@@ -629,7 +629,13 @@ func upsertDownloadedMod(path string, job downloadJob) {
 		return
 	}
 
-	// Store JAR metadata in global memory cache (local-only, no platform enrichment)
+	// Store local JAR metadata enriched with install-time platform display fields.
+	if strings.TrimSpace(job.Result.ProjectID) != "" && strings.TrimSpace(job.Result.Title) != "" {
+		if err := providers.StoreProject(job.Result); err != nil {
+			logging.Warn("store downloaded mod project metadata failed", "platform", job.Result.Platform, "projectID", job.Result.ProjectID, "error", err)
+		}
+	}
+	mods = modbridge.ApplyProjectMetadataToModInfos(mods, job.Result)
 	global.SetJarMetadata(sha1, mods)
 
 	relPath := path

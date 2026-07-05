@@ -85,6 +85,7 @@ func UpsertModPlatform(p models.ModProject) error {
 	if err != nil {
 		return err
 	}
+	p = copyProject(p)
 	p.Platform = strings.TrimSpace(p.Platform)
 	p.ProjectID = strings.TrimSpace(p.ProjectID)
 	if p.Platform == "" || p.ProjectID == "" {
@@ -108,6 +109,7 @@ func UpsertModPlatform(p models.ModProject) error {
 				p.IconURL = existing.IconURL
 				p.Description = existing.Description
 				p.Downloads = existing.Downloads
+				p.Categories = copyStringSlice(existing.Categories)
 				p.CachedAt = existing.CachedAt
 			}
 		} else if isFullMetadata {
@@ -145,7 +147,7 @@ func GetModPlatform(platform, projectID string) (models.ModProject, bool) {
 		return models.ModProject{}, false
 	}
 	logging.Debug("mod platform cache hit", "platform", key.Platform, "projectID", key.ProjectID, "updatedAt", p.UpdatedAt)
-	return p, true
+	return copyProject(p), true
 }
 
 func GetModPlatformBySlug(platform, slug string) (models.ModProject, bool) {
@@ -176,7 +178,7 @@ func GetModPlatformBySlug(platform, slug string) (models.ModProject, bool) {
 		return models.ModProject{}, false
 	}
 	logging.Debug("mod platform slug cache hit", "platform", platform, "slug", slug, "projectID", p.ProjectID, "updatedAt", p.UpdatedAt)
-	return p, true
+	return copyProject(p), true
 }
 
 func TouchModPlatform(platform, projectID string, updatedAt int64) error {

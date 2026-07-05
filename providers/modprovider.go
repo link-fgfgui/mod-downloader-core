@@ -849,6 +849,20 @@ func curseForgeLogoURL(logo cfSchema.ModAsset) string {
 	return strings.TrimSpace(logo.URL)
 }
 
+func curseForgeCategories(categories []cfSchema.Category) []string {
+	values := make([]string, 0, len(categories))
+	for _, category := range categories {
+		if value := strings.TrimSpace(category.Slug); value != "" {
+			values = append(values, value)
+			continue
+		}
+		if value := strings.TrimSpace(category.Name); value != "" {
+			values = append(values, value)
+		}
+	}
+	return models.NormalizeCategories(values)
+}
+
 // --- Conversion methods (SDK → Unified Model) ---
 
 // CurseForge SDK → ModProject
@@ -864,6 +878,7 @@ func (p curseForgeProvider) modToModProject(mod cfSchema.Mod) models.ModProject 
 		IconURL:     curseForgeLogoURL(mod.Logo),
 		Description: mod.Summary,
 		Downloads:   mod.DownloadCount,
+		Categories:  curseForgeCategories(mod.Categories),
 		UpdatedAt:   0, // Set by caller if needed
 	}
 }
@@ -928,6 +943,7 @@ func (p modrinthProvider) searchHitToModProject(hit *modrinth.SearchResult) mode
 	if hit.Slug != nil {
 		project.Slug = *hit.Slug
 	}
+	project.Categories = models.NormalizeCategories(hit.Categories)
 	return project
 }
 
@@ -956,6 +972,7 @@ func (p modrinthProvider) projectToModProject(project *modrinth.Project) models.
 	if project.Slug != nil {
 		result.Slug = *project.Slug
 	}
+	result.Categories = models.NormalizeCategories(project.Categories, project.AdditionalCategories)
 	return result
 }
 

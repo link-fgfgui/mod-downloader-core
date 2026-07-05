@@ -517,6 +517,41 @@ func PlatformMetadataForSHA1(sha1 string) (models.ModProject, models.ModVersion,
 	return project, version, true
 }
 
+// ApplyProjectMetadataToModInfo adds online display metadata to local JAR metadata
+// without replacing local identity fields used by install/status logic.
+func ApplyProjectMetadataToModInfo(info mcstructs.ModInfo, project models.ModProject) mcstructs.ModInfo {
+	if title := strings.TrimSpace(project.Title); title != "" {
+		info.OnlineName = title
+	}
+	if iconURL := strings.TrimSpace(project.IconURL); iconURL != "" {
+		info.IconURL = iconURL
+	}
+	if platform := strings.TrimSpace(project.Platform); platform != "" {
+		info.OnlinePlatform = platform
+	}
+	if projectID := strings.TrimSpace(project.ProjectID); projectID != "" {
+		info.OnlineProjectID = projectID
+	}
+	if slug := strings.TrimSpace(project.Slug); slug != "" {
+		info.OnlineSlug = slug
+	}
+	if categories := models.NormalizeCategories(project.Categories); len(categories) > 0 {
+		info.Categories = categories
+	}
+	return info
+}
+
+func ApplyProjectMetadataToModInfos(mods []mcstructs.ModInfo, project models.ModProject) []mcstructs.ModInfo {
+	if len(mods) == 0 {
+		return nil
+	}
+	out := make([]mcstructs.ModInfo, len(mods))
+	for i, mod := range mods {
+		out[i] = ApplyProjectMetadataToModInfo(mod, project)
+	}
+	return out
+}
+
 // parseRemoteModJar downloads a JAR via HTTP range requests and parses its mod metadata.
 func parseRemoteModJar(downloadURL string, modLoader string) ([]mcstructs.ModInfo, error) {
 	reader, err := minecraft.NewHTTPRangeReaderAt(downloadURL)

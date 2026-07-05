@@ -383,6 +383,7 @@ func internModProject(pool *stringPool, project models.ModProject) models.ModPro
 	project.ProjectID = pool.Intern(project.ProjectID)
 	project.Slug = pool.Intern(project.Slug)
 	project.Icon = pool.Intern(project.Icon)
+	project.Categories = internStringSlice(pool, project.Categories)
 	return project
 }
 
@@ -501,6 +502,11 @@ func copyDependencies(deps []models.ModDependency) []models.ModDependency {
 	out := make([]models.ModDependency, len(deps))
 	copy(out, deps)
 	return out
+}
+
+func copyProject(p models.ModProject) models.ModProject {
+	p.Categories = copyStringSlice(p.Categories)
+	return p
 }
 
 func copyVersion(v models.ModVersion) models.ModVersion {

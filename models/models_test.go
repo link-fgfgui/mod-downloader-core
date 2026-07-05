@@ -238,6 +238,7 @@ func TestModProjectRoundtrip(t *testing.T) {
 		Description: "Essential hooks for modding with Fabric",
 		IconURL:     "https://example.com/icon.png",
 		Downloads:   1000000,
+		Categories:  []string{"library", "technology"},
 		UpdatedAt:   1234567890,
 	}
 
@@ -251,6 +252,22 @@ func TestModProjectRoundtrip(t *testing.T) {
 	reconstructed := ProjectKey(platform, projectID)
 	if reconstructed != project.ID {
 		t.Errorf("ProjectKey roundtrip failed: got %q, want %q", reconstructed, project.ID)
+	}
+}
+
+func TestNormalizeCategories(t *testing.T) {
+	got := NormalizeCategories(
+		[]string{" Library ", "magic"},
+		[]string{"library", "", "Technology"},
+	)
+	want := []string{"library", "magic", "technology"}
+	if len(got) != len(want) {
+		t.Fatalf("NormalizeCategories() = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("NormalizeCategories()[%d] = %q, want %q (all: %#v)", i, got[i], want[i], got)
+		}
 	}
 }
 

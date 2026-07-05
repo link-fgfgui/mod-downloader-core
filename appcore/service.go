@@ -457,7 +457,7 @@ func (s *Service) RefreshSelectedVersionMods() structs.VersionInfo {
 		return structs.VersionInfo{}
 	}
 	refreshed := s.refreshVersionMods(selected, global.GetMinecraftDir())
-	enriched, missedSHA1s := enrichModIcons(refreshed.Mods)
+	enriched, missedSHA1s := enrichModMetadata(refreshed.Mods)
 	refreshed.Mods = enriched
 	global.SetSelectedVersion(refreshed)
 	s.emit(EventSelectedVersionChanged, refreshed)
@@ -476,13 +476,16 @@ func (s *Service) RefreshSelectedVersionMods() structs.VersionInfo {
 			copy(mods, updated.Mods)
 			changed := false
 			for i := range mods {
-				if mods[i].IconURL != "" || strings.TrimSpace(mods[i].SHA1) == "" {
+				if strings.TrimSpace(mods[i].SHA1) == "" {
 					continue
 				}
 				sha1 := strings.ToLower(strings.TrimSpace(mods[i].SHA1))
-				if project, ok := resolved[sha1]; ok && strings.TrimSpace(project.IconURL) != "" {
-					mods[i].IconURL = project.IconURL
-					changed = true
+				if project, ok := resolved[sha1]; ok {
+					enrichedMod := modbridge.ApplyProjectMetadataToModInfo(mods[i], project)
+					if modInfoDisplayMetadataChanged(mods[i], enrichedMod) {
+						mods[i] = enrichedMod
+						changed = true
+					}
 				}
 			}
 			if !changed {
@@ -550,7 +553,7 @@ func (s *Service) LocalModsInDir(dir, minecraftVersion, modLoader string) ([]str
 	instanceID := modbridge.InstanceIDForTargetDir(dir)
 	global.ClearLocalModsByInstance(instanceID)
 	mods := minecraft.ScanModsDir(dir, instanceID, minecraftVersion, modLoader, "")
-	enriched, _ := enrichModIcons(mods)
+	enriched, _ := enrichModMetadata(mods)
 	return enriched, nil
 }
 
@@ -785,7 +788,7 @@ func ScanVersionMods(version structs.VersionInfo, mcDir string) structs.VersionI
 	return version
 }
 
-func enrichModIcons(mods []structs.ModInfo) ([]structs.ModInfo, []string) {
+func enrichModMetadata(mods []structs.ModInfo) ([]structs.ModInfo, []string) {
 	enriched := make([]structs.ModInfo, len(mods))
 	copy(enriched, mods)
 	var missedSHA1s []string
@@ -795,13 +798,36 @@ func enrichModIcons(mods []structs.ModInfo) ([]structs.ModInfo, []string) {
 			continue
 		}
 		project, _, ok := modbridge.PlatformMetadataForSHA1(sha1)
-		if ok && strings.TrimSpace(project.IconURL) != "" {
-			enriched[i].IconURL = project.IconURL
+		if ok && hasProjectDisplayMetadata(project) {
+			enriched[i] = modbridge.ApplyProjectMetadataToModInfo(enriched[i], project)
 		} else {
 			missedSHA1s = append(missedSHA1s, sha1)
 		}
 	}
 	return enriched, missedSHA1s
+}
+
+func hasProjectDisplayMetadata(project models.ModProject) bool {
+	return strings.TrimSpace(project.Title) != "" ||
+		strings.TrimSpace(project.IconURL) != "" ||
+		len(project.Categories) > 0
+}
+
+func modInfoDisplayMetadataChanged(left, right structs.ModInfo) bool {
+	if left.OnlineName != right.OnlineName ||
+		left.OnlinePlatform != right.OnlinePlatform ||
+		left.OnlineProjectID != right.OnlineProjectID ||
+		left.OnlineSlug != right.OnlineSlug ||
+		left.IconURL != right.IconURL ||
+		len(left.Categories) != len(right.Categories) {
+		return true
+	}
+	for i := range left.Categories {
+		if left.Categories[i] != right.Categories[i] {
+			return true
+		}
+	}
+	return false
 }
 
 func ScanAllModDirsForHardlinkIndex(mcDir string, versions []structs.VersionInfo, generation uint64) {

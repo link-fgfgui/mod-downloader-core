@@ -6,17 +6,18 @@ import (
 
 // ModProject represents a mod project on any platform.
 type ModProject struct {
-	ID          string `json:"id"`          // Composite: "platform:projectID" or just projectID
-	Platform    string `json:"platform"`    // "CurseForge" | "Modrinth"
-	ProjectID   string `json:"projectId"`   // Numeric ID for CF, slug for MR
-	Slug        string `json:"slug"`        // URL slug
-	Title       string `json:"title"`       // Display name
-	Icon        string `json:"icon"`        // Material Design Icon name (e.g. "mdi-package-variant")
-	IconURL     string `json:"iconUrl"`     // Avatar/logo URL
-	Description string `json:"description"` // Short description
-	Downloads   int64  `json:"downloads"`   // Total download count
-	UpdatedAt   int64  `json:"updatedAt"`   // Last fetched timestamp (Unix seconds)
-	CachedAt    int64  `json:"cachedAt"`    // Metadata cache timestamp (Unix seconds)
+	ID          string   `json:"id"`                   // Composite: "platform:projectID" or just projectID
+	Platform    string   `json:"platform"`             // "CurseForge" | "Modrinth"
+	ProjectID   string   `json:"projectId"`            // Numeric ID for CF, slug for MR
+	Slug        string   `json:"slug"`                 // URL slug
+	Title       string   `json:"title"`                // Display name
+	Icon        string   `json:"icon"`                 // Material Design Icon name (e.g. "mdi-package-variant")
+	IconURL     string   `json:"iconUrl"`              // Avatar/logo URL
+	Description string   `json:"description"`          // Short description
+	Downloads   int64    `json:"downloads"`            // Total download count
+	Categories  []string `json:"categories,omitempty"` // Provider-native categories/tags (deduplicated)
+	UpdatedAt   int64    `json:"updatedAt"`            // Last fetched timestamp (Unix seconds)
+	CachedAt    int64    `json:"cachedAt"`             // Metadata cache timestamp (Unix seconds)
 }
 
 // ModVersion represents a specific version file.
@@ -83,6 +84,26 @@ func ParseProjectKey(id string) (string, string) {
 	}
 
 	return platform, projectID
+}
+
+// NormalizeCategories trims, lowercases, and deduplicates provider category/tag values.
+func NormalizeCategories(groups ...[]string) []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0)
+	for _, group := range groups {
+		for _, value := range group {
+			value = strings.ToLower(strings.TrimSpace(value))
+			if value == "" {
+				continue
+			}
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 // VersionKey generates a composite version ID from platform, projectID, and versionID.
