@@ -58,9 +58,9 @@ func queueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, cu
 		req.ProjectID = providers.ProjectReferenceFromSearchResult(req.Result)
 	}
 
-	req, instanceID, targetDir, ok := modbridge.ApplySelectedInstance(req)
+	req, instanceID, targetDir, ok := modbridge.ResolveInstallTarget(req)
 	if !ok {
-		return appstructs.ModDownloadResult{Skipped: true, Reason: "no selected version"}
+		return appstructs.ModDownloadResult{Skipped: true, Reason: "no install target"}
 	}
 	if req.ProjectID == "" || req.MinecraftVersion == "" || req.ModLoader == "" {
 		return appstructs.ModDownloadResult{Skipped: true, Reason: "invalid request"}
@@ -466,6 +466,8 @@ func dependencyDownloadRequest(platform string, dep models.ModDependency, parent
 		MinecraftVersion: parent.MinecraftVersion,
 		ModLoader:        parent.ModLoader,
 		VersionID:        strings.TrimSpace(dep.DependencyVersionID),
+		TargetDir:        parent.TargetDir,
+		InstanceID:       parent.InstanceID,
 	}, true
 }
 
@@ -630,7 +632,7 @@ func upsertDownloadedMod(path string, job downloadJob) {
 	// Store JAR metadata in global memory cache (local-only, no platform enrichment)
 	global.SetJarMetadata(sha1, mods)
 
-	relPath := filepath.Base(path)
+	relPath := path
 	if mcDir := global.GetMinecraftDir(); mcDir != "" {
 		if rel, err := filepath.Rel(mcDir, path); err == nil {
 			relPath = rel

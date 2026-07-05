@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/link-fgfgui/mod-downloader-core/logging"
@@ -16,7 +17,8 @@ import (
 )
 
 const (
-	databaseFileName = "mods.gob.zst"
+	CacheFileName    = "mods.gob.zst"
+	databaseFileName = CacheFileName
 	cacheVersion     = 3
 )
 
@@ -89,13 +91,34 @@ func (p *stringPool) Intern(s string) string {
 }
 
 func Open() error {
-	dir, err := os.Getwd()
+	targetPath, err := DefaultCachePath()
 	if err != nil {
-		logging.Error("resolve cache working directory failed", "error", err)
-		return fmt.Errorf("get working dir: %w", err)
+		return err
 	}
+	return OpenAt(targetPath)
+}
 
-	targetPath := filepath.Join(dir, databaseFileName)
+func DefaultCachePath() (string, error) {
+	dir := os.TempDir()
+	if strings.TrimSpace(dir) == "" {
+		return "", errors.New("empty temp dir")
+	}
+	return filepath.Join(dir, "mod-downloader", databaseFileName), nil
+}
+
+func OpenAt(path string) error {
+	targetPath := strings.TrimSpace(path)
+	if targetPath == "" {
+		return errors.New("empty cache path")
+	}
+	if !filepath.IsAbs(targetPath) {
+		abs, err := filepath.Abs(targetPath)
+		if err != nil {
+			return fmt.Errorf("resolve cache path: %w", err)
+		}
+		targetPath = abs
+	}
+	targetPath = filepath.Clean(targetPath)
 	if db != nil && dbPath == targetPath {
 		logging.Debug("cache already open", "path", targetPath)
 		return nil

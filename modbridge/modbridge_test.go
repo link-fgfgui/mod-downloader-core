@@ -3,11 +3,13 @@ package modbridge
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/models"
+	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 	mcstructs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
 
@@ -52,6 +54,65 @@ func TestSelectedVersionModsDirUsesInstanceIDNotDisplayName(t *testing.T) {
 	want := filepath.Join(mcDir, "versions", "instance-folder", "mods")
 	if got != want {
 		t.Fatalf("selectedVersionModsDir() = %q, want %q", got, want)
+	}
+}
+
+func TestResolveInstallTargetPrefersExplicitTargetDir(t *testing.T) {
+	global.SetMinecraftDir("")
+	global.InvalidateVersions()
+	t.Cleanup(func() {
+		global.SetMinecraftDir("")
+		global.InvalidateVersions()
+	})
+
+	targetDir := filepath.Join(t.TempDir(), "mods")
+	req, instanceID, resolvedDir, ok := ResolveInstallTarget(appstructs.ModDownloadRequest{
+		MinecraftVersion: " 1.21.1 ",
+		ModLoader:        " Fabric ",
+		TargetDir:        targetDir,
+	})
+	if !ok {
+		t.Fatal("ResolveInstallTarget() ok = false")
+	}
+	if resolvedDir != targetDir || req.TargetDir != targetDir {
+		t.Fatalf("target dir = %q/%q, want %q", resolvedDir, req.TargetDir, targetDir)
+	}
+	if req.MinecraftVersion != "1.21.1" || req.ModLoader != "fabric" {
+		t.Fatalf("request version/loader = %q/%q", req.MinecraftVersion, req.ModLoader)
+	}
+	if !strings.HasPrefix(instanceID, "cli:") || req.InstanceID != instanceID {
+		t.Fatalf("instanceID = %q, req.InstanceID = %q", instanceID, req.InstanceID)
+	}
+}
+
+func TestResolveInstallTargetFallsBackToSelectedInstance(t *testing.T) {
+	mcDir := t.TempDir()
+	global.SetMinecraftDir(mcDir)
+	selected := mcstructs.VersionInfo{
+		ID:               "instance",
+		Name:             "Display Name",
+		MinecraftVersion: "1.20.1",
+		ModLoader:        "neoforge",
+	}
+	global.SetVersions([]mcstructs.VersionInfo{selected})
+	global.SetSelectedVersion(selected)
+	t.Cleanup(func() {
+		global.SetMinecraftDir("")
+		global.InvalidateVersions()
+	})
+
+	req, instanceID, targetDir, ok := ResolveInstallTarget(appstructs.ModDownloadRequest{})
+	if !ok {
+		t.Fatal("ResolveInstallTarget() fallback ok = false")
+	}
+	if instanceID != "instance" {
+		t.Fatalf("instanceID = %q, want instance", instanceID)
+	}
+	if targetDir != filepath.Join(mcDir, "versions", "instance", "mods") {
+		t.Fatalf("targetDir = %q", targetDir)
+	}
+	if req.MinecraftVersion != "1.20.1" || req.ModLoader != "neoforge" {
+		t.Fatalf("request version/loader = %q/%q", req.MinecraftVersion, req.ModLoader)
 	}
 }
 
@@ -152,7 +213,7 @@ func TestResolveVersionModIDsReturnsNilForUnknownVersion(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
-	if err := database.Open(); err != nil {
+	if err := database.OpenAt(filepath.Join(tmp, "mods.gob.zst")); err != nil {
 		t.Fatal(err)
 	}
 

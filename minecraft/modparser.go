@@ -274,6 +274,19 @@ func FileSHA1(path string) string {
 
 func ScanVersionMods(versionDir string, instanceID string, minecraftVersion string, modLoader string, minecraftDir string) []structs.ModInfo {
 	modsDir := filepath.Join(versionDir, "mods")
+	return ScanModsDir(modsDir, instanceID, minecraftVersion, modLoader, minecraftDir)
+}
+
+func ScanModsDir(modsDir string, instanceID string, minecraftVersion string, modLoader string, pathRoot string) []structs.ModInfo {
+	modsDir = strings.TrimSpace(modsDir)
+	if modsDir == "" {
+		return nil
+	}
+	if !filepath.IsAbs(modsDir) {
+		if abs, err := filepath.Abs(modsDir); err == nil {
+			modsDir = abs
+		}
+	}
 	entries, err := os.ReadDir(modsDir)
 	if err != nil {
 		return nil
@@ -292,20 +305,19 @@ func ScanVersionMods(versionDir string, instanceID string, minecraftVersion stri
 		enabled := isJarEnabled(entry.Name())
 		baseName := StripJarSuffix(entry.Name())
 
-		relPath := entry.Name()
-		if minecraftDir != "" {
-			if rel, err := filepath.Rel(minecraftDir, jarPath); err == nil {
-				relPath = rel
-			}
-		}
-
 		if len(mods) == 0 {
 			continue
 		}
 
+		pathValue := jarPath
+		if strings.TrimSpace(pathRoot) != "" {
+			if rel, err := filepath.Rel(pathRoot, jarPath); err == nil {
+				pathValue = rel
+			}
+		}
 		for i := range mods {
 			mods[i].FileName = baseName
-			mods[i].Path = relPath
+			mods[i].Path = pathValue
 			mods[i].SHA1 = hash
 			mods[i].Enabled = enabled
 			global.UpsertLocalMod(mods[i], instanceID, minecraftVersion, modLoader)

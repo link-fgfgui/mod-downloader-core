@@ -3,6 +3,7 @@ package database
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/link-fgfgui/mod-downloader-core/models"
@@ -24,21 +25,49 @@ func openTestDB(t *testing.T) string {
 			t.Fatal(err)
 		}
 	})
-	if err := Open(); err != nil {
+	path := filepath.Join(tmp, databaseFileName)
+	if err := OpenAt(path); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(tmp, databaseFileName)
 	return path
 }
 
 func reopenTestDB(t *testing.T, path string) {
 	t.Helper()
 	Close()
-	if err := Open(); err != nil {
+	if err := OpenAt(path); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDefaultCachePathUsesTempDir(t *testing.T) {
+	path, err := DefaultCachePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempDir := filepath.Clean(os.TempDir())
+	if rel, err := filepath.Rel(tempDir, path); err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+		t.Fatalf("DefaultCachePath() = %q, want under %q", path, tempDir)
+	}
+	if filepath.Base(path) != databaseFileName {
+		t.Fatalf("DefaultCachePath() base = %q, want %q", filepath.Base(path), databaseFileName)
+	}
+}
+
+func TestOpenAtCreatesParentDirectoryOnClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "cache", databaseFileName)
+	if err := OpenAt(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Dir(path)); !os.IsNotExist(err) {
+		t.Fatalf("parent before close error = %v, want not exist", err)
+	}
+	Close()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("cache file after close: %v", err)
 	}
 }
 

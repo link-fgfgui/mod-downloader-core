@@ -68,11 +68,38 @@ func TestDependencyDownloadRequestCarriesDependencyVersionID(t *testing.T) {
 	}, appstructs.ModDownloadRequest{
 		MinecraftVersion: "1.21.1",
 		ModLoader:        "Fabric",
+		TargetDir:        "/tmp/mods",
+		InstanceID:       "cli:/tmp/mods",
 	})
 	if !ok {
 		t.Fatal("dependencyDownloadRequest() ok = false")
 	}
 	if req.VersionID != "version-123" {
 		t.Fatalf("VersionID = %q, want version-123", req.VersionID)
+	}
+	if req.TargetDir != "/tmp/mods" || req.InstanceID != "cli:/tmp/mods" {
+		t.Fatalf("target = %q, instance = %q", req.TargetDir, req.InstanceID)
+	}
+}
+
+func TestQueueModDownloadAcceptsExplicitTargetWithoutSelectedInstance(t *testing.T) {
+	global.SetMinecraftDir("")
+	global.InvalidateVersions()
+	t.Cleanup(func() {
+		global.SetMinecraftDir("")
+		global.InvalidateVersions()
+	})
+
+	result := QueueModDownload(nil, appstructs.ModDownloadRequest{
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+		TargetDir:        filepath.Join(t.TempDir(), "mods"),
+	}, "")
+
+	if !result.Skipped {
+		t.Fatalf("result = %#v, want skipped invalid request", result)
+	}
+	if result.Reason != "invalid request" {
+		t.Fatalf("reason = %q, want invalid request", result.Reason)
 	}
 }

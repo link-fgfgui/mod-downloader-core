@@ -32,6 +32,8 @@ type ModDownloadRequest struct {
 	MinecraftVersion string            `json:"minecraftVersion"`
 	ModLoader        string            `json:"modLoader"`
 	VersionID        string            `json:"versionId,omitempty"` // explicit platform version ID; empty means "best match"
+	TargetDir        string            `json:"targetDir,omitempty"`
+	InstanceID       string            `json:"instanceId,omitempty"`
 }
 
 type ModDownloadResult struct {
@@ -71,6 +73,8 @@ type DownloadStatesRequest struct {
 	Results          []models.ModProject `json:"results"`
 	MinecraftVersion string              `json:"minecraftVersion"`
 	ModLoader        string              `json:"modLoader"`
+	TargetDir        string              `json:"targetDir,omitempty"`
+	InstanceID       string              `json:"instanceId,omitempty"`
 }
 
 type ModDownloadButtonState struct {

@@ -47,8 +47,19 @@ type Event struct {
 type Options struct {
 	Config                *configs.Config
 	ConfigOverrides       ConfigOverrides
+	Runtime               RuntimeOptions
 	LoadMinecraftReleases bool
 	OnEvent               func(Event)
+}
+
+type RuntimeOptions struct {
+	WorkDir          string
+	TargetModsDir    string
+	MinecraftVersion string
+	ModLoader        string
+	CacheDir         string
+	CachePath        string
+	NoConfigFile     bool
 }
 
 type ConfigOverrides struct {
@@ -90,6 +101,15 @@ type InstallWaitResult struct {
 	Errors []appstructs.DownloadFailedEvent `json:"errors,omitempty"`
 }
 
+type InstallToDirRequest struct {
+	ProjectID        string            `json:"projectId"`
+	Project          models.ModProject `json:"project"`
+	TargetDir        string            `json:"targetDir"`
+	MinecraftVersion string            `json:"minecraftVersion"`
+	ModLoader        string            `json:"modLoader"`
+	VersionID        string            `json:"versionId,omitempty"`
+}
+
 func New(options Options) *Service {
 	return &Service{config: options.Config, options: options}
 }
@@ -97,7 +117,7 @@ func New(options Options) *Service {
 func (s *Service) Startup(ctx context.Context) error {
 	s.ctx = ctx
 	if s.config == nil {
-		cfg, err := configs.Load()
+		cfg, err := s.loadConfig()
 		if err != nil {
 			logging.Error("load config failed", "error", err)
 			cfg = &configs.Config{}
@@ -105,10 +125,15 @@ func (s *Service) Startup(ctx context.Context) error {
 		s.config = cfg
 	}
 	s.applyConfigOverrides()
-	s.config.Prefers.MinecraftDir = minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir)
-	global.SetMinecraftDir(s.config.Prefers.MinecraftDir)
+	if minecraftDir := minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir); strings.TrimSpace(minecraftDir) != "" {
+		s.config.Prefers.MinecraftDir = minecraftDir
+		global.SetMinecraftDir(minecraftDir)
+	}
 
-	if err := database.Open(); err != nil {
+	cachePath, err := s.cachePath()
+	if err != nil {
+		logging.Error("resolve database cache path failed", "error", err)
+	} else if err := database.OpenAt(cachePath); err != nil {
 		logging.Error("open database failed", "error", err)
 	}
 	s.configureProviderClients()
@@ -299,10 +324,12 @@ func (s *Service) SaveApiKeys(req SaveApiKeysRequest) SettingsView {
 }
 
 func (s *Service) QueueModDownload(req appstructs.ModDownloadRequest) appstructs.ModDownloadResult {
+	req = s.applyRuntimeDownloadRequest(req)
 	return downloader.QueueModDownload(s.ctx, req, s.Config().Keys.CurseforgeApiKey, s.downloadEvents())
 }
 
 func (s *Service) InstallModAndWait(ctx context.Context, req appstructs.ModDownloadRequest) InstallWaitResult {
+	req = s.applyRuntimeDownloadRequest(req)
 	var failed []appstructs.DownloadFailedEvent
 	events := s.downloadEvents()
 	previousFailed := events.OnDownloadFailed
@@ -337,6 +364,17 @@ func (s *Service) InstallModAndWait(ctx context.Context, req appstructs.ModDownl
 	}
 }
 
+func (s *Service) InstallModToDirAndWait(ctx context.Context, req InstallToDirRequest) InstallWaitResult {
+	return s.InstallModAndWait(ctx, appstructs.ModDownloadRequest{
+		ProjectID:        req.ProjectID,
+		Result:           req.Project,
+		MinecraftVersion: req.MinecraftVersion,
+		ModLoader:        req.ModLoader,
+		VersionID:        req.VersionID,
+		TargetDir:        req.TargetDir,
+	})
+}
+
 func (s *Service) GetDownloadQueueState() appstructs.DownloadQueueState {
 	return downloader.GetDownloadQueueState()
 }
@@ -346,6 +384,7 @@ func (s *Service) CancelDownload(id string) bool {
 }
 
 func (s *Service) GetDownloadStates(req appstructs.DownloadStatesRequest) []appstructs.ModDownloadButtonState {
+	req = s.applyRuntimeDownloadStatesRequest(req)
 	return downloader.GetDownloadStates(req, func() {
 		s.emit(EventDownloadStatesUpdated, nil)
 	})
@@ -491,6 +530,30 @@ func (s *Service) LocalMods(versionKey string) ([]structs.ModInfo, error) {
 	return selected.Mods, nil
 }
 
+func (s *Service) LocalModsInDir(dir, minecraftVersion, modLoader string) ([]structs.ModInfo, error) {
+	dir = s.resolveRuntimePath(dir)
+	if strings.TrimSpace(dir) == "" {
+		return nil, errors.New("empty mods dir")
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("mods path is not a directory: %s", dir)
+	}
+	minecraftVersion = firstNonEmpty(strings.TrimSpace(minecraftVersion), s.options.Runtime.MinecraftVersion, s.Config().Runtime.MinecraftVersion)
+	modLoader = strings.ToLower(firstNonEmpty(strings.TrimSpace(modLoader), s.options.Runtime.ModLoader, s.Config().Runtime.ModLoader))
+	instanceID := modbridge.InstanceIDForTargetDir(dir)
+	global.ClearLocalModsByInstance(instanceID)
+	mods := minecraft.ScanModsDir(dir, instanceID, minecraftVersion, modLoader, "")
+	enriched, _ := enrichModIcons(mods)
+	return enriched, nil
+}
+
 func (s *Service) LoadVersionsFromDisk(mcDir string) []structs.VersionInfo {
 	if strings.TrimSpace(mcDir) == "" {
 		global.SetVersionsForDir(mcDir, nil)
@@ -535,6 +598,75 @@ func (s *Service) applyConfigOverrides() {
 	if s.options.ConfigOverrides.HasModrinthAPIKey {
 		s.config.Keys.ModrinthApiKey = s.options.ConfigOverrides.ModrinthAPIKey
 	}
+}
+
+func (s *Service) loadConfig() (*configs.Config, error) {
+	if s.options.Runtime.NoConfigFile {
+		return configs.LoadEnv()
+	}
+	return configs.Load()
+}
+
+func (s *Service) cachePath() (string, error) {
+	if path := s.resolveRuntimePath(s.options.Runtime.CachePath); path != "" {
+		return path, nil
+	}
+	cacheDir := firstNonEmpty(s.options.Runtime.CacheDir, s.Config().Runtime.CacheDir)
+	if cacheDir != "" {
+		return filepath.Join(s.resolveRuntimePath(cacheDir), database.CacheFileName), nil
+	}
+	return database.DefaultCachePath()
+}
+
+func (s *Service) applyRuntimeDownloadRequest(req appstructs.ModDownloadRequest) appstructs.ModDownloadRequest {
+	if strings.TrimSpace(req.TargetDir) == "" {
+		req.TargetDir = s.resolveRuntimePath(s.options.Runtime.TargetModsDir)
+	} else {
+		req.TargetDir = s.resolveRuntimePath(req.TargetDir)
+	}
+	if strings.TrimSpace(req.MinecraftVersion) == "" {
+		req.MinecraftVersion = firstNonEmpty(s.options.Runtime.MinecraftVersion, s.Config().Runtime.MinecraftVersion)
+	}
+	if strings.TrimSpace(req.ModLoader) == "" {
+		req.ModLoader = firstNonEmpty(s.options.Runtime.ModLoader, s.Config().Runtime.ModLoader)
+	}
+	return req
+}
+
+func (s *Service) applyRuntimeDownloadStatesRequest(req appstructs.DownloadStatesRequest) appstructs.DownloadStatesRequest {
+	if strings.TrimSpace(req.TargetDir) == "" {
+		req.TargetDir = s.resolveRuntimePath(s.options.Runtime.TargetModsDir)
+	} else {
+		req.TargetDir = s.resolveRuntimePath(req.TargetDir)
+	}
+	if strings.TrimSpace(req.MinecraftVersion) == "" {
+		req.MinecraftVersion = firstNonEmpty(s.options.Runtime.MinecraftVersion, s.Config().Runtime.MinecraftVersion)
+	}
+	if strings.TrimSpace(req.ModLoader) == "" {
+		req.ModLoader = firstNonEmpty(s.options.Runtime.ModLoader, s.Config().Runtime.ModLoader)
+	}
+	return req
+}
+
+func (s *Service) resolveRuntimePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	path = minecraft.ExpandPathWithEnv(path)
+	if filepath.IsAbs(path) || strings.TrimSpace(s.options.Runtime.WorkDir) == "" {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(filepath.Join(s.options.Runtime.WorkDir, path))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 func (s *Service) configureProviderClients() {

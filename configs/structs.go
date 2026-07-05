@@ -60,7 +60,14 @@ type Preferences struct {
 	MinecraftDir string `toml:"minecraft_dir" json:"minecraft_dir" env:"MINECRAFT_DIR"`
 }
 
+type RuntimeConfig struct {
+	MinecraftVersion string `toml:"minecraft_version" json:"minecraftVersion" env:"MINECRAFT_VERSION"`
+	ModLoader        string `toml:"mod_loader" json:"modLoader" env:"MOD_LOADER"`
+	CacheDir         string `toml:"cache_dir" json:"cacheDir" env:"MOD_DOWNLOADER_CACHE_DIR"`
+}
+
 type Config struct {
-	Keys    APIKeys     `toml:"keys" json:"keys" env-prefix:"KEYS_"`
-	Prefers Preferences `toml:"preferences" json:"preferences" env-prefix:"PREFERS_"`
+	Keys    APIKeys       `toml:"keys" json:"keys" env-prefix:"KEYS_"`
+	Prefers Preferences   `toml:"preferences" json:"preferences" env-prefix:"PREFERS_"`
+	Runtime RuntimeConfig `toml:"runtime" json:"runtime"`
 }

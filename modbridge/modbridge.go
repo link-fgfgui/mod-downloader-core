@@ -101,6 +101,45 @@ func ApplySelectedInstance(req appstructs.ModDownloadRequest) (appstructs.ModDow
 	return req, instanceID, targetDir, true
 }
 
+// ResolveInstallTarget resolves the concrete mods directory and local-index
+// instance identity for a download request. Explicit request fields are used
+// first for CLI/direct-target workflows; selected GUI instance state is only a
+// compatibility fallback.
+func ResolveInstallTarget(req appstructs.ModDownloadRequest) (appstructs.ModDownloadRequest, string, string, bool) {
+	req.MinecraftVersion = strings.TrimSpace(req.MinecraftVersion)
+	req.ModLoader = strings.ToLower(strings.TrimSpace(req.ModLoader))
+	req.TargetDir = cleanPath(req.TargetDir)
+	req.InstanceID = strings.TrimSpace(req.InstanceID)
+
+	if req.TargetDir != "" {
+		if req.MinecraftVersion == "" || req.ModLoader == "" {
+			return req, req.InstanceID, req.TargetDir, false
+		}
+		if req.InstanceID == "" {
+			req.InstanceID = InstanceIDForTargetDir(req.TargetDir)
+		}
+		if req.InstanceID == "" {
+			return req, "", req.TargetDir, false
+		}
+		return req, req.InstanceID, req.TargetDir, true
+	}
+
+	return ApplySelectedInstance(req)
+}
+
+func InstanceIDForTargetDir(targetDir string) string {
+	targetDir = cleanPath(targetDir)
+	if targetDir == "" {
+		return ""
+	}
+	if !filepath.IsAbs(targetDir) {
+		if abs, err := filepath.Abs(targetDir); err == nil {
+			targetDir = abs
+		}
+	}
+	return "cli:" + filepath.Clean(targetDir)
+}
+
 // InstallStatus determines the button status for a search result in the current instance
 // without parsing remote JARs (used for search-list rendering).
 func InstallStatus(req appstructs.ModDownloadRequest) string {
@@ -109,10 +148,11 @@ func InstallStatus(req appstructs.ModDownloadRequest) string {
 		req.ProjectID = providers.ProjectReferenceFromSearchResult(req.Result)
 	}
 
-	req, instanceID, _, ok := ApplySelectedInstance(req)
+	req, instanceID, targetDir, ok := ResolveInstallTarget(req)
 	if !ok || req.ProjectID == "" || req.MinecraftVersion == "" || req.ModLoader == "" {
 		return BtnStatusNew
 	}
+	ensureTargetModsScanned(targetDir, instanceID, req.MinecraftVersion, req.ModLoader)
 
 	versions := ResolveVersions(req)
 	if len(versions) == 0 {
@@ -171,10 +211,11 @@ func InstallStatusPrecise(req appstructs.ModDownloadRequest) string {
 		req.ProjectID = providers.ProjectReferenceFromSearchResult(req.Result)
 	}
 
-	req, instanceID, _, ok := ApplySelectedInstance(req)
+	req, instanceID, targetDir, ok := ResolveInstallTarget(req)
 	if !ok || req.ProjectID == "" || req.MinecraftVersion == "" || req.ModLoader == "" {
 		return BtnStatusNew
 	}
+	ensureTargetModsScanned(targetDir, instanceID, req.MinecraftVersion, req.ModLoader)
 
 	version, ok := ResolveVersion(req)
 	if !ok {
@@ -215,19 +256,24 @@ func InstallStatusPrecise(req appstructs.ModDownloadRequest) string {
 func DownloadStates(req appstructs.DownloadStatesRequest, onBackfillComplete func()) []appstructs.ModDownloadButtonState {
 	req.MinecraftVersion = strings.TrimSpace(req.MinecraftVersion)
 	req.ModLoader = strings.ToLower(strings.TrimSpace(req.ModLoader))
+	req.TargetDir = cleanPath(req.TargetDir)
+	req.InstanceID = strings.TrimSpace(req.InstanceID)
 
 	states := make([]appstructs.ModDownloadButtonState, len(req.Results))
-	selected := global.GetSelectedVersion()
-	instanceID := versionInstanceID(selected)
+	targetReq, instanceID, targetDir, ok := ResolveInstallTarget(appstructs.ModDownloadRequest{
+		MinecraftVersion: req.MinecraftVersion,
+		ModLoader:        req.ModLoader,
+		TargetDir:        req.TargetDir,
+		InstanceID:       req.InstanceID,
+	})
+	req.MinecraftVersion = targetReq.MinecraftVersion
+	req.ModLoader = targetReq.ModLoader
 
-	// R2: if the selected instance has never been scanned, scan it once now so
-	// status decisions aren't falsely reported as "new" just because the local
-	// mod index is empty. No TTL guard — already-scanned instances are skipped.
-	if instanceID != "" && !global.HasLocalModPathsInInstance(instanceID) {
-		ensureInstanceModsScanned(selected)
+	if ok {
+		ensureTargetModsScanned(targetDir, instanceID, req.MinecraftVersion, req.ModLoader)
 	}
 
-	if instanceID == "" || !global.HasLocalModPathsInInstance(instanceID) {
+	if !ok || instanceID == "" || !global.HasLocalModPathsInInstance(instanceID) {
 		for i := range req.Results {
 			states[i] = defaultDownloadButtonState(req.Results[i])
 		}
@@ -250,6 +296,8 @@ func DownloadStates(req appstructs.DownloadStatesRequest, onBackfillComplete fun
 				Result:           result,
 				MinecraftVersion: req.MinecraftVersion,
 				ModLoader:        req.ModLoader,
+				TargetDir:        targetDir,
+				InstanceID:       instanceID,
 			})
 			applyButtonStatus(&states[idx], status)
 		}(i)
@@ -433,6 +481,15 @@ func ensureInstanceModsScanned(selected mcstructs.VersionInfo) {
 	minecraft.ScanVersionMods(versionDir, instanceID, selected.MinecraftVersion, selected.ModLoader, mcDir)
 }
 
+func ensureTargetModsScanned(targetDir, instanceID, minecraftVersion, modLoader string) {
+	instanceID = strings.TrimSpace(instanceID)
+	targetDir = cleanPath(targetDir)
+	if instanceID == "" || targetDir == "" || global.HasLocalModPathsInInstance(instanceID) {
+		return
+	}
+	minecraft.ScanModsDir(targetDir, instanceID, minecraftVersion, modLoader, "")
+}
+
 // PlatformMetadataForSHA1 looks up a platform version by SHA1 and returns the associated
 // project and version info for display-layer merging. This does NOT write to any cache.
 func PlatformMetadataForSHA1(sha1 string) (models.ModProject, models.ModVersion, bool) {
@@ -543,6 +600,14 @@ func versionInstanceID(version mcstructs.VersionInfo) string {
 		return strings.TrimSpace(version.ID)
 	}
 	return strings.TrimSpace(version.Name)
+}
+
+func cleanPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	return filepath.Clean(path)
 }
 
 func normalizedModIDs(ids []string) []string {

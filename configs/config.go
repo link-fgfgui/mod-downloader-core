@@ -56,6 +56,17 @@ func readEnv(cfg *Config) error {
 	return cleanenv.ReadEnv(cfg)
 }
 
+// LoadEnv reads configuration from environment variables only.
+func LoadEnv() (*Config, error) {
+	var cfg Config
+	if err := readEnv(&cfg); err != nil {
+		logging.Error("load config from environment failed", "error", err)
+		return nil, fmt.Errorf("read env: %w", err)
+	}
+	logging.Info("config loaded from environment", "hasCurseforgeKey", cfg.Keys.CurseforgeApiKey != "", "hasModrinthKey", cfg.Keys.ModrinthApiKey != "", "minecraftDir", cfg.Prefers.MinecraftDir, "cacheDir", cfg.Runtime.CacheDir)
+	return &cfg, nil
+}
+
 // Save writes the configuration to mod-downloader.toml in pwd.
 func Save(cfg *Config) error {
 	path, err := AppConfigPath()
