@@ -11,15 +11,7 @@ import (
 )
 
 func SearchMods(req appstructs.SearchModsRequest, emitUpdate func(appstructs.SearchModsUpdate)) {
-	req.Query = strings.TrimSpace(req.Query)
-	req.Version = strings.TrimSpace(req.Version)
-	req.ModLoader = strings.ToLower(strings.TrimSpace(req.ModLoader))
-	if req.Limit <= 0 {
-		req.Limit = 10
-	}
-	if req.Offset < 0 {
-		req.Offset = 0
-	}
+	req = normalizeSearchModsRequest(req)
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -99,6 +91,65 @@ func SearchMods(req appstructs.SearchModsRequest, emitUpdate func(appstructs.Sea
 	}
 	mu.Unlock()
 	go cacheSearchResults(finalResults)
+}
+
+func SearchModsText(req appstructs.SearchModsRequest, emitUpdate func(appstructs.SearchModsUpdate)) {
+	req = normalizeSearchModsRequest(req)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	providerResults := make(map[string][]models.ModProject, len(modProviders))
+	remaining := len(modProviders)
+
+	emit := func() {
+		if emitUpdate != nil {
+			emitUpdate(appstructs.SearchModsUpdate{
+				RequestID: req.RequestID,
+				Results:   mergeProviderSearchResults(providerResults),
+				Loading:   remaining > 0,
+				Append:    req.Offset > 0,
+			})
+		}
+	}
+
+	finish := func(providerName string, results []models.ModProject) {
+		mu.Lock()
+		defer mu.Unlock()
+		providerResults[providerName] = results
+		remaining--
+		emit()
+	}
+
+	for _, provider := range modProviders {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results, err := provider.Search(req)
+			if err != nil {
+				logging.Error("search text mods failed", "provider", provider.Name(), "query", req.Query, "version", req.Version, "modLoader", req.ModLoader, "error", err)
+			}
+			finish(provider.Name(), results)
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	finalResults := mergeProviderSearchResults(providerResults)
+	mu.Unlock()
+	go cacheSearchResults(finalResults)
+}
+
+func normalizeSearchModsRequest(req appstructs.SearchModsRequest) appstructs.SearchModsRequest {
+	req.Query = strings.TrimSpace(req.Query)
+	req.Version = strings.TrimSpace(req.Version)
+	req.ModLoader = strings.ToLower(strings.TrimSpace(req.ModLoader))
+	if req.Limit <= 0 {
+		req.Limit = 10
+	}
+	if req.Offset < 0 {
+		req.Offset = 0
+	}
+	return req
 }
 
 func ResolveProjectsByHashes(hashes []string) map[string]models.ModProject {
@@ -199,6 +250,30 @@ func LookupProjectByPlatform(platform, idOrSlug, mcVersion, modLoader string) (m
 		return models.ModProject{}, false
 	}
 	return results[0], true
+}
+
+func LookupProjectByPlatformSlug(platform, slug, mcVersion, modLoader string) (models.ModProject, bool) {
+	return lookupProjectByPlatformMatching(platform, slug, mcVersion, modLoader, func(project models.ModProject, expected string) bool {
+		return strings.EqualFold(strings.TrimSpace(project.Slug), expected)
+	})
+}
+
+func LookupProjectByPlatformID(platform, projectID, mcVersion, modLoader string) (models.ModProject, bool) {
+	return lookupProjectByPlatformMatching(platform, projectID, mcVersion, modLoader, func(project models.ModProject, expected string) bool {
+		return strings.EqualFold(strings.TrimSpace(project.ProjectID), expected)
+	})
+}
+
+func lookupProjectByPlatformMatching(platform, idOrSlug, mcVersion, modLoader string, match func(models.ModProject, string) bool) (models.ModProject, bool) {
+	expected := strings.TrimSpace(idOrSlug)
+	if expected == "" {
+		return models.ModProject{}, false
+	}
+	project, ok := LookupProjectByPlatform(platform, expected, mcVersion, modLoader)
+	if !ok || !match(project, expected) {
+		return models.ModProject{}, false
+	}
+	return project, true
 }
 
 func providerByPlatform(platform string) modProvider {

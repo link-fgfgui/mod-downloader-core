@@ -185,12 +185,28 @@ func (s *Service) SearchModsCollect(req appstructs.SearchModsRequest) appstructs
 	return last
 }
 
+func (s *Service) SearchModsTextCollect(req appstructs.SearchModsRequest) appstructs.SearchModsUpdate {
+	var last appstructs.SearchModsUpdate
+	providers.SearchModsText(req, func(update appstructs.SearchModsUpdate) {
+		last = update
+	})
+	return last
+}
+
 func (s *Service) ListMatchingProjectVersions(result models.ModProject, minecraftVersion string, modLoader string) []models.ModVersion {
 	return providers.ListMatchingProjectVersions(result, minecraftVersion, modLoader)
 }
 
 func (s *Service) LookupProject(platform, idOrSlug, mcVersion, modLoader string) (models.ModProject, bool) {
 	return providers.LookupProjectByPlatform(platform, idOrSlug, mcVersion, modLoader)
+}
+
+func (s *Service) LookupProjectBySlug(platform, slug, mcVersion, modLoader string) (models.ModProject, bool) {
+	return providers.LookupProjectByPlatformSlug(platform, slug, mcVersion, modLoader)
+}
+
+func (s *Service) LookupProjectByID(platform, projectID, mcVersion, modLoader string) (models.ModProject, bool) {
+	return providers.LookupProjectByPlatformID(platform, projectID, mcVersion, modLoader)
 }
 
 func (s *Service) GetPinnedModVersion(platform string, modID string, minecraftVersion string, modLoader string) database.PinnedMod {
