@@ -122,6 +122,13 @@ type InstallToDirRequest struct {
 	VersionID        string            `json:"versionId,omitempty"`
 }
 
+const (
+	LocalModBatchActionEnable  = "enable"
+	LocalModBatchActionDisable = "disable"
+	LocalModBatchActionInvert  = "invert"
+	LocalModBatchActionDelete  = "delete"
+)
+
 func New(options Options) *Service {
 	return &Service{config: options.Config, options: options}
 }
@@ -631,6 +638,202 @@ func (s *Service) LocalModsInDir(dir, minecraftVersion, modLoader string) ([]str
 	mods := minecraft.ScanModsDir(dir, instanceID, minecraftVersion, modLoader, "")
 	enriched, _ := enrichModMetadata(mods)
 	return enriched, nil
+}
+
+func (s *Service) ApplyLocalModBatchOperation(req appstructs.LocalModBatchOperationRequest) (structs.VersionInfo, error) {
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	selected := global.GetSelectedVersion()
+	if selected.ID == "" && selected.Name == "" {
+		return structs.VersionInfo{}, errors.New("no selected version")
+	}
+
+	versionDir := minecraft.VersionDirPath(global.GetMinecraftDir(), selected)
+	if strings.TrimSpace(versionDir) == "" {
+		return s.RefreshSelectedVersionMods(), errors.New("selected version directory not found")
+	}
+	modsDir := filepath.Join(versionDir, "mods")
+
+	ops, err := planLocalModBatchOperations(req.Paths, action, modsDir, global.GetMinecraftDir())
+	if err != nil {
+		return s.RefreshSelectedVersionMods(), err
+	}
+	if err := applyLocalModFileOperations(ops); err != nil {
+		return s.RefreshSelectedVersionMods(), err
+	}
+	return s.RefreshSelectedVersionMods(), nil
+}
+
+type localModFileOperation struct {
+	action string
+	source string
+	target string
+}
+
+func planLocalModBatchOperations(paths []string, action string, modsDir string, minecraftDir string) ([]localModFileOperation, error) {
+	switch action {
+	case LocalModBatchActionEnable, LocalModBatchActionDisable, LocalModBatchActionInvert, LocalModBatchActionDelete:
+	default:
+		return nil, fmt.Errorf("unsupported local mod action: %s", action)
+	}
+	if len(paths) == 0 {
+		return nil, errors.New("no local mod paths selected")
+	}
+
+	modsDir, err := filepath.Abs(filepath.Clean(modsDir))
+	if err != nil {
+		return nil, err
+	}
+	minecraftDir = strings.TrimSpace(minecraftDir)
+	if minecraftDir != "" {
+		if abs, err := filepath.Abs(filepath.Clean(minecraftDir)); err == nil {
+			minecraftDir = abs
+		}
+	}
+
+	seen := make(map[string]bool, len(paths))
+	targets := make(map[string]string, len(paths))
+	ops := make([]localModFileOperation, 0, len(paths))
+	for _, rawPath := range paths {
+		source, err := resolveSelectedLocalModPath(rawPath, modsDir, minecraftDir)
+		if err != nil {
+			return nil, err
+		}
+		if seen[source] {
+			continue
+		}
+		seen[source] = true
+
+		info, err := os.Stat(source)
+		if err != nil {
+			return nil, fmt.Errorf("local mod file not found: %s", rawPath)
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("local mod path is a directory: %s", rawPath)
+		}
+
+		fileAction := action
+		if action == LocalModBatchActionInvert {
+			if localModPathDisabled(source) {
+				fileAction = LocalModBatchActionEnable
+			} else {
+				fileAction = LocalModBatchActionDisable
+			}
+		}
+
+		op := localModFileOperation{action: fileAction, source: source}
+		switch fileAction {
+		case LocalModBatchActionEnable:
+			if !localModPathDisabled(source) {
+				continue
+			}
+			op.target = strings.TrimSuffix(source, ".disabled")
+			if err := validateLocalModRenameTarget(source, op.target, targets); err != nil {
+				return nil, err
+			}
+		case LocalModBatchActionDisable:
+			if localModPathDisabled(source) {
+				continue
+			}
+			op.target = source + ".disabled"
+			if err := validateLocalModRenameTarget(source, op.target, targets); err != nil {
+				return nil, err
+			}
+		case LocalModBatchActionDelete:
+		default:
+			return nil, fmt.Errorf("unsupported local mod action: %s", fileAction)
+		}
+		ops = append(ops, op)
+	}
+	return ops, nil
+}
+
+func applyLocalModFileOperations(ops []localModFileOperation) error {
+	for _, op := range ops {
+		switch op.action {
+		case LocalModBatchActionEnable, LocalModBatchActionDisable:
+			if err := os.Rename(op.source, op.target); err != nil {
+				return err
+			}
+			global.RemoveLocalModByPath(op.source)
+		case LocalModBatchActionDelete:
+			if err := os.Remove(op.source); err != nil {
+				return err
+			}
+			global.RemoveLocalModByPath(op.source)
+		default:
+			return fmt.Errorf("unsupported local mod action: %s", op.action)
+		}
+	}
+	return nil
+}
+
+func resolveSelectedLocalModPath(rawPath string, modsDir string, minecraftDir string) (string, error) {
+	rawPath = strings.TrimSpace(rawPath)
+	if rawPath == "" {
+		return "", errors.New("empty local mod path")
+	}
+
+	candidates := []string{rawPath}
+	if !filepath.IsAbs(rawPath) {
+		if minecraftDir != "" {
+			candidates = append(candidates, filepath.Join(minecraftDir, rawPath))
+		}
+		candidates = append(candidates, filepath.Join(modsDir, rawPath))
+	}
+
+	missingInside := false
+	for _, candidate := range candidates {
+		abs, err := filepath.Abs(filepath.Clean(candidate))
+		if err != nil {
+			continue
+		}
+		if !pathInsideDir(abs, modsDir) {
+			continue
+		}
+		if !isLocalModJarPath(abs) {
+			return "", fmt.Errorf("local mod path is not a jar: %s", rawPath)
+		}
+		if _, err := os.Stat(abs); err == nil {
+			return abs, nil
+		} else if os.IsNotExist(err) {
+			missingInside = true
+		}
+	}
+
+	if missingInside {
+		return "", fmt.Errorf("local mod file not found: %s", rawPath)
+	}
+	return "", fmt.Errorf("local mod path is outside selected instance: %s", rawPath)
+}
+
+func validateLocalModRenameTarget(source string, target string, plannedTargets map[string]string) error {
+	if existingSource, ok := plannedTargets[target]; ok && existingSource != source {
+		return fmt.Errorf("multiple local mod files target the same path: %s", target)
+	}
+	if _, err := os.Stat(target); err == nil {
+		return fmt.Errorf("local mod target already exists: %s", target)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	plannedTargets[target] = source
+	return nil
+}
+
+func isLocalModJarPath(path string) bool {
+	lower := strings.ToLower(path)
+	return strings.HasSuffix(lower, ".jar") || strings.HasSuffix(lower, ".jar.disabled")
+}
+
+func localModPathDisabled(path string) bool {
+	return strings.HasSuffix(strings.ToLower(path), ".jar.disabled")
+}
+
+func pathInsideDir(path string, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil || rel == "." {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func (s *Service) LoadVersionsFromDisk(mcDir string) []structs.VersionInfo {

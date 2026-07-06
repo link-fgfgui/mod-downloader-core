@@ -4,12 +4,14 @@ import (
 	"archive/zip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/modbridge"
 	"github.com/link-fgfgui/mod-downloader-core/models"
+	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 	structs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
 
@@ -46,6 +48,104 @@ func TestLocalModsInDirScansExplicitModsDir(t *testing.T) {
 	if paths[0].Path != filepath.Join(modsDir, "example.jar") {
 		t.Fatalf("indexed path = %q", paths[0].Path)
 	}
+}
+
+func TestApplyLocalModBatchOperationDisableEnableInvertDelete(t *testing.T) {
+	root, modsDir := setupSelectedLocalModInstance(t)
+	enabled := filepath.Join(modsDir, "enabled.jar")
+	disabled := filepath.Join(modsDir, "disabled.jar.disabled")
+	removed := filepath.Join(modsDir, "remove.jar")
+	writeFile(t, enabled)
+	writeFile(t, disabled)
+	writeFile(t, removed)
+
+	svc := New(Options{})
+	if _, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
+		Action: LocalModBatchActionDisable,
+		Paths:  []string{filepath.ToSlash(filepath.Join("versions", "test", "mods", "enabled.jar"))},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertMissing(t, enabled)
+	assertExists(t, enabled+".disabled")
+
+	if _, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
+		Action: LocalModBatchActionEnable,
+		Paths:  []string{filepath.Join(root, "versions", "test", "mods", "enabled.jar.disabled")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertExists(t, enabled)
+	assertMissing(t, enabled+".disabled")
+
+	if _, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
+		Action: LocalModBatchActionInvert,
+		Paths:  []string{enabled, disabled},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertExists(t, enabled+".disabled")
+	assertMissing(t, enabled)
+	assertExists(t, strings.TrimSuffix(disabled, ".disabled"))
+	assertMissing(t, disabled)
+
+	if _, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
+		Action: LocalModBatchActionDelete,
+		Paths:  []string{removed},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertMissing(t, removed)
+}
+
+func TestApplyLocalModBatchOperationDeduplicatesPaths(t *testing.T) {
+	_, modsDir := setupSelectedLocalModInstance(t)
+	source := filepath.Join(modsDir, "dup.jar")
+	writeFile(t, source)
+
+	svc := New(Options{})
+	if _, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
+		Action: LocalModBatchActionDisable,
+		Paths:  []string{source, source},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertMissing(t, source)
+	assertExists(t, source+".disabled")
+}
+
+func TestApplyLocalModBatchOperationRejectsMissingOutsideAndCollision(t *testing.T) {
+	_, modsDir := setupSelectedLocalModInstance(t)
+	source := filepath.Join(modsDir, "collision.jar")
+	writeFile(t, source)
+	writeFile(t, source+".disabled")
+
+	svc := New(Options{})
+	if _, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
+		Action: LocalModBatchActionDisable,
+		Paths:  []string{source},
+	}); err == nil {
+		t.Fatal("collision disable returned nil error")
+	}
+	assertExists(t, source)
+	assertExists(t, source+".disabled")
+
+	if _, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
+		Action: LocalModBatchActionDelete,
+		Paths:  []string{filepath.Join(modsDir, "missing.jar")},
+	}); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("missing delete error = %v, want not found", err)
+	}
+
+	outside := filepath.Join(t.TempDir(), "outside.jar")
+	writeFile(t, outside)
+	if _, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
+		Action: LocalModBatchActionDelete,
+		Paths:  []string{outside},
+	}); err == nil || !strings.Contains(err.Error(), "outside selected instance") {
+		t.Fatalf("outside delete error = %v, want outside selected instance", err)
+	}
+	assertExists(t, outside)
 }
 
 func TestEnrichModMetadataPrefersOnlineDisplayFields(t *testing.T) {
@@ -107,6 +207,56 @@ func assertStringSlice(t *testing.T, got []string, want []string) {
 		if got[i] != want[i] {
 			t.Fatalf("strings[%d] = %q, want %q (all: %#v)", i, got[i], want[i], got)
 		}
+	}
+}
+
+func setupSelectedLocalModInstance(t *testing.T) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	version := structs.VersionInfo{
+		ID:               "test",
+		Name:             "test",
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+	}
+	global.SetMinecraftDir(root)
+	global.SetVersionsForDir(root, []structs.VersionInfo{version})
+	global.SetSelectedVersion(version)
+	global.ClearLocalMods()
+	t.Cleanup(func() {
+		global.SetMinecraftDir("")
+		global.InvalidateVersions()
+		global.ClearLocalMods()
+	})
+
+	modsDir := filepath.Join(root, "versions", "test", "mods")
+	if err := os.MkdirAll(modsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return root, modsDir
+}
+
+func writeFile(t *testing.T, path string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("jar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertExists(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected path to exist %q: %v", path, err)
+	}
+}
+
+func assertMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected path to be missing %q: %v", path, err)
 	}
 }
 
