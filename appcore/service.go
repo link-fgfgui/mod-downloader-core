@@ -79,12 +79,14 @@ type Service struct {
 
 type AppPreferences struct {
 	Theme                       string  `json:"theme"`
+	AnimationMode               string  `json:"animationMode"`
 	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
 }
 
 type SettingsView struct {
 	Theme                       string  `json:"theme"`
+	AnimationMode               string  `json:"animationMode"`
 	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
 	MinecraftDir                string  `json:"minecraftDir"`
@@ -100,6 +102,7 @@ type SaveApiKeysRequest struct {
 }
 
 type SaveAnimationSettingsRequest struct {
+	AnimationMode               string  `json:"animationMode"`
 	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
 }
@@ -285,13 +288,16 @@ func (s *Service) GetPreferences() AppPreferences {
 	if s.config == nil {
 		return AppPreferences{
 			Theme:                       configs.ThemeDark.String(),
+			AnimationMode:               configs.DefaultAnimationMode.String(),
 			AnimationEnabled:            configs.DefaultAnimationsEnabled,
 			AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
 		}
 	}
+	animationMode := s.config.Prefers.AnimationModeValue()
 	return AppPreferences{
 		Theme:                       s.config.Prefers.Theme.Normalized().String(),
-		AnimationEnabled:            s.config.Prefers.AnimationsEnabledValue(),
+		AnimationMode:               animationMode.String(),
+		AnimationEnabled:            animationMode != configs.AnimationModeOff,
 		AnimationDurationMultiplier: s.config.Prefers.NormalizedAnimationDurationMultiplier(),
 	}
 }
@@ -299,12 +305,15 @@ func (s *Service) GetPreferences() AppPreferences {
 func (s *Service) GetSettings() SettingsView {
 	sv := SettingsView{
 		Theme:                       configs.ThemeDark.String(),
+		AnimationMode:               configs.DefaultAnimationMode.String(),
 		AnimationEnabled:            configs.DefaultAnimationsEnabled,
 		AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
 	}
 	if s.config != nil {
+		animationMode := s.config.Prefers.AnimationModeValue()
 		sv.Theme = s.config.Prefers.Theme.Normalized().String()
-		sv.AnimationEnabled = s.config.Prefers.AnimationsEnabledValue()
+		sv.AnimationMode = animationMode.String()
+		sv.AnimationEnabled = animationMode != configs.AnimationModeOff
 		sv.AnimationDurationMultiplier = s.config.Prefers.NormalizedAnimationDurationMultiplier()
 		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir))
 		sv.HasCurseforgeKey = strings.TrimSpace(s.config.Keys.CurseforgeApiKey) != ""
@@ -337,10 +346,22 @@ func (s *Service) SaveAnimationSettings(req SaveAnimationSettingsRequest) Settin
 	if s.config == nil {
 		s.config = &configs.Config{}
 	}
-	s.config.Prefers.AnimationsEnabled = configs.BoolPtr(req.AnimationEnabled)
+	var animationMode configs.AnimationMode
+	if strings.TrimSpace(req.AnimationMode) != "" {
+		animationMode = configs.ParseAnimationMode(req.AnimationMode)
+	}
+	if animationMode == "" {
+		if req.AnimationEnabled {
+			animationMode = configs.AnimationModeVuetify
+		} else {
+			animationMode = configs.AnimationModeOff
+		}
+	}
+	s.config.Prefers.AnimationMode = animationMode
+	s.config.Prefers.AnimationsEnabled = configs.BoolPtr(animationMode != configs.AnimationModeOff)
 	s.config.Prefers.AnimationDurationMultiplier = configs.NormalizeAnimationDurationMultiplier(req.AnimationDurationMultiplier)
 	if err := configs.Save(s.config); err != nil {
-		logging.Error("save animation settings failed", "animationEnabled", req.AnimationEnabled, "animationDurationMultiplier", req.AnimationDurationMultiplier, "error", err)
+		logging.Error("save animation settings failed", "animationMode", animationMode, "animationDurationMultiplier", req.AnimationDurationMultiplier, "error", err)
 	}
 	return s.GetSettings()
 }

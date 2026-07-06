@@ -20,6 +20,9 @@ func TestPreferencesThemeReadsPrefixedEnvironment(t *testing.T) {
 	if cfg.Prefers.Theme != ThemeLight {
 		t.Fatalf("theme = %q, want %q", cfg.Prefers.Theme, ThemeLight)
 	}
+	if cfg.Prefers.AnimationModeValue() != DefaultAnimationMode {
+		t.Fatalf("animation mode = %q, want %q", cfg.Prefers.AnimationModeValue(), DefaultAnimationMode)
+	}
 	if cfg.Prefers.NormalizedAnimationDurationMultiplier() != 2.5 {
 		t.Fatalf("animation multiplier = %v, want 2.5", cfg.Prefers.NormalizedAnimationDurationMultiplier())
 	}
@@ -83,6 +86,31 @@ func TestParseThemeSupportsLegacyNumericValues(t *testing.T) {
 	}
 }
 
+func TestParseAnimationModeSupportsModesAndLegacyValues(t *testing.T) {
+	tests := map[string]AnimationMode{
+		"":         AnimationModeVuetify,
+		"0":        AnimationModeOff,
+		"false":    AnimationModeOff,
+		"off":      AnimationModeOff,
+		"1":        AnimationModeVuetify,
+		"true":     AnimationModeVuetify,
+		"vuetify":  AnimationModeVuetify,
+		"2":        AnimationModeGSAP,
+		"gsap":     AnimationModeGSAP,
+		" GSAP  ":  AnimationModeGSAP,
+		"disabled": AnimationModeOff,
+		"enabled":  AnimationModeVuetify,
+	}
+	for value, want := range tests {
+		if got := ParseAnimationMode(value); got != want {
+			t.Fatalf("ParseAnimationMode(%q) = %q, want %q", value, got, want)
+		}
+	}
+	if got := ParseAnimationMode("invalid"); got != "" {
+		t.Fatalf("ParseAnimationMode(invalid) = %q, want empty", got)
+	}
+}
+
 func TestPreferencesThemeReadsStringTOML(t *testing.T) {
 	var cfg Config
 	if _, err := toml.Decode(`
@@ -99,8 +127,28 @@ animation_duration_multiplier = 1.75
 	if cfg.Prefers.AnimationsEnabledValue() {
 		t.Fatal("animations enabled = true, want false")
 	}
+	if cfg.Prefers.AnimationModeValue() != AnimationModeOff {
+		t.Fatalf("animation mode = %q, want %q", cfg.Prefers.AnimationModeValue(), AnimationModeOff)
+	}
 	if cfg.Prefers.NormalizedAnimationDurationMultiplier() != 1.75 {
 		t.Fatalf("animation multiplier = %v, want 1.75", cfg.Prefers.NormalizedAnimationDurationMultiplier())
+	}
+}
+
+func TestPreferencesAnimationModeTOMLTakesPrecedenceOverLegacyEnabled(t *testing.T) {
+	var cfg Config
+	if _, err := toml.Decode(`
+[preferences]
+animation_mode = "gsap"
+animations_enabled = false
+`, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Prefers.AnimationModeValue() != AnimationModeGSAP {
+		t.Fatalf("animation mode = %q, want %q", cfg.Prefers.AnimationModeValue(), AnimationModeGSAP)
+	}
+	if !cfg.Prefers.AnimationsEnabledValue() {
+		t.Fatal("animations enabled = false, want true")
 	}
 }
 
@@ -119,6 +167,9 @@ theme = 2
 
 func TestPreferencesAnimationDefaultsAndNormalization(t *testing.T) {
 	defaults := Preferences{}
+	if defaults.AnimationModeValue() != DefaultAnimationMode {
+		t.Fatalf("default animation mode = %q, want %q", defaults.AnimationModeValue(), DefaultAnimationMode)
+	}
 	if !defaults.AnimationsEnabledValue() {
 		t.Fatal("default animations enabled = false, want true")
 	}
