@@ -10,6 +10,7 @@ import (
 
 func TestPreferencesThemeReadsPrefixedEnvironment(t *testing.T) {
 	t.Setenv("PREFERS_THEME", "light")
+	t.Setenv("PREFERS_ANIMATION_DURATION_MULTIPLIER", "2.5")
 	t.Setenv("THEME", "dark")
 
 	var cfg Config
@@ -18,6 +19,9 @@ func TestPreferencesThemeReadsPrefixedEnvironment(t *testing.T) {
 	}
 	if cfg.Prefers.Theme != ThemeLight {
 		t.Fatalf("theme = %q, want %q", cfg.Prefers.Theme, ThemeLight)
+	}
+	if cfg.Prefers.NormalizedAnimationDurationMultiplier() != 2.5 {
+		t.Fatalf("animation multiplier = %v, want 2.5", cfg.Prefers.NormalizedAnimationDurationMultiplier())
 	}
 }
 
@@ -84,11 +88,19 @@ func TestPreferencesThemeReadsStringTOML(t *testing.T) {
 	if _, err := toml.Decode(`
 [preferences]
 theme = "system"
+animations_enabled = false
+animation_duration_multiplier = 1.75
 `, &cfg); err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Prefers.Theme != ThemeSystem {
 		t.Fatalf("theme = %q, want %q", cfg.Prefers.Theme, ThemeSystem)
+	}
+	if cfg.Prefers.AnimationsEnabledValue() {
+		t.Fatal("animations enabled = true, want false")
+	}
+	if cfg.Prefers.NormalizedAnimationDurationMultiplier() != 1.75 {
+		t.Fatalf("animation multiplier = %v, want 1.75", cfg.Prefers.NormalizedAnimationDurationMultiplier())
 	}
 }
 
@@ -102,5 +114,29 @@ theme = 2
 	}
 	if cfg.Prefers.Theme != ThemeSystem {
 		t.Fatalf("theme = %q, want %q", cfg.Prefers.Theme, ThemeSystem)
+	}
+}
+
+func TestPreferencesAnimationDefaultsAndNormalization(t *testing.T) {
+	defaults := Preferences{}
+	if !defaults.AnimationsEnabledValue() {
+		t.Fatal("default animations enabled = false, want true")
+	}
+	if defaults.NormalizedAnimationDurationMultiplier() != DefaultAnimationDurationMultiplier {
+		t.Fatalf("default animation multiplier = %v, want %v", defaults.NormalizedAnimationDurationMultiplier(), DefaultAnimationDurationMultiplier)
+	}
+
+	tests := map[float64]float64{
+		-1:   DefaultAnimationDurationMultiplier,
+		0:    DefaultAnimationDurationMultiplier,
+		0.1:  MinAnimationDurationMultiplier,
+		0.25: MinAnimationDurationMultiplier,
+		1.5:  1.5,
+		5:    MaxAnimationDurationMultiplier,
+	}
+	for value, want := range tests {
+		if got := NormalizeAnimationDurationMultiplier(value); got != want {
+			t.Fatalf("NormalizeAnimationDurationMultiplier(%v) = %v, want %v", value, got, want)
+		}
 	}
 }

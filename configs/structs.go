@@ -2,6 +2,7 @@ package configs
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -56,8 +57,45 @@ func ParseTheme(value string) Theme {
 }
 
 type Preferences struct {
-	Theme        Theme  `toml:"theme" json:"theme" env:"THEME" env-default:"dark"`
-	MinecraftDir string `toml:"minecraft_dir" json:"minecraft_dir" env:"MINECRAFT_DIR"`
+	Theme                       Theme   `toml:"theme" json:"theme" env:"THEME" env-default:"dark"`
+	MinecraftDir                string  `toml:"minecraft_dir" json:"minecraft_dir" env:"MINECRAFT_DIR"`
+	AnimationsEnabled           *bool   `toml:"animations_enabled" json:"animations_enabled"`
+	AnimationDurationMultiplier float64 `toml:"animation_duration_multiplier" json:"animation_duration_multiplier" env:"ANIMATION_DURATION_MULTIPLIER"`
+}
+
+const (
+	DefaultAnimationsEnabled           = true
+	DefaultAnimationDurationMultiplier = 1.0
+	MinAnimationDurationMultiplier     = 0.25
+	MaxAnimationDurationMultiplier     = 3.0
+)
+
+func BoolPtr(value bool) *bool {
+	return &value
+}
+
+func (p Preferences) AnimationsEnabledValue() bool {
+	if p.AnimationsEnabled == nil {
+		return DefaultAnimationsEnabled
+	}
+	return *p.AnimationsEnabled
+}
+
+func (p Preferences) NormalizedAnimationDurationMultiplier() float64 {
+	return NormalizeAnimationDurationMultiplier(p.AnimationDurationMultiplier)
+}
+
+func NormalizeAnimationDurationMultiplier(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
+		return DefaultAnimationDurationMultiplier
+	}
+	if value < MinAnimationDurationMultiplier {
+		return MinAnimationDurationMultiplier
+	}
+	if value > MaxAnimationDurationMultiplier {
+		return MaxAnimationDurationMultiplier
+	}
+	return value
 }
 
 type RuntimeConfig struct {
