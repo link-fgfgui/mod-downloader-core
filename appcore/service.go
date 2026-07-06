@@ -78,21 +78,33 @@ type Service struct {
 }
 
 type AppPreferences struct {
-	Theme string `json:"theme"`
+	Theme                       string  `json:"theme"`
+	AnimationMode               string  `json:"animationMode"`
+	AnimationEnabled            bool    `json:"animationEnabled"`
+	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
 }
 
 type SettingsView struct {
-	Theme             string `json:"theme"`
-	MinecraftDir      string `json:"minecraftDir"`
-	HasCurseforgeKey  bool   `json:"hasCurseforgeKey"`
-	CurseforgeKeyMask string `json:"curseforgeKeyMask"`
-	HasModrinthKey    bool   `json:"hasModrinthKey"`
-	ModrinthKeyMask   string `json:"modrinthKeyMask"`
+	Theme                       string  `json:"theme"`
+	AnimationMode               string  `json:"animationMode"`
+	AnimationEnabled            bool    `json:"animationEnabled"`
+	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
+	MinecraftDir                string  `json:"minecraftDir"`
+	HasCurseforgeKey            bool    `json:"hasCurseforgeKey"`
+	CurseforgeKeyMask           string  `json:"curseforgeKeyMask"`
+	HasModrinthKey              bool    `json:"hasModrinthKey"`
+	ModrinthKeyMask             string  `json:"modrinthKeyMask"`
 }
 
 type SaveApiKeysRequest struct {
 	CurseforgeApiKey string `json:"curseforgeApiKey"`
 	ModrinthApiKey   string `json:"modrinthApiKey"`
+}
+
+type SaveAnimationSettingsRequest struct {
+	AnimationMode               string  `json:"animationMode"`
+	AnimationEnabled            bool    `json:"animationEnabled"`
+	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
 }
 
 type InstallWaitResult struct {
@@ -274,15 +286,35 @@ func (s *Service) GetMinecraftReleaseVersions() []string {
 
 func (s *Service) GetPreferences() AppPreferences {
 	if s.config == nil {
-		return AppPreferences{Theme: configs.ThemeDark.String()}
+		return AppPreferences{
+			Theme:                       configs.ThemeDark.String(),
+			AnimationMode:               configs.DefaultAnimationMode.String(),
+			AnimationEnabled:            configs.DefaultAnimationsEnabled,
+			AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
+		}
 	}
-	return AppPreferences{Theme: s.config.Prefers.Theme.Normalized().String()}
+	animationMode := s.config.Prefers.AnimationModeValue()
+	return AppPreferences{
+		Theme:                       s.config.Prefers.Theme.Normalized().String(),
+		AnimationMode:               animationMode.String(),
+		AnimationEnabled:            animationMode != configs.AnimationModeOff,
+		AnimationDurationMultiplier: s.config.Prefers.NormalizedAnimationDurationMultiplier(),
+	}
 }
 
 func (s *Service) GetSettings() SettingsView {
-	sv := SettingsView{Theme: configs.ThemeDark.String()}
+	sv := SettingsView{
+		Theme:                       configs.ThemeDark.String(),
+		AnimationMode:               configs.DefaultAnimationMode.String(),
+		AnimationEnabled:            configs.DefaultAnimationsEnabled,
+		AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
+	}
 	if s.config != nil {
+		animationMode := s.config.Prefers.AnimationModeValue()
 		sv.Theme = s.config.Prefers.Theme.Normalized().String()
+		sv.AnimationMode = animationMode.String()
+		sv.AnimationEnabled = animationMode != configs.AnimationModeOff
+		sv.AnimationDurationMultiplier = s.config.Prefers.NormalizedAnimationDurationMultiplier()
 		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir))
 		sv.HasCurseforgeKey = strings.TrimSpace(s.config.Keys.CurseforgeApiKey) != ""
 		sv.CurseforgeKeyMask = MaskKey(s.config.Keys.CurseforgeApiKey)
@@ -308,6 +340,30 @@ func (s *Service) SaveTheme(theme string) string {
 		logging.Error("save theme failed", "theme", parsed, "error", err)
 	}
 	return parsed.String()
+}
+
+func (s *Service) SaveAnimationSettings(req SaveAnimationSettingsRequest) SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	var animationMode configs.AnimationMode
+	if strings.TrimSpace(req.AnimationMode) != "" {
+		animationMode = configs.ParseAnimationMode(req.AnimationMode)
+	}
+	if animationMode == "" {
+		if req.AnimationEnabled {
+			animationMode = configs.AnimationModeVuetify
+		} else {
+			animationMode = configs.AnimationModeOff
+		}
+	}
+	s.config.Prefers.AnimationMode = animationMode
+	s.config.Prefers.AnimationsEnabled = configs.BoolPtr(animationMode != configs.AnimationModeOff)
+	s.config.Prefers.AnimationDurationMultiplier = configs.NormalizeAnimationDurationMultiplier(req.AnimationDurationMultiplier)
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save animation settings failed", "animationMode", animationMode, "animationDurationMultiplier", req.AnimationDurationMultiplier, "error", err)
+	}
+	return s.GetSettings()
 }
 
 func (s *Service) SaveMinecraftDirPreference(dir string) string {

@@ -2,6 +2,7 @@ package configs
 
 import (
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -55,9 +56,106 @@ func ParseTheme(value string) Theme {
 	}
 }
 
+type AnimationMode string
+
+const (
+	AnimationModeOff     AnimationMode = "off"
+	AnimationModeVuetify AnimationMode = "vuetify"
+	AnimationModeGSAP    AnimationMode = "gsap"
+)
+
+func (m *AnimationMode) UnmarshalText(text []byte) error {
+	mode := ParseAnimationMode(string(text))
+	if mode == "" {
+		return fmt.Errorf("invalid animation mode %q: expected off, vuetify, or gsap", strings.TrimSpace(string(text)))
+	}
+	*m = mode
+	return nil
+}
+
+func (m AnimationMode) MarshalText() ([]byte, error) {
+	return []byte(m.Normalized().String()), nil
+}
+
+func (m AnimationMode) String() string {
+	return string(m)
+}
+
+func (m AnimationMode) Normalized() AnimationMode {
+	if normalized := ParseAnimationMode(string(m)); normalized != "" {
+		return normalized
+	}
+	return DefaultAnimationMode
+}
+
+func ParseAnimationMode(value string) AnimationMode {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "true", "on", "enabled", "1", string(AnimationModeVuetify):
+		return AnimationModeVuetify
+	case "false", "disabled", "0", string(AnimationModeOff):
+		return AnimationModeOff
+	case "2", string(AnimationModeGSAP):
+		return AnimationModeGSAP
+	default:
+		return ""
+	}
+}
+
 type Preferences struct {
-	Theme        Theme  `toml:"theme" json:"theme" env:"THEME" env-default:"dark"`
-	MinecraftDir string `toml:"minecraft_dir" json:"minecraft_dir" env:"MINECRAFT_DIR"`
+	Theme                       Theme         `toml:"theme" json:"theme" env:"THEME" env-default:"dark"`
+	MinecraftDir                string        `toml:"minecraft_dir" json:"minecraft_dir" env:"MINECRAFT_DIR"`
+	AnimationMode               AnimationMode `toml:"animation_mode" json:"animation_mode" env:"ANIMATION_MODE"`
+	AnimationsEnabled           *bool         `toml:"animations_enabled" json:"animations_enabled"`
+	AnimationDurationMultiplier float64       `toml:"animation_duration_multiplier" json:"animation_duration_multiplier" env:"ANIMATION_DURATION_MULTIPLIER"`
+}
+
+const (
+	DefaultAnimationMode               = AnimationModeVuetify
+	DefaultAnimationsEnabled           = true
+	DefaultAnimationDurationMultiplier = 1.0
+	MinAnimationDurationMultiplier     = 0.25
+	MaxAnimationDurationMultiplier     = 3.0
+)
+
+func BoolPtr(value bool) *bool {
+	return &value
+}
+
+func (p Preferences) AnimationModeValue() AnimationMode {
+	if strings.TrimSpace(string(p.AnimationMode)) != "" {
+		if mode := ParseAnimationMode(string(p.AnimationMode)); mode != "" {
+			return mode
+		}
+		return DefaultAnimationMode
+	}
+	if p.AnimationsEnabled == nil {
+		return DefaultAnimationMode
+	}
+	if *p.AnimationsEnabled {
+		return AnimationModeVuetify
+	}
+	return AnimationModeOff
+}
+
+func (p Preferences) AnimationsEnabledValue() bool {
+	return p.AnimationModeValue() != AnimationModeOff
+}
+
+func (p Preferences) NormalizedAnimationDurationMultiplier() float64 {
+	return NormalizeAnimationDurationMultiplier(p.AnimationDurationMultiplier)
+}
+
+func NormalizeAnimationDurationMultiplier(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
+		return DefaultAnimationDurationMultiplier
+	}
+	if value < MinAnimationDurationMultiplier {
+		return MinAnimationDurationMultiplier
+	}
+	if value > MaxAnimationDurationMultiplier {
+		return MaxAnimationDurationMultiplier
+	}
+	return value
 }
 
 type RuntimeConfig struct {
