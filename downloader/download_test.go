@@ -11,7 +11,20 @@ import (
 	mcstructs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
 
+func resetDownloadQueueForTest(t *testing.T) {
+	t.Helper()
+	downloadQueue.Lock()
+	downloadQueue.nextID = 0
+	downloadQueue.pending = nil
+	downloadQueue.retryable = nil
+	downloadQueue.cancelRequested = nil
+	downloadQueue.running = false
+	downloadQueue.current = nil
+	downloadQueue.Unlock()
+}
+
 func TestGetDownloadStatesReturnsDefaultWhenSelectedInstanceHasNoLocalMods(t *testing.T) {
+	resetDownloadQueueForTest(t)
 	global.ClearLocalMods()
 	global.SetMinecraftDir(t.TempDir())
 	global.SetVersions([]mcstructs.VersionInfo{{
@@ -45,6 +58,7 @@ func TestGetDownloadStatesReturnsDefaultWhenSelectedInstanceHasNoLocalMods(t *te
 }
 
 func TestPathInLocalModPathsMatchesRelativePaths(t *testing.T) {
+	resetDownloadQueueForTest(t)
 	mcDir := t.TempDir()
 	global.SetMinecraftDir(mcDir)
 	t.Cleanup(func() {
@@ -61,6 +75,7 @@ func TestPathInLocalModPathsMatchesRelativePaths(t *testing.T) {
 }
 
 func TestDependencyDownloadRequestCarriesDependencyVersionID(t *testing.T) {
+	resetDownloadQueueForTest(t)
 	req, ok := dependencyDownloadRequest("Modrinth", models.ModDependency{
 		DependencyProjectID: "fabric-api",
 		DependencyVersionID: "version-123",
@@ -83,6 +98,7 @@ func TestDependencyDownloadRequestCarriesDependencyVersionID(t *testing.T) {
 }
 
 func TestQueueModDownloadAcceptsExplicitTargetWithoutSelectedInstance(t *testing.T) {
+	resetDownloadQueueForTest(t)
 	global.SetMinecraftDir("")
 	global.InvalidateVersions()
 	t.Cleanup(func() {
@@ -101,5 +117,85 @@ func TestQueueModDownloadAcceptsExplicitTargetWithoutSelectedInstance(t *testing
 	}
 	if result.Reason != "invalid request" {
 		t.Fatalf("reason = %q, want invalid request", result.Reason)
+	}
+}
+
+func TestCancelPendingDownloadKeepsRetryableQueueItem(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	downloadQueue.Lock()
+	downloadQueue.nextID = 1
+	downloadQueue.pending = []downloadJob{{
+		ID: "download-1",
+		Version: models.ModVersion{
+			ID:       "version-1",
+			Platform: "modrinth",
+			FileName: "sodium.jar",
+		},
+		Result: models.ModProject{
+			Title: "Sodium",
+		},
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+	}}
+	downloadQueue.Unlock()
+
+	if !CancelDownload(nil, "download-1") {
+		t.Fatal("CancelDownload() = false, want true")
+	}
+
+	state := GetDownloadQueueState()
+	if !state.Active || state.Pending != 0 || state.Running != 0 {
+		t.Fatalf("state summary = %#v", state)
+	}
+	if len(state.Items) != 1 {
+		t.Fatalf("item count = %d, want 1", len(state.Items))
+	}
+	item := state.Items[0]
+	if item.ID != "download-1" || item.Status != "canceled" || !item.Retryable || item.Cancelable {
+		t.Fatalf("item = %#v", item)
+	}
+}
+
+func TestRetryDownloadRequeuesRetryableItemWithFreshID(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	downloadQueue.Lock()
+	downloadQueue.nextID = 1
+	downloadQueue.retryable = []retryableDownloadJob{{
+		Status: "failed",
+		Reason: "network error",
+		Job: downloadJob{
+			ID: "download-1",
+			Version: models.ModVersion{
+				ID:       "version-1",
+				Platform: "modrinth",
+				FileName: "sodium.jar",
+			},
+			Result: models.ModProject{
+				Title: "Sodium",
+			},
+			TargetDir:        t.TempDir(),
+			InstanceID:       "instance",
+			MinecraftVersion: "1.21.1",
+			ModLoader:        "fabric",
+		},
+	}}
+	// Suppress the background runner; this test only needs to verify requeue state.
+	downloadQueue.running = true
+	downloadQueue.Unlock()
+
+	if !RetryDownload(nil, "download-1") {
+		t.Fatal("RetryDownload() = false, want true")
+	}
+
+	state := GetDownloadQueueState()
+	if state.Pending != 1 || len(state.Items) != 1 {
+		t.Fatalf("state = %#v", state)
+	}
+	item := state.Items[0]
+	if item.ID != "download-2" || item.Status != "pending" || !item.Cancelable || item.Retryable {
+		t.Fatalf("item = %#v", item)
+	}
+	if item.VersionID != "version-1" || item.MinecraftVersion != "1.21.1" || item.ModLoader != "fabric" {
+		t.Fatalf("item lost retry context: %#v", item)
 	}
 }

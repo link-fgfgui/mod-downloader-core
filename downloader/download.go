@@ -38,12 +38,22 @@ type downloadJob struct {
 	cancel           context.CancelFunc
 }
 
+type retryableDownloadJob struct {
+	Job    downloadJob
+	Status string
+	Reason string
+}
+
+const maxRetryableDownloadHistory = 20
+
 var downloadQueue = struct {
 	sync.Mutex
-	nextID  int64
-	pending []downloadJob
-	running bool
-	current *downloadJob
+	nextID          int64
+	pending         []downloadJob
+	retryable       []retryableDownloadJob
+	cancelRequested map[string]struct{}
+	running         bool
+	current         *downloadJob
 }{}
 
 func QueueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, curseForgeAPIKey string, events ...Events) appstructs.ModDownloadResult {
@@ -118,6 +128,7 @@ func CancelDownload(ctx context.Context, id string, events ...Events) bool {
 			continue
 		}
 		downloadQueue.pending = append(downloadQueue.pending[:i], downloadQueue.pending[i+1:]...)
+		appendRetryableDownloadLocked(job, "canceled", "canceled")
 		downloadQueue.Unlock()
 		emitDownloadQueueState(eventSink)
 		return true
@@ -126,6 +137,10 @@ func CancelDownload(ctx context.Context, id string, events ...Events) bool {
 	var cancel context.CancelFunc
 	if downloadQueue.current != nil && downloadQueue.current.ID == id {
 		cancel = downloadQueue.current.cancel
+		if downloadQueue.cancelRequested == nil {
+			downloadQueue.cancelRequested = make(map[string]struct{})
+		}
+		downloadQueue.cancelRequested[id] = struct{}{}
 	}
 	downloadQueue.Unlock()
 
@@ -134,6 +149,37 @@ func CancelDownload(ctx context.Context, id string, events ...Events) bool {
 	}
 	cancel()
 	emitDownloadQueueState(eventSink)
+	return true
+}
+
+func RetryDownload(ctx context.Context, id string, events ...Events) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	eventSink := firstEvents(events)
+
+	downloadQueue.Lock()
+	index := -1
+	var job downloadJob
+	for i, item := range downloadQueue.retryable {
+		if item.Job.ID != id {
+			continue
+		}
+		index = i
+		job = item.Job
+		break
+	}
+	if index < 0 {
+		downloadQueue.Unlock()
+		return false
+	}
+	downloadQueue.retryable = append(downloadQueue.retryable[:index], downloadQueue.retryable[index+1:]...)
+	downloadQueue.Unlock()
+
+	job.ID = ""
+	job.cancel = nil
+	enqueueDownload(ctx, job, eventSink)
 	return true
 }
 
@@ -228,8 +274,12 @@ func runDownloadQueue(ctx context.Context, events Events) {
 		if err := downloadModJob(jobCtx, job); err != nil {
 			if errors.Is(err, context.Canceled) {
 				logging.Info("download mod canceled", "fileName", job.Version.FileName, "versionID", job.Version.ID, "targetDir", job.TargetDir)
+				if consumeDownloadCancelRequest(job.ID) {
+					appendRetryableDownload(job, "canceled", "canceled")
+				}
 			} else {
 				logging.Error("download mod failed", "fileName", job.Version.FileName, "versionID", job.Version.ID, "targetDir", job.TargetDir, "error", err)
+				appendRetryableDownload(job, "failed", err.Error())
 				emitDownloadFailed(events, job, err)
 			}
 		}
@@ -667,15 +717,21 @@ func currentDownloadQueueState() appstructs.DownloadQueueState {
 	if downloadQueue.current != nil {
 		running = 1
 	}
-	items := make([]appstructs.DownloadQueueItem, 0, running+len(downloadQueue.pending))
+	items := make([]appstructs.DownloadQueueItem, 0, running+len(downloadQueue.pending)+len(downloadQueue.retryable))
 	if downloadQueue.current != nil {
 		items = append(items, downloadQueueItemFromJob(*downloadQueue.current, "running", true))
 	}
 	for _, job := range downloadQueue.pending {
 		items = append(items, downloadQueueItemFromJob(job, "pending", true))
 	}
+	for _, item := range downloadQueue.retryable {
+		queueItem := downloadQueueItemFromJob(item.Job, item.Status, false)
+		queueItem.Retryable = true
+		queueItem.Reason = item.Reason
+		items = append(items, queueItem)
+	}
 	return appstructs.DownloadQueueState{
-		Active:  running > 0 || len(downloadQueue.pending) > 0,
+		Active:  running > 0 || len(downloadQueue.pending) > 0 || len(downloadQueue.retryable) > 0,
 		Pending: len(downloadQueue.pending),
 		Running: running,
 		Items:   items,
@@ -698,6 +754,37 @@ func downloadQueueItemFromJob(job downloadJob, status string, cancelable bool) a
 		ModLoader:        job.ModLoader,
 		Cancelable:       cancelable,
 	}
+}
+
+func appendRetryableDownload(job downloadJob, status string, reason string) {
+	downloadQueue.Lock()
+	defer downloadQueue.Unlock()
+	appendRetryableDownloadLocked(job, status, reason)
+}
+
+func appendRetryableDownloadLocked(job downloadJob, status string, reason string) {
+	job.cancel = nil
+	downloadQueue.retryable = append(downloadQueue.retryable, retryableDownloadJob{
+		Job:    job,
+		Status: strings.TrimSpace(status),
+		Reason: strings.TrimSpace(reason),
+	})
+	if overflow := len(downloadQueue.retryable) - maxRetryableDownloadHistory; overflow > 0 {
+		downloadQueue.retryable = append([]retryableDownloadJob(nil), downloadQueue.retryable[overflow:]...)
+	}
+}
+
+func consumeDownloadCancelRequest(id string) bool {
+	downloadQueue.Lock()
+	defer downloadQueue.Unlock()
+	if downloadQueue.cancelRequested == nil {
+		return false
+	}
+	if _, ok := downloadQueue.cancelRequested[id]; !ok {
+		return false
+	}
+	delete(downloadQueue.cancelRequested, id)
+	return true
 }
 
 func firstEvents(events []Events) Events {

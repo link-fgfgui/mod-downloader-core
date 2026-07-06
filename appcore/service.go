@@ -399,6 +399,10 @@ func (s *Service) CancelDownload(id string) bool {
 	return downloader.CancelDownload(s.ctx, id, s.downloadEvents())
 }
 
+func (s *Service) RetryDownload(id string) bool {
+	return downloader.RetryDownload(s.ctx, id, s.downloadEvents())
+}
+
 func (s *Service) GetDownloadStates(req appstructs.DownloadStatesRequest) []appstructs.ModDownloadButtonState {
 	req = s.applyRuntimeDownloadStatesRequest(req)
 	return downloader.GetDownloadStates(req, func() {
