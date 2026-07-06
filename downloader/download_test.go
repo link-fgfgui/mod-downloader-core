@@ -18,6 +18,7 @@ func resetDownloadQueueForTest(t *testing.T) {
 	downloadQueue.pending = nil
 	downloadQueue.retryable = nil
 	downloadQueue.cancelRequested = nil
+	downloadQueue.restartRequested = nil
 	downloadQueue.running = false
 	downloadQueue.current = nil
 	downloadQueue.Unlock()
@@ -197,5 +198,89 @@ func TestRetryDownloadRequeuesRetryableItemWithFreshID(t *testing.T) {
 	}
 	if item.VersionID != "version-1" || item.MinecraftVersion != "1.21.1" || item.ModLoader != "fabric" {
 		t.Fatalf("item lost retry context: %#v", item)
+	}
+}
+
+func TestRunningDownloadIsRetryableAndMarksRestartRequest(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	canceled := false
+	downloadQueue.Lock()
+	downloadQueue.nextID = 1
+	downloadQueue.running = true
+	downloadQueue.current = &downloadJob{
+		ID: "download-1",
+		Version: models.ModVersion{
+			ID:       "version-1",
+			Platform: "modrinth",
+			FileName: "sodium.jar",
+		},
+		Result: models.ModProject{
+			Title: "Sodium",
+		},
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+		cancel: func() {
+			canceled = true
+		},
+	}
+	downloadQueue.Unlock()
+
+	state := GetDownloadQueueState()
+	if len(state.Items) != 1 || state.Items[0].Status != "running" || !state.Items[0].Retryable {
+		t.Fatalf("running item = %#v", state.Items)
+	}
+	if !RetryDownload(nil, "download-1") {
+		t.Fatal("RetryDownload() = false, want true")
+	}
+	if !canceled {
+		t.Fatal("running retry did not cancel active attempt")
+	}
+	if !consumeDownloadRestartRequest("download-1") {
+		t.Fatal("restart request was not recorded")
+	}
+	if consumeDownloadCancelRequest("download-1") {
+		t.Fatal("running retry should not record a user-cancel request")
+	}
+}
+
+func TestRetryStalledDownloadRequeuesUntilLimit(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	downloadQueue.Lock()
+	downloadQueue.running = true
+	downloadQueue.nextID = 1
+	downloadQueue.Unlock()
+
+	job := downloadJob{
+		ID: "download-1",
+		Version: models.ModVersion{
+			ID:       "version-1",
+			Platform: "modrinth",
+			FileName: "sodium.jar",
+		},
+		Result: models.ModProject{
+			Title: "Sodium",
+		},
+		AutoAttempt: 0,
+	}
+	if !retryStalledDownload(nil, job, Events{}) {
+		t.Fatal("retryStalledDownload() = false, want true")
+	}
+
+	state := GetDownloadQueueState()
+	if state.Pending != 1 || len(state.Items) != 1 {
+		t.Fatalf("state = %#v", state)
+	}
+	if state.Items[0].ID != "download-2" || state.Items[0].Status != "pending" {
+		t.Fatalf("item = %#v", state.Items[0])
+	}
+
+	downloadQueue.Lock()
+	requeuedAttempt := downloadQueue.pending[0].AutoAttempt
+	downloadQueue.Unlock()
+	if requeuedAttempt != 1 {
+		t.Fatalf("AutoAttempt = %d, want 1", requeuedAttempt)
+	}
+	if retryStalledDownload(nil, downloadJob{AutoAttempt: maxDownloadStallRetries}, Events{}) {
+		t.Fatal("retryStalledDownload() = true at retry limit, want false")
 	}
 }

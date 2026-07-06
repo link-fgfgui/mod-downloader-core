@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/logging"
@@ -35,6 +36,7 @@ type downloadJob struct {
 	MinecraftVersion string
 	ModLoader        string
 	CurseForgeAPIKey string
+	AutoAttempt      int
 	cancel           context.CancelFunc
 }
 
@@ -44,16 +46,26 @@ type retryableDownloadJob struct {
 	Reason string
 }
 
-const maxRetryableDownloadHistory = 20
+const (
+	maxRetryableDownloadHistory = 20
+	maxDownloadStallRetries     = 2
+)
+
+var (
+	errDownloadStalled           = errors.New("download stalled: no byte progress")
+	downloadStallTimeout         = 30 * time.Second
+	downloadProgressPollInterval = time.Second
+)
 
 var downloadQueue = struct {
 	sync.Mutex
-	nextID          int64
-	pending         []downloadJob
-	retryable       []retryableDownloadJob
-	cancelRequested map[string]struct{}
-	running         bool
-	current         *downloadJob
+	nextID           int64
+	pending          []downloadJob
+	retryable        []retryableDownloadJob
+	cancelRequested  map[string]struct{}
+	restartRequested map[string]struct{}
+	running          bool
+	current          *downloadJob
 }{}
 
 func QueueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, curseForgeAPIKey string, events ...Events) appstructs.ModDownloadResult {
@@ -170,16 +182,34 @@ func RetryDownload(ctx context.Context, id string, events ...Events) bool {
 		job = item.Job
 		break
 	}
-	if index < 0 {
+	if index >= 0 {
+		downloadQueue.retryable = append(downloadQueue.retryable[:index], downloadQueue.retryable[index+1:]...)
 		downloadQueue.Unlock()
-		return false
+
+		job.ID = ""
+		job.cancel = nil
+		job.AutoAttempt = 0
+		enqueueDownload(ctx, job, eventSink)
+		return true
 	}
-	downloadQueue.retryable = append(downloadQueue.retryable[:index], downloadQueue.retryable[index+1:]...)
+
+	var cancel context.CancelFunc
+	if downloadQueue.current != nil && downloadQueue.current.ID == id {
+		cancel = downloadQueue.current.cancel
+		if cancel != nil {
+			if downloadQueue.restartRequested == nil {
+				downloadQueue.restartRequested = make(map[string]struct{})
+			}
+			downloadQueue.restartRequested[id] = struct{}{}
+		}
+	}
 	downloadQueue.Unlock()
 
-	job.ID = ""
-	job.cancel = nil
-	enqueueDownload(ctx, job, eventSink)
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	emitDownloadQueueState(eventSink)
 	return true
 }
 
@@ -274,9 +304,14 @@ func runDownloadQueue(ctx context.Context, events Events) {
 		if err := downloadModJob(jobCtx, job); err != nil {
 			if errors.Is(err, context.Canceled) {
 				logging.Info("download mod canceled", "fileName", job.Version.FileName, "versionID", job.Version.ID, "targetDir", job.TargetDir)
-				if consumeDownloadCancelRequest(job.ID) {
+				if consumeDownloadRestartRequest(job.ID) {
+					job.AutoAttempt = 0
+					enqueueDownload(parentCtx, job, events)
+				} else if consumeDownloadCancelRequest(job.ID) {
 					appendRetryableDownload(job, "canceled", "canceled")
 				}
+			} else if errors.Is(err, errDownloadStalled) && retryStalledDownload(parentCtx, job, events) {
+				logging.Warn("download mod stalled, retrying", "fileName", job.Version.FileName, "versionID", job.Version.ID, "targetDir", job.TargetDir, "attempt", job.AutoAttempt+1, "maxRetries", maxDownloadStallRetries)
 			} else {
 				logging.Error("download mod failed", "fileName", job.Version.FileName, "versionID", job.Version.ID, "targetDir", job.TargetDir, "error", err)
 				appendRetryableDownload(job, "failed", err.Error())
@@ -538,8 +573,8 @@ func downloadModToTarget(ctx context.Context, job downloadJob, existing []global
 	req = req.WithContext(ctx)
 	setCurseForgeAPIKeyHeader(req, job)
 
-	resp := client.Do(req)
-	if err := resp.Err(); err != nil {
+	resp, err := doDownloadWithStallTimeout(ctx, client, req)
+	if err != nil {
 		return err
 	}
 	if resp.Filename == "" {
@@ -582,8 +617,8 @@ func downloadModWithLocalParse(ctx context.Context, job downloadJob) error {
 	req = req.WithContext(ctx)
 	setCurseForgeAPIKeyHeader(req, job)
 
-	resp := client.Do(req)
-	if err := resp.Err(); err != nil {
+	resp, err := doDownloadWithStallTimeout(ctx, client, req)
+	if err != nil {
 		return err
 	}
 	if resp.Filename == "" {
@@ -719,7 +754,9 @@ func currentDownloadQueueState() appstructs.DownloadQueueState {
 	}
 	items := make([]appstructs.DownloadQueueItem, 0, running+len(downloadQueue.pending)+len(downloadQueue.retryable))
 	if downloadQueue.current != nil {
-		items = append(items, downloadQueueItemFromJob(*downloadQueue.current, "running", true))
+		item := downloadQueueItemFromJob(*downloadQueue.current, "running", true)
+		item.Retryable = true
+		items = append(items, item)
 	}
 	for _, job := range downloadQueue.pending {
 		items = append(items, downloadQueueItemFromJob(job, "pending", true))
@@ -785,6 +822,77 @@ func consumeDownloadCancelRequest(id string) bool {
 	}
 	delete(downloadQueue.cancelRequested, id)
 	return true
+}
+
+func consumeDownloadRestartRequest(id string) bool {
+	downloadQueue.Lock()
+	defer downloadQueue.Unlock()
+	if downloadQueue.restartRequested == nil {
+		return false
+	}
+	if _, ok := downloadQueue.restartRequested[id]; !ok {
+		return false
+	}
+	delete(downloadQueue.restartRequested, id)
+	return true
+}
+
+func retryStalledDownload(ctx context.Context, job downloadJob, events Events) bool {
+	if job.AutoAttempt >= maxDownloadStallRetries {
+		return false
+	}
+	job.ID = ""
+	job.cancel = nil
+	job.AutoAttempt++
+	enqueueDownload(ctx, job, events)
+	return true
+}
+
+func doDownloadWithStallTimeout(ctx context.Context, client *grab.Client, req *grab.Request) (*grab.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	req = req.WithContext(attemptCtx)
+	resp := client.Do(req)
+	if err := waitForDownloadWithStallTimeout(resp, cancel, downloadStallTimeout, downloadProgressPollInterval); err != nil {
+		return resp, err
+	}
+	return resp, nil
+}
+
+func waitForDownloadWithStallTimeout(resp *grab.Response, cancel context.CancelFunc, stallTimeout time.Duration, pollInterval time.Duration) error {
+	if stallTimeout <= 0 {
+		return resp.Err()
+	}
+	if pollInterval <= 0 {
+		pollInterval = time.Second
+	}
+
+	lastBytes := resp.BytesComplete()
+	lastProgress := time.Now()
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-resp.Done:
+			return resp.Err()
+		case <-ticker.C:
+			currentBytes := resp.BytesComplete()
+			if currentBytes > lastBytes {
+				lastBytes = currentBytes
+				lastProgress = time.Now()
+				continue
+			}
+			if time.Since(lastProgress) >= stallTimeout {
+				cancel()
+				_ = resp.Err()
+				return errDownloadStalled
+			}
+		}
+	}
 }
 
 func firstEvents(events []Events) Events {
