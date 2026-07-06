@@ -26,6 +26,32 @@ type PinnedMod struct {
 	ModLoader        string `json:"modLoader"`
 }
 
+type FavoriteList struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt int64  `json:"createdAt"`
+	UpdatedAt int64  `json:"updatedAt"`
+	SortOrder int    `json:"sortOrder"`
+	System    bool   `json:"system,omitempty"`
+}
+
+type FavoriteMod struct {
+	ID               string   `json:"id"`
+	ListID           string   `json:"listId"`
+	Platform         string   `json:"platform"`
+	ModID            string   `json:"modId"`
+	VersionID        string   `json:"versionId,omitempty"`
+	MinecraftVersion string   `json:"minecraftVersion,omitempty"`
+	ModLoader        string   `json:"modLoader,omitempty"`
+	Title            string   `json:"title,omitempty"`
+	Slug             string   `json:"slug,omitempty"`
+	IconURL          string   `json:"iconUrl,omitempty"`
+	Description      string   `json:"description,omitempty"`
+	Categories       []string `json:"categories,omitempty"`
+	CreatedAt        int64    `json:"createdAt"`
+	UpdatedAt        int64    `json:"updatedAt"`
+}
+
 type ModPlatformVersionScope struct {
 	MinecraftVersion string
 	ModLoader        string
@@ -48,8 +74,28 @@ func normalizePinnedModKey(platform, modID, mcVersion, modLoader string) (string
 
 func normalizePinnedMod(p PinnedMod) PinnedMod {
 	p.Platform, p.ModID, p.MinecraftVersion, p.ModLoader = normalizePinnedModKey(p.Platform, p.ModID, p.MinecraftVersion, p.ModLoader)
+	p.ID = strings.TrimSpace(p.ID)
 	p.VersionID = strings.TrimSpace(p.VersionID)
 	return p
+}
+
+func normalizeFavoriteList(list FavoriteList) FavoriteList {
+	list.ID = strings.TrimSpace(list.ID)
+	list.Name = strings.TrimSpace(list.Name)
+	return list
+}
+
+func normalizeFavoriteMod(mod FavoriteMod) FavoriteMod {
+	mod.ID = strings.TrimSpace(mod.ID)
+	mod.ListID = strings.TrimSpace(mod.ListID)
+	mod.Platform, mod.ModID, mod.MinecraftVersion, mod.ModLoader = normalizePinnedModKey(mod.Platform, mod.ModID, mod.MinecraftVersion, mod.ModLoader)
+	mod.VersionID = strings.TrimSpace(mod.VersionID)
+	mod.Title = strings.TrimSpace(mod.Title)
+	mod.Slug = strings.TrimSpace(mod.Slug)
+	mod.IconURL = strings.TrimSpace(mod.IconURL)
+	mod.Description = strings.TrimSpace(mod.Description)
+	mod.Categories = models.NormalizeCategories(mod.Categories)
+	return mod
 }
 
 func makePlatformKey(platform, projectID string) platformKey {
@@ -63,6 +109,17 @@ func makeVersionKey(platform, projectID, versionID string) versionKey {
 func makePinnedModKey(platform, modID, mcVersion, modLoader string) pinnedModKey {
 	platform, modID, mcVersion, modLoader = normalizePinnedModKey(platform, modID, mcVersion, modLoader)
 	return pinnedModKey{Platform: platform, ModID: modID, MinecraftVersion: mcVersion, ModLoader: modLoader}
+}
+
+func makeFavoriteModKey(listID, platform, modID, mcVersion, modLoader string) favoriteModKey {
+	platform, modID, mcVersion, modLoader = normalizePinnedModKey(platform, modID, mcVersion, modLoader)
+	return favoriteModKey{
+		ListID:           strings.TrimSpace(listID),
+		Platform:         platform,
+		ModID:            modID,
+		MinecraftVersion: mcVersion,
+		ModLoader:        modLoader,
+	}
 }
 
 func makeVersionScopeKey(platform, projectID string, scope ModPlatformVersionScope) versionScopeKey {
@@ -765,6 +822,257 @@ func ListPinnedMods() []PinnedMod {
 		return pins[i].ModLoader < pins[j].ModLoader
 	})
 	return pins
+}
+
+// --- favorite lists ---
+
+func CreateFavoriteList(name string) (FavoriteList, error) {
+	d, err := readyDB()
+	if err != nil {
+		return FavoriteList{}, err
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return FavoriteList{}, nil
+	}
+
+	var list FavoriteList
+	err = d.update(func(state *cacheState, pool *stringPool) error {
+		now := time.Now().Unix()
+		maxSortOrder := 0
+		for _, existing := range state.FavoriteLists {
+			if existing.SortOrder > maxSortOrder {
+				maxSortOrder = existing.SortOrder
+			}
+		}
+		list = FavoriteList{
+			ID:        NewID(),
+			Name:      name,
+			CreatedAt: now,
+			UpdatedAt: now,
+			SortOrder: maxSortOrder + 1,
+		}
+		list = internFavoriteList(pool, list)
+		state.FavoriteLists[list.ID] = list
+		return nil
+	})
+	if err != nil {
+		logging.Error("create favorite list failed", "name", name, "error", err)
+		return FavoriteList{}, err
+	}
+	logging.Info("favorite list created", "id", list.ID, "name", list.Name)
+	return list, nil
+}
+
+func UpdateFavoriteListName(id, name string) (FavoriteList, bool, error) {
+	d, err := readyDB()
+	if err != nil {
+		return FavoriteList{}, false, err
+	}
+	id = strings.TrimSpace(id)
+	name = strings.TrimSpace(name)
+	if id == "" || name == "" {
+		return FavoriteList{}, false, nil
+	}
+
+	var list FavoriteList
+	found := false
+	err = d.update(func(state *cacheState, pool *stringPool) error {
+		existing, ok := state.FavoriteLists[id]
+		if !ok {
+			return nil
+		}
+		existing.Name = name
+		existing.UpdatedAt = time.Now().Unix()
+		list = internFavoriteList(pool, normalizeFavoriteList(existing))
+		state.FavoriteLists[list.ID] = list
+		found = true
+		return nil
+	})
+	if err != nil {
+		logging.Error("rename favorite list failed", "id", id, "name", name, "error", err)
+		return FavoriteList{}, false, err
+	}
+	if found {
+		logging.Info("favorite list renamed", "id", id, "name", name)
+	}
+	return list, found, nil
+}
+
+func DeleteFavoriteList(id string) (bool, error) {
+	d, err := readyDB()
+	if err != nil {
+		return false, err
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, nil
+	}
+
+	deleted := false
+	err = d.update(func(state *cacheState, pool *stringPool) error {
+		if _, ok := state.FavoriteLists[id]; !ok {
+			return nil
+		}
+		delete(state.FavoriteLists, id)
+		for key := range state.FavoriteMods {
+			if key.ListID == id {
+				delete(state.FavoriteMods, key)
+			}
+		}
+		deleted = true
+		return nil
+	})
+	if err != nil {
+		logging.Error("delete favorite list failed", "id", id, "error", err)
+		return false, err
+	}
+	if deleted {
+		logging.Info("favorite list deleted", "id", id)
+	}
+	return deleted, nil
+}
+
+func ListFavoriteLists() []FavoriteList {
+	d, err := readyDB()
+	if err != nil {
+		return nil
+	}
+
+	var lists []FavoriteList
+	err = d.view(func(state *cacheState) error {
+		lists = make([]FavoriteList, 0, len(state.FavoriteLists))
+		for _, list := range state.FavoriteLists {
+			lists = append(lists, list)
+		}
+		return nil
+	})
+	if err != nil {
+		logging.Error("list favorite lists failed", "error", err)
+		return nil
+	}
+	sort.SliceStable(lists, func(i, j int) bool {
+		if lists[i].SortOrder != lists[j].SortOrder {
+			return lists[i].SortOrder < lists[j].SortOrder
+		}
+		if lists[i].CreatedAt != lists[j].CreatedAt {
+			return lists[i].CreatedAt < lists[j].CreatedAt
+		}
+		return lists[i].Name < lists[j].Name
+	})
+	return lists
+}
+
+func UpsertFavoriteMod(mod FavoriteMod) (FavoriteMod, bool, error) {
+	d, err := readyDB()
+	if err != nil {
+		return FavoriteMod{}, false, err
+	}
+	mod = normalizeFavoriteMod(mod)
+	if mod.ListID == "" || mod.Platform == "" || mod.ModID == "" {
+		return FavoriteMod{}, false, nil
+	}
+
+	var saved FavoriteMod
+	ok := false
+	err = d.update(func(state *cacheState, pool *stringPool) error {
+		if _, foundList := state.FavoriteLists[mod.ListID]; !foundList {
+			return nil
+		}
+		now := time.Now().Unix()
+		key := internFavoriteModKey(pool, makeFavoriteModKey(mod.ListID, mod.Platform, mod.ModID, mod.MinecraftVersion, mod.ModLoader))
+		if existing, found := state.FavoriteMods[key]; found {
+			if mod.ID == "" {
+				mod.ID = existing.ID
+			}
+			if mod.CreatedAt == 0 {
+				mod.CreatedAt = existing.CreatedAt
+			}
+		}
+		if mod.ID == "" {
+			mod.ID = NewID()
+		}
+		if mod.CreatedAt == 0 {
+			mod.CreatedAt = now
+		}
+		mod.UpdatedAt = now
+		saved = internFavoriteMod(pool, mod)
+		state.FavoriteMods[key] = saved
+		ok = true
+		return nil
+	})
+	if err != nil {
+		logging.Error("upsert favorite mod failed", "listID", mod.ListID, "platform", mod.Platform, "modID", mod.ModID, "error", err)
+		return FavoriteMod{}, false, err
+	}
+	if ok {
+		logging.Info("favorite mod upserted", "listID", saved.ListID, "platform", saved.Platform, "modID", saved.ModID)
+	}
+	return copyFavoriteMod(saved), ok, nil
+}
+
+func DeleteFavoriteMod(listID, platform, modID, mcVersion, modLoader string) (bool, error) {
+	d, err := readyDB()
+	if err != nil {
+		return false, err
+	}
+	key := makeFavoriteModKey(listID, platform, modID, mcVersion, modLoader)
+	if key.ListID == "" || key.Platform == "" || key.ModID == "" {
+		return false, nil
+	}
+
+	deleted := false
+	err = d.update(func(state *cacheState, pool *stringPool) error {
+		if _, ok := state.FavoriteMods[key]; ok {
+			delete(state.FavoriteMods, key)
+			deleted = true
+		}
+		return nil
+	})
+	if err != nil {
+		logging.Error("delete favorite mod failed", "listID", key.ListID, "platform", key.Platform, "modID", key.ModID, "error", err)
+		return false, err
+	}
+	if deleted {
+		logging.Info("favorite mod deleted", "listID", key.ListID, "platform", key.Platform, "modID", key.ModID)
+	}
+	return deleted, nil
+}
+
+func ListFavoriteMods(listID string) []FavoriteMod {
+	d, err := readyDB()
+	if err != nil {
+		return nil
+	}
+	listID = strings.TrimSpace(listID)
+	if listID == "" {
+		return nil
+	}
+
+	var mods []FavoriteMod
+	err = d.view(func(state *cacheState) error {
+		mods = make([]FavoriteMod, 0)
+		for key, mod := range state.FavoriteMods {
+			if key.ListID == listID {
+				mods = append(mods, copyFavoriteMod(mod))
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		logging.Error("list favorite mods failed", "listID", listID, "error", err)
+		return nil
+	}
+	sort.SliceStable(mods, func(i, j int) bool {
+		if mods[i].CreatedAt != mods[j].CreatedAt {
+			return mods[i].CreatedAt < mods[j].CreatedAt
+		}
+		if mods[i].Platform != mods[j].Platform {
+			return mods[i].Platform < mods[j].Platform
+		}
+		return mods[i].ModID < mods[j].ModID
+	})
+	return mods
 }
 
 // --- version mod IDs ---

@@ -242,6 +242,126 @@ func TestListPinnedMods(t *testing.T) {
 	}
 }
 
+func TestFavoriteListsAndModsPersist(t *testing.T) {
+	path := openTestDB(t)
+
+	first, err := CreateFavoriteList(" Utilities ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := CreateFavoriteList("Performance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == "" || second.ID == "" || first.ID == second.ID {
+		t.Fatalf("list IDs = %q, %q", first.ID, second.ID)
+	}
+	if first.Name != "Utilities" || second.SortOrder <= first.SortOrder {
+		t.Fatalf("lists = %#v, %#v", first, second)
+	}
+
+	renamed, ok, err := UpdateFavoriteListName(first.ID, "Utility Mods")
+	if err != nil || !ok || renamed.Name != "Utility Mods" {
+		t.Fatalf("rename = %#v, %v, %v", renamed, ok, err)
+	}
+
+	item, ok, err := UpsertFavoriteMod(FavoriteMod{
+		ListID:           first.ID,
+		Platform:         "Modrinth",
+		ModID:            "Sodium",
+		VersionID:        "v1",
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "Fabric",
+		Title:            "Sodium",
+		Slug:             "sodium",
+		IconURL:          "https://example.com/icon.png",
+		Categories:       []string{"Performance", "performance", ""},
+	})
+	if err != nil || !ok {
+		t.Fatalf("upsert favorite mod = %#v, %v, %v", item, ok, err)
+	}
+	if item.Platform != "modrinth" || item.ModID != "sodium" || item.ModLoader != "fabric" {
+		t.Fatalf("normalized item = %#v", item)
+	}
+	if len(item.Categories) != 1 || item.Categories[0] != "performance" {
+		t.Fatalf("categories = %#v", item.Categories)
+	}
+
+	updated, ok, err := UpsertFavoriteMod(FavoriteMod{
+		ListID:           first.ID,
+		Platform:         "modrinth",
+		ModID:            "sodium",
+		VersionID:        "v2",
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+		Title:            "Sodium Updated",
+	})
+	if err != nil || !ok {
+		t.Fatalf("update favorite mod = %#v, %v, %v", updated, ok, err)
+	}
+	if updated.ID != item.ID || updated.VersionID != "v2" || updated.Title != "Sodium Updated" {
+		t.Fatalf("updated item = %#v, original = %#v", updated, item)
+	}
+
+	reopenTestDB(t, path)
+
+	lists := ListFavoriteLists()
+	if len(lists) != 2 {
+		t.Fatalf("lists after reopen = %#v", lists)
+	}
+	if lists[0].ID != first.ID || lists[0].Name != "Utility Mods" || lists[1].ID != second.ID {
+		t.Fatalf("list order after reopen = %#v", lists)
+	}
+
+	mods := ListFavoriteMods(first.ID)
+	if len(mods) != 1 || mods[0].ID != item.ID || mods[0].VersionID != "v2" || mods[0].Title != "Sodium Updated" {
+		t.Fatalf("mods after reopen = %#v", mods)
+	}
+
+	mods[0].Categories = []string{"mutated"}
+	if again := ListFavoriteMods(first.ID); len(again) != 1 || len(again[0].Categories) != 0 {
+		t.Fatalf("returned favorite mods are not copies: %#v", again)
+	}
+}
+
+func TestFavoriteListDeleteCascadesItems(t *testing.T) {
+	openTestDB(t)
+
+	list, err := CreateFavoriteList("To Delete")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := UpsertFavoriteMod(FavoriteMod{
+		ListID:   list.ID,
+		Platform: "modrinth",
+		ModID:    "sodium",
+	}); err != nil || !ok {
+		t.Fatalf("upsert favorite mod: %v, %v", ok, err)
+	}
+	if deleted, err := DeleteFavoriteList(list.ID); err != nil || !deleted {
+		t.Fatalf("delete favorite list = %v, %v", deleted, err)
+	}
+	if lists := ListFavoriteLists(); len(lists) != 0 {
+		t.Fatalf("lists after delete = %#v", lists)
+	}
+	if mods := ListFavoriteMods(list.ID); len(mods) != 0 {
+		t.Fatalf("mods after delete = %#v", mods)
+	}
+}
+
+func TestFavoriteModRequiresExistingList(t *testing.T) {
+	openTestDB(t)
+
+	mod, ok, err := UpsertFavoriteMod(FavoriteMod{
+		ListID:   "missing",
+		Platform: "modrinth",
+		ModID:    "sodium",
+	})
+	if err != nil || ok || mod.ID != "" {
+		t.Fatalf("upsert without list = %#v, %v, %v", mod, ok, err)
+	}
+}
+
 func TestCacheVersionModIDs(t *testing.T) {
 	path := openTestDB(t)
 

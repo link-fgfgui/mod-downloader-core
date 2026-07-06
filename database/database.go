@@ -19,7 +19,7 @@ import (
 const (
 	CacheFileName    = "mods.gob.zst"
 	databaseFileName = CacheFileName
-	cacheVersion     = 3
+	cacheVersion     = 4
 )
 
 var (
@@ -43,6 +43,8 @@ type cacheState struct {
 	PlatformVersions       map[versionKey]models.ModVersion
 	PlatformVersionScopes  map[versionScopeKey]storedVersionScope
 	PinnedMods             map[pinnedModKey]PinnedMod
+	FavoriteLists          map[string]FavoriteList
+	FavoriteMods           map[favoriteModKey]FavoriteMod
 	PlatformVersionKeyByID map[string]versionKey
 }
 
@@ -65,6 +67,14 @@ type versionScopeKey struct {
 }
 
 type pinnedModKey struct {
+	Platform         string
+	ModID            string
+	MinecraftVersion string
+	ModLoader        string
+}
+
+type favoriteModKey struct {
+	ListID           string
 	Platform         string
 	ModID            string
 	MinecraftVersion string
@@ -229,6 +239,12 @@ func (s *cacheState) normalize() {
 	if s.PinnedMods == nil {
 		s.PinnedMods = make(map[pinnedModKey]PinnedMod)
 	}
+	if s.FavoriteLists == nil {
+		s.FavoriteLists = make(map[string]FavoriteList)
+	}
+	if s.FavoriteMods == nil {
+		s.FavoriteMods = make(map[favoriteModKey]FavoriteMod)
+	}
 	if s.PlatformVersionKeyByID == nil {
 		s.PlatformVersionKeyByID = make(map[string]versionKey)
 	}
@@ -291,6 +307,59 @@ func (s *cacheState) normalizeKeys() {
 		scopes[key] = scope
 	}
 	s.PlatformVersionScopes = scopes
+
+	pinnedMods := make(map[pinnedModKey]PinnedMod, len(s.PinnedMods))
+	for key, pin := range s.PinnedMods {
+		key = makePinnedModKey(key.Platform, key.ModID, key.MinecraftVersion, key.ModLoader)
+		pin = normalizePinnedMod(pin)
+		if pin.ID == "" {
+			pin.ID = key.Platform + ":" + key.ModID + ":" + key.MinecraftVersion + ":" + key.ModLoader
+		}
+		pinnedMods[key] = pin
+	}
+	s.PinnedMods = pinnedMods
+
+	favoriteLists := make(map[string]FavoriteList, len(s.FavoriteLists))
+	for id, list := range s.FavoriteLists {
+		list = normalizeFavoriteList(list)
+		if list.ID == "" {
+			list.ID = strings.TrimSpace(id)
+		}
+		if list.ID == "" {
+			continue
+		}
+		favoriteLists[list.ID] = list
+	}
+	s.FavoriteLists = favoriteLists
+
+	favoriteMods := make(map[favoriteModKey]FavoriteMod, len(s.FavoriteMods))
+	for key, mod := range s.FavoriteMods {
+		if mod.ListID == "" {
+			mod.ListID = key.ListID
+		}
+		if mod.Platform == "" {
+			mod.Platform = key.Platform
+		}
+		if mod.ModID == "" {
+			mod.ModID = key.ModID
+		}
+		if mod.MinecraftVersion == "" {
+			mod.MinecraftVersion = key.MinecraftVersion
+		}
+		if mod.ModLoader == "" {
+			mod.ModLoader = key.ModLoader
+		}
+		mod = normalizeFavoriteMod(mod)
+		key = makeFavoriteModKey(mod.ListID, mod.Platform, mod.ModID, mod.MinecraftVersion, mod.ModLoader)
+		if key.ListID == "" || key.Platform == "" || key.ModID == "" {
+			continue
+		}
+		if mod.ID == "" {
+			mod.ID = key.ListID + ":" + key.Platform + ":" + key.ModID + ":" + key.MinecraftVersion + ":" + key.ModLoader
+		}
+		favoriteMods[key] = mod
+	}
+	s.FavoriteMods = favoriteMods
 }
 
 func (s *cacheState) intern(pool *stringPool) {
@@ -336,6 +405,22 @@ func (s *cacheState) intern(pool *stringPool) {
 	}
 	s.PinnedMods = pinnedMods
 
+	favoriteLists := make(map[string]FavoriteList, len(s.FavoriteLists))
+	for id, list := range s.FavoriteLists {
+		id = pool.Intern(id)
+		list = internFavoriteList(pool, list)
+		favoriteLists[id] = list
+	}
+	s.FavoriteLists = favoriteLists
+
+	favoriteMods := make(map[favoriteModKey]FavoriteMod, len(s.FavoriteMods))
+	for key, mod := range s.FavoriteMods {
+		key = internFavoriteModKey(pool, key)
+		mod = internFavoriteMod(pool, mod)
+		favoriteMods[key] = mod
+	}
+	s.FavoriteMods = favoriteMods
+
 	versionKeyByID := make(map[string]versionKey, len(s.PlatformVersionKeyByID))
 	for id, key := range s.PlatformVersionKeyByID {
 		versionKeyByID[id] = internVersionKey(pool, key)
@@ -364,6 +449,15 @@ func internVersionScopeKey(pool *stringPool, key versionScopeKey) versionScopeKe
 }
 
 func internPinnedModKey(pool *stringPool, key pinnedModKey) pinnedModKey {
+	key.Platform = pool.Intern(key.Platform)
+	key.ModID = pool.Intern(key.ModID)
+	key.MinecraftVersion = pool.Intern(key.MinecraftVersion)
+	key.ModLoader = pool.Intern(key.ModLoader)
+	return key
+}
+
+func internFavoriteModKey(pool *stringPool, key favoriteModKey) favoriteModKey {
+	key.ListID = pool.Intern(key.ListID)
 	key.Platform = pool.Intern(key.Platform)
 	key.ModID = pool.Intern(key.ModID)
 	key.MinecraftVersion = pool.Intern(key.MinecraftVersion)
@@ -420,11 +514,35 @@ func internStoredVersionScope(pool *stringPool, scope storedVersionScope) stored
 }
 
 func internPinnedMod(pool *stringPool, pin PinnedMod) PinnedMod {
+	pin.ID = pool.Intern(pin.ID)
 	pin.Platform = pool.Intern(pin.Platform)
 	pin.ModID = pool.Intern(pin.ModID)
+	pin.VersionID = pool.Intern(pin.VersionID)
 	pin.MinecraftVersion = pool.Intern(pin.MinecraftVersion)
 	pin.ModLoader = pool.Intern(pin.ModLoader)
 	return pin
+}
+
+func internFavoriteList(pool *stringPool, list FavoriteList) FavoriteList {
+	list.ID = pool.Intern(list.ID)
+	list.Name = pool.Intern(list.Name)
+	return list
+}
+
+func internFavoriteMod(pool *stringPool, mod FavoriteMod) FavoriteMod {
+	mod.ID = pool.Intern(mod.ID)
+	mod.ListID = pool.Intern(mod.ListID)
+	mod.Platform = pool.Intern(mod.Platform)
+	mod.ModID = pool.Intern(mod.ModID)
+	mod.VersionID = pool.Intern(mod.VersionID)
+	mod.MinecraftVersion = pool.Intern(mod.MinecraftVersion)
+	mod.ModLoader = pool.Intern(mod.ModLoader)
+	mod.Title = pool.Intern(mod.Title)
+	mod.Slug = pool.Intern(mod.Slug)
+	mod.IconURL = pool.Intern(mod.IconURL)
+	mod.Description = pool.Intern(mod.Description)
+	mod.Categories = internStringSlice(pool, mod.Categories)
+	return mod
 }
 
 func (d *cacheDB) view(fn func(*cacheState) error) error {
@@ -515,4 +633,9 @@ func copyVersion(v models.ModVersion) models.ModVersion {
 	v.Dependencies = copyDependencies(v.Dependencies)
 	v.ModIDs = copyStringSlice(v.ModIDs)
 	return v
+}
+
+func copyFavoriteMod(mod FavoriteMod) FavoriteMod {
+	mod.Categories = copyStringSlice(mod.Categories)
+	return mod
 }
