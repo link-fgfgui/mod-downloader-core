@@ -75,3 +75,49 @@ minecraft_dir = "/from-file"
 		t.Fatalf("cache path after close: %v", err)
 	}
 }
+
+func TestFavoriteServiceWorkflow(t *testing.T) {
+	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(database.Close)
+
+	svc := New(Options{})
+	list := svc.CreateFavoriteList("Performance")
+	if list.ID == "" || list.Name != "Performance" {
+		t.Fatalf("created list = %#v", list)
+	}
+
+	renamed := svc.RenameFavoriteList(list.ID, "Performance Mods")
+	if renamed.ID != list.ID || renamed.Name != "Performance Mods" {
+		t.Fatalf("renamed list = %#v", renamed)
+	}
+
+	mod := svc.AddFavoriteMod(database.FavoriteMod{
+		ListID:           list.ID,
+		Platform:         "Modrinth",
+		ModID:            "Sodium",
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "Fabric",
+		Title:            "Sodium",
+	})
+	if mod.ID == "" || mod.Platform != "modrinth" || mod.ModID != "sodium" {
+		t.Fatalf("added mod = %#v", mod)
+	}
+	if mods := svc.ListFavoriteMods(list.ID); len(mods) != 1 || mods[0].ID != mod.ID {
+		t.Fatalf("listed mods = %#v", mods)
+	}
+
+	if !svc.RemoveFavoriteMod(list.ID, "Modrinth", "Sodium", "1.21.1", "Fabric") {
+		t.Fatal("RemoveFavoriteMod returned false")
+	}
+	if mods := svc.ListFavoriteMods(list.ID); len(mods) != 0 {
+		t.Fatalf("mods after remove = %#v", mods)
+	}
+	if !svc.DeleteFavoriteList(list.ID) {
+		t.Fatal("DeleteFavoriteList returned false")
+	}
+	if lists := svc.ListFavoriteLists(); len(lists) != 0 {
+		t.Fatalf("lists after delete = %#v", lists)
+	}
+}

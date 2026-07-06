@@ -287,6 +287,65 @@ func (s *Service) UnpinMod(platform, modID, mcVersion, modLoader string) bool {
 	return true
 }
 
+func (s *Service) ListFavoriteLists() []database.FavoriteList {
+	return database.ListFavoriteLists()
+}
+
+func (s *Service) CreateFavoriteList(name string) database.FavoriteList {
+	list, err := database.CreateFavoriteList(name)
+	if err != nil {
+		logging.Error("create favorite list failed", "name", name, "error", err)
+		return database.FavoriteList{}
+	}
+	return list
+}
+
+func (s *Service) RenameFavoriteList(id, name string) database.FavoriteList {
+	list, ok, err := database.UpdateFavoriteListName(id, name)
+	if err != nil {
+		logging.Error("rename favorite list failed", "id", id, "name", name, "error", err)
+		return database.FavoriteList{}
+	}
+	if !ok {
+		return database.FavoriteList{}
+	}
+	return list
+}
+
+func (s *Service) DeleteFavoriteList(id string) bool {
+	deleted, err := database.DeleteFavoriteList(id)
+	if err != nil {
+		logging.Error("delete favorite list failed", "id", id, "error", err)
+		return false
+	}
+	return deleted
+}
+
+func (s *Service) ListFavoriteMods(listID string) []database.FavoriteMod {
+	return database.ListFavoriteMods(listID)
+}
+
+func (s *Service) AddFavoriteMod(mod database.FavoriteMod) database.FavoriteMod {
+	saved, ok, err := database.UpsertFavoriteMod(mod)
+	if err != nil {
+		logging.Error("add favorite mod failed", "listID", mod.ListID, "platform", mod.Platform, "modID", mod.ModID, "error", err)
+		return database.FavoriteMod{}
+	}
+	if !ok {
+		return database.FavoriteMod{}
+	}
+	return saved
+}
+
+func (s *Service) RemoveFavoriteMod(listID, platform, modID, mcVersion, modLoader string) bool {
+	deleted, err := database.DeleteFavoriteMod(listID, platform, modID, mcVersion, modLoader)
+	if err != nil {
+		logging.Error("remove favorite mod failed", "listID", listID, "platform", platform, "modID", modID, "error", err)
+		return false
+	}
+	return deleted
+}
+
 func (s *Service) GetMinecraftReleaseVersions() []string {
 	return minecraft.GetMinecraftReleaseVersions()
 }
@@ -539,47 +598,7 @@ func (s *Service) RefreshSelectedVersionMods() structs.VersionInfo {
 	if selected.ID == "" && selected.Name == "" {
 		return structs.VersionInfo{}
 	}
-	refreshed := s.refreshVersionMods(selected, global.GetMinecraftDir())
-	enriched, missedSHA1s := enrichModMetadata(refreshed.Mods)
-	refreshed.Mods = enriched
-	global.SetSelectedVersion(refreshed)
-	s.emit(EventSelectedVersionChanged, refreshed)
-
-	if len(missedSHA1s) > 0 {
-		go func() {
-			resolved := providers.ResolveProjectsByHashes(missedSHA1s)
-			if len(resolved) == 0 {
-				return
-			}
-			updated := global.GetSelectedVersion()
-			if updated.ID != refreshed.ID && updated.Name != refreshed.Name {
-				return
-			}
-			mods := make([]structs.ModInfo, len(updated.Mods))
-			copy(mods, updated.Mods)
-			changed := false
-			for i := range mods {
-				if strings.TrimSpace(mods[i].SHA1) == "" {
-					continue
-				}
-				sha1 := strings.ToLower(strings.TrimSpace(mods[i].SHA1))
-				if project, ok := resolved[sha1]; ok {
-					enrichedMod := modbridge.ApplyProjectMetadataToModInfo(mods[i], project)
-					if modInfoDisplayMetadataChanged(mods[i], enrichedMod) {
-						mods[i] = enrichedMod
-						changed = true
-					}
-				}
-			}
-			if !changed {
-				return
-			}
-			updated.Mods = mods
-			global.SetSelectedVersion(updated)
-			s.emit(EventSelectedVersionChanged, updated)
-		}()
-	}
-	return refreshed
+	return s.refreshAndSelectVersionMods(selected, global.GetMinecraftDir())
 }
 
 func (s *Service) SelectVersion(versionKey string) (structs.VersionInfo, error) {
@@ -597,10 +616,7 @@ func (s *Service) SelectVersion(versionKey string) (structs.VersionInfo, error) 
 		if !ValidMinecraftInstance(version) {
 			return structs.VersionInfo{}, errors.New("invalid minecraft version or mod loader")
 		}
-		version = s.refreshVersionMods(version, mcDir)
-		global.SetSelectedVersion(version)
-		s.emit(EventSelectedVersionChanged, version)
-		return version, nil
+		return s.refreshAndSelectVersionMods(version, mcDir), nil
 	}
 
 	return structs.VersionInfo{}, fmt.Errorf("version not found: %s", versionKey)
@@ -1065,6 +1081,54 @@ func ScanVersionMods(version structs.VersionInfo, mcDir string) structs.VersionI
 	versionDir := minecraft.VersionDirPath(mcDir, version)
 	version.Mods = minecraft.ScanVersionMods(versionDir, versionDirName, version.MinecraftVersion, version.ModLoader, mcDir)
 	return version
+}
+
+func (s *Service) refreshAndSelectVersionMods(version structs.VersionInfo, mcDir string) structs.VersionInfo {
+	refreshed := s.refreshVersionMods(version, mcDir)
+	enriched, missedSHA1s := enrichModMetadata(refreshed.Mods)
+	refreshed.Mods = enriched
+	global.SetSelectedVersion(refreshed)
+	s.emit(EventSelectedVersionChanged, refreshed)
+	s.resolveMissingModMetadata(refreshed, missedSHA1s)
+	return refreshed
+}
+
+func (s *Service) resolveMissingModMetadata(refreshed structs.VersionInfo, missedSHA1s []string) {
+	if len(missedSHA1s) == 0 {
+		return
+	}
+	go func() {
+		resolved := providers.ResolveProjectsByHashes(missedSHA1s)
+		if len(resolved) == 0 {
+			return
+		}
+		updated := global.GetSelectedVersion()
+		if updated.ID != refreshed.ID || updated.Name != refreshed.Name {
+			return
+		}
+		mods := make([]structs.ModInfo, len(updated.Mods))
+		copy(mods, updated.Mods)
+		changed := false
+		for i := range mods {
+			if strings.TrimSpace(mods[i].SHA1) == "" {
+				continue
+			}
+			sha1 := strings.ToLower(strings.TrimSpace(mods[i].SHA1))
+			if project, ok := resolved[sha1]; ok {
+				enrichedMod := modbridge.ApplyProjectMetadataToModInfo(mods[i], project)
+				if modInfoDisplayMetadataChanged(mods[i], enrichedMod) {
+					mods[i] = enrichedMod
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			return
+		}
+		updated.Mods = mods
+		global.SetSelectedVersion(updated)
+		s.emit(EventSelectedVersionChanged, updated)
+	}()
 }
 
 func enrichModMetadata(mods []structs.ModInfo) ([]structs.ModInfo, []string) {
