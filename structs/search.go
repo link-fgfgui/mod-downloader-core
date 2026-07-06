@@ -61,6 +61,8 @@ type DownloadQueueItem struct {
 	MinecraftVersion string `json:"minecraftVersion"`
 	ModLoader        string `json:"modLoader"`
 	Cancelable       bool   `json:"cancelable"`
+	Retryable        bool   `json:"retryable"`
+	Reason           string `json:"reason,omitempty"`
 }
 
 type DownloadFailedEvent struct {
