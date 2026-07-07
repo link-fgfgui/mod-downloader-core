@@ -848,6 +848,24 @@ func DeleteFavoriteList(id string) (bool, error) {
 	return deleted, nil
 }
 
+func GetFavoriteList(id string) (FavoriteList, bool) {
+	d, err := readyUserDB()
+	if err != nil {
+		return FavoriteList{}, false
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return FavoriteList{}, false
+	}
+
+	list, found, err := d.getFavoriteList(id)
+	if err != nil || !found {
+		logging.Debug("favorite list miss", "id", id)
+		return FavoriteList{}, false
+	}
+	return list, true
+}
+
 func ListFavoriteLists() []FavoriteList {
 	d, err := readyUserDB()
 	if err != nil {
