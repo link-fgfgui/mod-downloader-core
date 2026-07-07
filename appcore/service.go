@@ -90,6 +90,8 @@ type SettingsView struct {
 	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
 	MinecraftDir                string  `json:"minecraftDir"`
+	CacheDir                    string  `json:"cacheDir"`
+	CachePath                   string  `json:"cachePath"`
 	HasCurseforgeKey            bool    `json:"hasCurseforgeKey"`
 	CurseforgeKeyMask           string  `json:"curseforgeKeyMask"`
 	HasModrinthKey              bool    `json:"hasModrinthKey"`
@@ -382,6 +384,7 @@ func (s *Service) GetSettings() SettingsView {
 		sv.AnimationEnabled = animationMode != configs.AnimationModeOff
 		sv.AnimationDurationMultiplier = s.config.Prefers.NormalizedAnimationDurationMultiplier()
 		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir))
+		sv.CacheDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Runtime.CacheDir))
 		sv.HasCurseforgeKey = strings.TrimSpace(s.config.Keys.CurseforgeApiKey) != ""
 		sv.CurseforgeKeyMask = MaskKey(s.config.Keys.CurseforgeApiKey)
 		sv.HasModrinthKey = strings.TrimSpace(s.config.Keys.ModrinthApiKey) != ""
@@ -389,6 +392,9 @@ func (s *Service) GetSettings() SettingsView {
 	}
 	if sv.MinecraftDir == "" {
 		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(global.GetMinecraftDir())
+	}
+	if path, err := s.cachePath(); err == nil {
+		sv.CachePath = minecraft.SimplifyPathWithEnv(path)
 	}
 	return sv
 }
@@ -442,6 +448,26 @@ func (s *Service) SaveMinecraftDirPreference(dir string) string {
 	}
 	global.SetMinecraftDir(minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir))
 	return s.config.Prefers.MinecraftDir
+}
+
+func (s *Service) SaveCacheDirPreference(dir string) SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	dir = strings.TrimSpace(dir)
+	if dir != "" {
+		dir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(dir))
+	}
+	s.config.Runtime.CacheDir = dir
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save cache dir preference failed", "cacheDir", dir, "error", err)
+	}
+	if cachePath, err := s.cachePath(); err != nil {
+		logging.Error("resolve database cache path after cache dir save failed", "cacheDir", dir, "error", err)
+	} else if err := database.OpenAt(cachePath); err != nil {
+		logging.Error("reopen database after cache dir save failed", "cachePath", cachePath, "error", err)
+	}
+	return s.GetSettings()
 }
 
 func (s *Service) SaveApiKeys(req SaveApiKeysRequest) SettingsView {

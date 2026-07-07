@@ -18,16 +18,20 @@ import (
 
 const (
 	CacheFileName    = "mods.gob.zst"
+	UserDataFileName = "user-data.sqlite"
 	databaseFileName = CacheFileName
 	cacheVersion     = 4
 )
 
 var (
-	db     *cacheDB
-	dbPath string
+	db         *cacheDB
+	dbPath     string
+	userDB     *userStore
+	userDBPath string
 )
 
 var errDatabaseNotOpen = errors.New("database is not open")
+var errUserDatabaseNotOpen = errors.New("user database is not open")
 
 type cacheDB struct {
 	mu      sync.RWMutex
@@ -37,11 +41,12 @@ type cacheDB struct {
 }
 
 type cacheState struct {
-	Version                int
-	ModPlatforms           map[platformKey]models.ModProject
-	PlatformAssociations   map[string]PlatformAssociation
-	PlatformVersions       map[versionKey]models.ModVersion
-	PlatformVersionScopes  map[versionScopeKey]storedVersionScope
+	Version               int
+	ModPlatforms          map[platformKey]models.ModProject
+	PlatformAssociations  map[string]PlatformAssociation
+	PlatformVersions      map[versionKey]models.ModVersion
+	PlatformVersionScopes map[versionScopeKey]storedVersionScope
+	// Legacy user-owned records are decoded only for one-time SQLite migration.
 	PinnedMods             map[pinnedModKey]PinnedMod
 	FavoriteLists          map[string]FavoriteList
 	FavoriteMods           map[favoriteModKey]FavoriteMod
@@ -116,6 +121,10 @@ func DefaultCachePath() (string, error) {
 	return filepath.Join(dir, "mod-downloader", databaseFileName), nil
 }
 
+func UserDataPathForCachePath(cachePath string) string {
+	return filepath.Join(filepath.Dir(cachePath), UserDataFileName)
+}
+
 func OpenAt(path string) error {
 	targetPath := strings.TrimSpace(path)
 	if targetPath == "" {
@@ -129,7 +138,8 @@ func OpenAt(path string) error {
 		targetPath = abs
 	}
 	targetPath = filepath.Clean(targetPath)
-	if db != nil && dbPath == targetPath {
+	targetUserPath := UserDataPathForCachePath(targetPath)
+	if db != nil && dbPath == targetPath && userDB != nil && userDBPath == targetUserPath {
 		logging.Debug("cache already open", "path", targetPath)
 		return nil
 	}
@@ -146,12 +156,24 @@ func OpenAt(path string) error {
 		return fmt.Errorf("open cache: %w", err)
 	}
 	state.normalize()
+	nextUserDB, err := openUserStore(targetUserPath)
+	if err != nil {
+		logging.Error("open user database failed", "path", targetUserPath, "error", err)
+		return fmt.Errorf("open user database: %w", err)
+	}
+	if err := nextUserDB.migrateLegacyUserData(&state); err != nil {
+		_ = nextUserDB.close()
+		logging.Error("migrate legacy user data failed", "path", targetUserPath, "error", err)
+		return fmt.Errorf("migrate legacy user data: %w", err)
+	}
 	pool := newStringPool()
 	state.intern(&pool)
 	nextDB := &cacheDB{path: targetPath, state: state, strings: pool}
 
 	db = nextDB
 	dbPath = targetPath
+	userDB = nextUserDB
+	userDBPath = targetUserPath
 	logging.Info("cache opened", "path", targetPath)
 	return nil
 }
@@ -165,6 +187,14 @@ func Close() {
 		db = nil
 	}
 	dbPath = ""
+	if userDB != nil {
+		logging.Info("closing user database", "path", userDBPath)
+		if err := userDB.close(); err != nil {
+			logging.Warn("close user database failed", "path", userDBPath, "error", err)
+		}
+		userDB = nil
+	}
+	userDBPath = ""
 }
 
 func readyDB() (*cacheDB, error) {
@@ -173,6 +203,14 @@ func readyDB() (*cacheDB, error) {
 		return nil, errDatabaseNotOpen
 	}
 	return db, nil
+}
+
+func readyUserDB() (*userStore, error) {
+	if userDB == nil {
+		logging.Warn("user database access attempted before open")
+		return nil, errUserDatabaseNotOpen
+	}
+	return userDB, nil
 }
 
 func NewID() string {
@@ -426,6 +464,12 @@ func (s *cacheState) intern(pool *stringPool) {
 		versionKeyByID[id] = internVersionKey(pool, key)
 	}
 	s.PlatformVersionKeyByID = versionKeyByID
+}
+
+func (s *cacheState) clearLegacyUserData() {
+	s.PinnedMods = make(map[pinnedModKey]PinnedMod)
+	s.FavoriteLists = make(map[string]FavoriteList)
+	s.FavoriteMods = make(map[favoriteModKey]FavoriteMod)
 }
 
 func internPlatformKey(pool *stringPool, key platformKey) platformKey {

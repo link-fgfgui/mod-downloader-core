@@ -62,8 +62,14 @@ func TestOpenAtCreatesParentDirectoryOnClose(t *testing.T) {
 	if err := OpenAt(path); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Dir(path)); !os.IsNotExist(err) {
-		t.Fatalf("parent before close error = %v, want not exist", err)
+	if _, err := os.Stat(filepath.Dir(path)); err != nil {
+		t.Fatalf("parent after open: %v", err)
+	}
+	if _, err := os.Stat(UserDataPathForCachePath(path)); err != nil {
+		t.Fatalf("user database after open: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("cache file before close error = %v, want not exist", err)
 	}
 	Close()
 	if _, err := os.Stat(path); err != nil {
@@ -359,6 +365,76 @@ func TestFavoriteModRequiresExistingList(t *testing.T) {
 	})
 	if err != nil || ok || mod.ID != "" {
 		t.Fatalf("upsert without list = %#v, %v, %v", mod, ok, err)
+	}
+}
+
+func TestLegacyGobUserDataMigratesToSQLite(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, databaseFileName)
+	state := newCacheState()
+	state.PinnedMods[makePinnedModKey("Modrinth", "Sodium", "1.21.1", "Fabric")] = PinnedMod{
+		Platform:         "Modrinth",
+		ModID:            "Sodium",
+		VersionID:        "v1",
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "Fabric",
+	}
+	listID := "legacy-list"
+	state.FavoriteLists[listID] = FavoriteList{
+		ID:        listID,
+		Name:      "Legacy",
+		CreatedAt: 10,
+		UpdatedAt: 11,
+		SortOrder: 1,
+	}
+	state.FavoriteMods[makeFavoriteModKey(listID, "Modrinth", "Sodium", "1.21.1", "Fabric")] = FavoriteMod{
+		ListID:           listID,
+		Platform:         "Modrinth",
+		ModID:            "Sodium",
+		VersionID:        "v1",
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "Fabric",
+		Title:            "Sodium",
+		Categories:       []string{"performance"},
+		CreatedAt:        12,
+		UpdatedAt:        13,
+	}
+	legacyDB := &cacheDB{path: path, state: state, strings: newStringPool()}
+	if err := legacyDB.save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := OpenAt(path); err != nil {
+		t.Fatal(err)
+	}
+	if pin, ok := GetPinnedMod("modrinth", "sodium", "1.21.1", "fabric"); !ok || pin.VersionID != "v1" {
+		t.Fatalf("migrated pin = %#v, %v", pin, ok)
+	}
+	lists := ListFavoriteLists()
+	if len(lists) != 1 || lists[0].ID != listID || lists[0].Name != "Legacy" {
+		t.Fatalf("migrated lists = %#v", lists)
+	}
+	mods := ListFavoriteMods(listID)
+	if len(mods) != 1 || mods[0].VersionID != "v1" || len(mods[0].Categories) != 1 {
+		t.Fatalf("migrated mods = %#v", mods)
+	}
+	Close()
+
+	reloaded, err := loadCacheState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded.normalize()
+	if len(reloaded.PinnedMods) != 0 || len(reloaded.FavoriteLists) != 0 || len(reloaded.FavoriteMods) != 0 {
+		t.Fatalf("legacy user data still in gob cache: pins=%d lists=%d mods=%d", len(reloaded.PinnedMods), len(reloaded.FavoriteLists), len(reloaded.FavoriteMods))
+	}
+
+	if err := OpenAt(path); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(Close)
+	if pin, ok := GetPinnedMod("modrinth", "sodium", "1.21.1", "fabric"); !ok || pin.VersionID != "v1" {
+		t.Fatalf("sqlite pin after reopen = %#v, %v", pin, ok)
 	}
 }
 

@@ -714,7 +714,7 @@ func GetVersionDependencies(platformVersionID string) ([]models.ModDependency, e
 // --- pinned mods ---
 
 func UpsertPinnedMod(p PinnedMod) error {
-	d, err := readyDB()
+	d, err := readyUserDB()
 	if err != nil {
 		return err
 	}
@@ -723,18 +723,7 @@ func UpsertPinnedMod(p PinnedMod) error {
 		return nil
 	}
 
-	err = d.update(func(state *cacheState, pool *stringPool) error {
-		key := internPinnedModKey(pool, makePinnedModKey(p.Platform, p.ModID, p.MinecraftVersion, p.ModLoader))
-		if existing, ok := state.PinnedMods[key]; ok && existing.ID != "" {
-			p.ID = existing.ID
-		}
-		if p.ID == "" {
-			p.ID = NewID()
-		}
-		state.PinnedMods[key] = internPinnedMod(pool, p)
-		return nil
-	})
-	if err != nil {
+	if err := d.upsertPinnedMod(p); err != nil {
 		logging.Error("upsert pinned mod failed", "platform", p.Platform, "modID", p.ModID, "versionID", p.VersionID, "minecraftVersion", p.MinecraftVersion, "modLoader", p.ModLoader, "error", err)
 		return err
 	}
@@ -743,7 +732,7 @@ func UpsertPinnedMod(p PinnedMod) error {
 }
 
 func GetPinnedMod(platform, modID, mcVersion, modLoader string) (PinnedMod, bool) {
-	d, err := readyDB()
+	d, err := readyUserDB()
 	if err != nil {
 		return PinnedMod{}, false
 	}
@@ -752,12 +741,7 @@ func GetPinnedMod(platform, modID, mcVersion, modLoader string) (PinnedMod, bool
 		return PinnedMod{}, false
 	}
 
-	var p PinnedMod
-	found := false
-	err = d.view(func(state *cacheState) error {
-		p, found = state.PinnedMods[key]
-		return nil
-	})
+	p, found, err := d.getPinnedMod(key.Platform, key.ModID, key.MinecraftVersion, key.ModLoader)
 	if err != nil || !found {
 		logging.Debug("pinned mod miss", "platform", key.Platform, "modID", key.ModID, "minecraftVersion", key.MinecraftVersion, "modLoader", key.ModLoader)
 		return PinnedMod{}, false
@@ -767,7 +751,7 @@ func GetPinnedMod(platform, modID, mcVersion, modLoader string) (PinnedMod, bool
 }
 
 func DeletePinnedMod(platform, modID, mcVersion, modLoader string) error {
-	d, err := readyDB()
+	d, err := readyUserDB()
 	if err != nil {
 		return err
 	}
@@ -776,11 +760,7 @@ func DeletePinnedMod(platform, modID, mcVersion, modLoader string) error {
 		return nil
 	}
 
-	err = d.update(func(state *cacheState, pool *stringPool) error {
-		delete(state.PinnedMods, key)
-		return nil
-	})
-	if err != nil {
+	if err := d.deletePinnedMod(key.Platform, key.ModID, key.MinecraftVersion, key.ModLoader); err != nil {
 		logging.Error("delete pinned mod failed", "platform", key.Platform, "modID", key.ModID, "minecraftVersion", key.MinecraftVersion, "modLoader", key.ModLoader, "error", err)
 		return err
 	}
@@ -791,43 +771,23 @@ func DeletePinnedMod(platform, modID, mcVersion, modLoader string) error {
 // ListPinnedMods returns a snapshot of all pinned mods, sorted in ascending stable order by Platform -> ModID -> MinecraftVersion -> ModLoader.
 // The returned value is a copy; callers may safely modify it.
 func ListPinnedMods() []PinnedMod {
-	d, err := readyDB()
+	d, err := readyUserDB()
 	if err != nil {
 		return nil
 	}
 
-	var pins []PinnedMod
-	err = d.view(func(state *cacheState) error {
-		pins = make([]PinnedMod, 0, len(state.PinnedMods))
-		for _, p := range state.PinnedMods {
-			pins = append(pins, p)
-		}
-		return nil
-	})
+	pins, err := d.listPinnedMods()
 	if err != nil {
 		logging.Error("list pinned mods failed", "error", err)
 		return nil
 	}
-
-	sort.SliceStable(pins, func(i, j int) bool {
-		if pins[i].Platform != pins[j].Platform {
-			return pins[i].Platform < pins[j].Platform
-		}
-		if pins[i].ModID != pins[j].ModID {
-			return pins[i].ModID < pins[j].ModID
-		}
-		if pins[i].MinecraftVersion != pins[j].MinecraftVersion {
-			return pins[i].MinecraftVersion < pins[j].MinecraftVersion
-		}
-		return pins[i].ModLoader < pins[j].ModLoader
-	})
 	return pins
 }
 
 // --- favorite lists ---
 
 func CreateFavoriteList(name string) (FavoriteList, error) {
-	d, err := readyDB()
+	d, err := readyUserDB()
 	if err != nil {
 		return FavoriteList{}, err
 	}
@@ -836,26 +796,7 @@ func CreateFavoriteList(name string) (FavoriteList, error) {
 		return FavoriteList{}, nil
 	}
 
-	var list FavoriteList
-	err = d.update(func(state *cacheState, pool *stringPool) error {
-		now := time.Now().Unix()
-		maxSortOrder := 0
-		for _, existing := range state.FavoriteLists {
-			if existing.SortOrder > maxSortOrder {
-				maxSortOrder = existing.SortOrder
-			}
-		}
-		list = FavoriteList{
-			ID:        NewID(),
-			Name:      name,
-			CreatedAt: now,
-			UpdatedAt: now,
-			SortOrder: maxSortOrder + 1,
-		}
-		list = internFavoriteList(pool, list)
-		state.FavoriteLists[list.ID] = list
-		return nil
-	})
+	list, err := d.createFavoriteList(name)
 	if err != nil {
 		logging.Error("create favorite list failed", "name", name, "error", err)
 		return FavoriteList{}, err
@@ -865,7 +806,7 @@ func CreateFavoriteList(name string) (FavoriteList, error) {
 }
 
 func UpdateFavoriteListName(id, name string) (FavoriteList, bool, error) {
-	d, err := readyDB()
+	d, err := readyUserDB()
 	if err != nil {
 		return FavoriteList{}, false, err
 	}
@@ -875,20 +816,7 @@ func UpdateFavoriteListName(id, name string) (FavoriteList, bool, error) {
 		return FavoriteList{}, false, nil
 	}
 
-	var list FavoriteList
-	found := false
-	err = d.update(func(state *cacheState, pool *stringPool) error {
-		existing, ok := state.FavoriteLists[id]
-		if !ok {
-			return nil
-		}
-		existing.Name = name
-		existing.UpdatedAt = time.Now().Unix()
-		list = internFavoriteList(pool, normalizeFavoriteList(existing))
-		state.FavoriteLists[list.ID] = list
-		found = true
-		return nil
-	})
+	list, found, err := d.updateFavoriteListName(id, name)
 	if err != nil {
 		logging.Error("rename favorite list failed", "id", id, "name", name, "error", err)
 		return FavoriteList{}, false, err
@@ -900,7 +828,7 @@ func UpdateFavoriteListName(id, name string) (FavoriteList, bool, error) {
 }
 
 func DeleteFavoriteList(id string) (bool, error) {
-	d, err := readyDB()
+	d, err := readyUserDB()
 	if err != nil {
 		return false, err
 	}
@@ -909,20 +837,7 @@ func DeleteFavoriteList(id string) (bool, error) {
 		return false, nil
 	}
 
-	deleted := false
-	err = d.update(func(state *cacheState, pool *stringPool) error {
-		if _, ok := state.FavoriteLists[id]; !ok {
-			return nil
-		}
-		delete(state.FavoriteLists, id)
-		for key := range state.FavoriteMods {
-			if key.ListID == id {
-				delete(state.FavoriteMods, key)
-			}
-		}
-		deleted = true
-		return nil
-	})
+	deleted, err := d.deleteFavoriteList(id)
 	if err != nil {
 		logging.Error("delete favorite list failed", "id", id, "error", err)
 		return false, err
@@ -934,37 +849,21 @@ func DeleteFavoriteList(id string) (bool, error) {
 }
 
 func ListFavoriteLists() []FavoriteList {
-	d, err := readyDB()
+	d, err := readyUserDB()
 	if err != nil {
 		return nil
 	}
 
-	var lists []FavoriteList
-	err = d.view(func(state *cacheState) error {
-		lists = make([]FavoriteList, 0, len(state.FavoriteLists))
-		for _, list := range state.FavoriteLists {
-			lists = append(lists, list)
-		}
-		return nil
-	})
+	lists, err := d.listFavoriteLists()
 	if err != nil {
 		logging.Error("list favorite lists failed", "error", err)
 		return nil
 	}
-	sort.SliceStable(lists, func(i, j int) bool {
-		if lists[i].SortOrder != lists[j].SortOrder {
-			return lists[i].SortOrder < lists[j].SortOrder
-		}
-		if lists[i].CreatedAt != lists[j].CreatedAt {
-			return lists[i].CreatedAt < lists[j].CreatedAt
-		}
-		return lists[i].Name < lists[j].Name
-	})
 	return lists
 }
 
 func UpsertFavoriteMod(mod FavoriteMod) (FavoriteMod, bool, error) {
-	d, err := readyDB()
+	d, err := readyUserDB()
 	if err != nil {
 		return FavoriteMod{}, false, err
 	}
@@ -973,34 +872,7 @@ func UpsertFavoriteMod(mod FavoriteMod) (FavoriteMod, bool, error) {
 		return FavoriteMod{}, false, nil
 	}
 
-	var saved FavoriteMod
-	ok := false
-	err = d.update(func(state *cacheState, pool *stringPool) error {
-		if _, foundList := state.FavoriteLists[mod.ListID]; !foundList {
-			return nil
-		}
-		now := time.Now().Unix()
-		key := internFavoriteModKey(pool, makeFavoriteModKey(mod.ListID, mod.Platform, mod.ModID, mod.MinecraftVersion, mod.ModLoader))
-		if existing, found := state.FavoriteMods[key]; found {
-			if mod.ID == "" {
-				mod.ID = existing.ID
-			}
-			if mod.CreatedAt == 0 {
-				mod.CreatedAt = existing.CreatedAt
-			}
-		}
-		if mod.ID == "" {
-			mod.ID = NewID()
-		}
-		if mod.CreatedAt == 0 {
-			mod.CreatedAt = now
-		}
-		mod.UpdatedAt = now
-		saved = internFavoriteMod(pool, mod)
-		state.FavoriteMods[key] = saved
-		ok = true
-		return nil
-	})
+	saved, ok, err := d.upsertFavoriteMod(mod)
 	if err != nil {
 		logging.Error("upsert favorite mod failed", "listID", mod.ListID, "platform", mod.Platform, "modID", mod.ModID, "error", err)
 		return FavoriteMod{}, false, err
@@ -1012,7 +884,7 @@ func UpsertFavoriteMod(mod FavoriteMod) (FavoriteMod, bool, error) {
 }
 
 func DeleteFavoriteMod(listID, platform, modID, mcVersion, modLoader string) (bool, error) {
-	d, err := readyDB()
+	d, err := readyUserDB()
 	if err != nil {
 		return false, err
 	}
@@ -1021,14 +893,7 @@ func DeleteFavoriteMod(listID, platform, modID, mcVersion, modLoader string) (bo
 		return false, nil
 	}
 
-	deleted := false
-	err = d.update(func(state *cacheState, pool *stringPool) error {
-		if _, ok := state.FavoriteMods[key]; ok {
-			delete(state.FavoriteMods, key)
-			deleted = true
-		}
-		return nil
-	})
+	deleted, err := d.deleteFavoriteMod(key.ListID, key.Platform, key.ModID, key.MinecraftVersion, key.ModLoader)
 	if err != nil {
 		logging.Error("delete favorite mod failed", "listID", key.ListID, "platform", key.Platform, "modID", key.ModID, "error", err)
 		return false, err
@@ -1040,7 +905,7 @@ func DeleteFavoriteMod(listID, platform, modID, mcVersion, modLoader string) (bo
 }
 
 func ListFavoriteMods(listID string) []FavoriteMod {
-	d, err := readyDB()
+	d, err := readyUserDB()
 	if err != nil {
 		return nil
 	}
@@ -1049,29 +914,11 @@ func ListFavoriteMods(listID string) []FavoriteMod {
 		return nil
 	}
 
-	var mods []FavoriteMod
-	err = d.view(func(state *cacheState) error {
-		mods = make([]FavoriteMod, 0)
-		for key, mod := range state.FavoriteMods {
-			if key.ListID == listID {
-				mods = append(mods, copyFavoriteMod(mod))
-			}
-		}
-		return nil
-	})
+	mods, err := d.listFavoriteMods(listID)
 	if err != nil {
 		logging.Error("list favorite mods failed", "listID", listID, "error", err)
 		return nil
 	}
-	sort.SliceStable(mods, func(i, j int) bool {
-		if mods[i].CreatedAt != mods[j].CreatedAt {
-			return mods[i].CreatedAt < mods[j].CreatedAt
-		}
-		if mods[i].Platform != mods[j].Platform {
-			return mods[i].Platform < mods[j].Platform
-		}
-		return mods[i].ModID < mods[j].ModID
-	})
 	return mods
 }
 

@@ -8,8 +8,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/link-fgfgui/mod-downloader-core/configs"
 	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/global"
+	"github.com/link-fgfgui/mod-downloader-core/minecraft"
 )
 
 func TestCoreDoesNotDependOnWailsRuntime(t *testing.T) {
@@ -119,5 +121,51 @@ func TestFavoriteServiceWorkflow(t *testing.T) {
 	}
 	if lists := svc.ListFavoriteLists(); len(lists) != 0 {
 		t.Fatalf("lists after delete = %#v", lists)
+	}
+}
+
+func TestSaveCacheDirPreferencePersistsAndReopensDatabase(t *testing.T) {
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	appDir := t.TempDir()
+	if err := os.Chdir(appDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		database.Close()
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	initialDir := filepath.Join(t.TempDir(), "initial-cache")
+	svc := New(Options{Config: &configs.Config{
+		Runtime: configs.RuntimeConfig{CacheDir: initialDir},
+	}})
+	if err := svc.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	nextDir := filepath.Join(t.TempDir(), "custom-cache")
+	view := svc.SaveCacheDirPreference(nextDir)
+	if got := minecraft.ExpandPathWithEnv(svc.Config().Runtime.CacheDir); got != nextDir {
+		t.Fatalf("config cache dir = %q, want %q", got, nextDir)
+	}
+	wantCachePath := filepath.Join(nextDir, database.CacheFileName)
+	if got := minecraft.ExpandPathWithEnv(view.CachePath); got != wantCachePath {
+		t.Fatalf("settings cache path = %q, want %q", got, wantCachePath)
+	}
+	if _, err := os.Stat(database.UserDataPathForCachePath(wantCachePath)); err != nil {
+		t.Fatalf("user database at custom cache dir: %v", err)
+	}
+
+	loaded, err := configs.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := minecraft.ExpandPathWithEnv(loaded.Runtime.CacheDir); got != nextDir {
+		t.Fatalf("persisted cache dir = %q, want %q", got, nextDir)
 	}
 }
