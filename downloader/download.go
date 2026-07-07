@@ -29,6 +29,7 @@ type Events struct {
 
 type downloadJob struct {
 	ID               string
+	ProjectID        string
 	Version          models.ModVersion
 	Result           models.ModProject
 	TargetDir        string
@@ -37,6 +38,8 @@ type downloadJob struct {
 	ModLoader        string
 	CurseForgeAPIKey string
 	AutoAttempt      int
+	visited          map[string]bool
+	dependenciesDone bool
 	cancel           context.CancelFunc
 }
 
@@ -52,9 +55,12 @@ const (
 )
 
 var (
-	errDownloadStalled           = errors.New("download stalled: no byte progress")
-	downloadStallTimeout         = 30 * time.Second
-	downloadProgressPollInterval = time.Second
+	errDownloadStalled             = errors.New("download stalled: no byte progress")
+	errDownloadRequeued            = errors.New("download requeued after dependency analysis")
+	downloadStallTimeout           = 30 * time.Second
+	downloadProgressPollInterval   = time.Second
+	refreshMatchingProjectVersions = providers.RefreshMatchingProjectVersions
+	installStatusPrecise           = modbridge.InstallStatusPrecise
 )
 
 var downloadQueue = struct {
@@ -74,6 +80,15 @@ func QueueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, cu
 }
 
 func queueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, curseForgeAPIKey string, visited map[string]bool, events Events) appstructs.ModDownloadResult {
+	job, result, ok := buildDownloadJob(req, curseForgeAPIKey, visited)
+	if !ok {
+		return result
+	}
+	enqueueDownload(ctx, job, events)
+	return result
+}
+
+func buildDownloadJob(req appstructs.ModDownloadRequest, curseForgeAPIKey string, visited map[string]bool) (downloadJob, appstructs.ModDownloadResult, bool) {
 	req.MinecraftVersion = strings.TrimSpace(req.MinecraftVersion)
 	req.ModLoader = strings.ToLower(strings.TrimSpace(req.ModLoader))
 	req.ProjectID = strings.TrimSpace(req.ProjectID)
@@ -83,45 +98,44 @@ func queueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, cu
 
 	req, instanceID, targetDir, ok := modbridge.ResolveInstallTarget(req)
 	if !ok {
-		return appstructs.ModDownloadResult{Skipped: true, Reason: "no install target"}
+		return downloadJob{}, appstructs.ModDownloadResult{Skipped: true, Reason: "no install target"}, false
 	}
 	if req.ProjectID == "" || req.MinecraftVersion == "" || req.ModLoader == "" {
-		return appstructs.ModDownloadResult{Skipped: true, Reason: "invalid request"}
+		return downloadJob{}, appstructs.ModDownloadResult{Skipped: true, Reason: "invalid request"}, false
 	}
 
 	version, ok := modbridge.ResolveVersion(req)
 	if !ok {
-		return appstructs.ModDownloadResult{Skipped: true, Reason: "no matching version"}
+		return downloadJob{}, appstructs.ModDownloadResult{Skipped: true, Reason: "no matching version"}, false
 	}
-	version = hydrateRequiredDependencies(req, version)
 	if version.DownloadURL == "" {
-		return appstructs.ModDownloadResult{Skipped: true, Reason: "missing download url"}
+		return downloadJob{}, appstructs.ModDownloadResult{Skipped: true, Reason: "missing download url"}, false
 	}
 	if visited == nil {
 		visited = make(map[string]bool)
 	}
 	if key := projectVersionJobKey(version); key != "" {
 		if visited[key] {
-			return appstructs.ModDownloadResult{Skipped: true, Reason: "already queued"}
+			return downloadJob{}, appstructs.ModDownloadResult{Skipped: true, Reason: "already queued"}, false
 		}
 		visited[key] = true
 	}
 
-	queueMissingRequiredDependencies(ctx, req, version, instanceID, curseForgeAPIKey, visited, events)
-	enqueueDownload(ctx, downloadJob{
-		Version:          version,
-		Result:           req.Result,
-		TargetDir:        targetDir,
-		InstanceID:       instanceID,
-		MinecraftVersion: req.MinecraftVersion,
-		ModLoader:        req.ModLoader,
-		CurseForgeAPIKey: curseForgeAPIKey,
-	}, events)
-	return appstructs.ModDownloadResult{
-		Queued:    true,
-		FileName:  version.FileName,
-		VersionID: version.ID,
-	}
+	return downloadJob{
+			ProjectID:        req.ProjectID,
+			Version:          version,
+			Result:           req.Result,
+			TargetDir:        targetDir,
+			InstanceID:       instanceID,
+			MinecraftVersion: req.MinecraftVersion,
+			ModLoader:        req.ModLoader,
+			CurseForgeAPIKey: curseForgeAPIKey,
+			visited:          visited,
+		}, appstructs.ModDownloadResult{
+			Queued:    true,
+			FileName:  version.FileName,
+			VersionID: version.ID,
+		}, true
 }
 
 func GetDownloadQueueState() appstructs.DownloadQueueState {
@@ -270,8 +284,7 @@ func firstNonEmpty(values ...string) string {
 
 func enqueueDownload(ctx context.Context, job downloadJob, events Events) {
 	downloadQueue.Lock()
-	downloadQueue.nextID++
-	job.ID = fmt.Sprintf("download-%d", downloadQueue.nextID)
+	assignDownloadIDLocked(&job)
 	downloadQueue.pending = append(downloadQueue.pending, job)
 	shouldStart := !downloadQueue.running
 	if shouldStart {
@@ -283,6 +296,28 @@ func enqueueDownload(ctx context.Context, job downloadJob, events Events) {
 	if shouldStart {
 		go runDownloadQueue(ctx, events)
 	}
+}
+
+func prependPendingDownloads(jobs []downloadJob, events Events) {
+	if len(jobs) == 0 {
+		return
+	}
+	downloadQueue.Lock()
+	for i := range jobs {
+		assignDownloadIDLocked(&jobs[i])
+		jobs[i].cancel = nil
+	}
+	downloadQueue.pending = append(append([]downloadJob(nil), jobs...), downloadQueue.pending...)
+	downloadQueue.Unlock()
+	emitDownloadQueueState(events)
+}
+
+func assignDownloadIDLocked(job *downloadJob) {
+	if strings.TrimSpace(job.ID) != "" {
+		return
+	}
+	downloadQueue.nextID++
+	job.ID = fmt.Sprintf("download-%d", downloadQueue.nextID)
 }
 
 func runDownloadQueue(ctx context.Context, events Events) {
@@ -307,7 +342,7 @@ func runDownloadQueue(ctx context.Context, events Events) {
 		downloadQueue.Unlock()
 		emitDownloadQueueState(events)
 
-		err := downloadModJob(jobCtx, job)
+		err := downloadModJob(jobCtx, job, events)
 		if consumeFinalizedDownloadCancel(job.ID) {
 			cancel()
 			emitDownloadQueueState(events)
@@ -322,6 +357,8 @@ func runDownloadQueue(ctx context.Context, events Events) {
 				} else if consumeDownloadCancelRequest(job.ID) {
 					appendRetryableDownload(job, "canceled", "canceled")
 				}
+			} else if errors.Is(err, errDownloadRequeued) {
+				logging.Debug("download mod requeued after dependency analysis", "fileName", job.Version.FileName, "versionID", job.Version.ID, "targetDir", job.TargetDir)
 			} else if errors.Is(err, errDownloadStalled) && retryStalledDownload(parentCtx, job, events) {
 				logging.Warn("download mod stalled, retrying", "fileName", job.Version.FileName, "versionID", job.Version.ID, "targetDir", job.TargetDir, "attempt", job.AutoAttempt+1, "maxRetries", maxDownloadStallRetries)
 			} else {
@@ -340,9 +377,23 @@ func runDownloadQueue(ctx context.Context, events Events) {
 	}
 }
 
-func downloadModJob(ctx context.Context, job downloadJob) error {
+func downloadModJob(ctx context.Context, job downloadJob, events Events) error {
 	if err := os.MkdirAll(job.TargetDir, 0o755); err != nil {
 		return err
+	}
+	if !job.dependenciesDone {
+		dependencies, preparedJob, err := prepareDownloadDependencies(ctx, job)
+		if err != nil {
+			return err
+		}
+		if err := ctxErr(ctx); err != nil {
+			return err
+		}
+		if len(dependencies) > 0 {
+			prependPendingDownloads(append(dependencies, preparedJob), events)
+			return errDownloadRequeued
+		}
+		job = preparedJob
 	}
 	if tryHardlinkInstall(job) {
 		return nil
@@ -499,8 +550,43 @@ func nextOldJarPath(path string) string {
 	}
 }
 
-func queueMissingRequiredDependencies(ctx context.Context, req appstructs.ModDownloadRequest, version models.ModVersion, instanceID string, curseForgeAPIKey string, visited map[string]bool, events Events) {
+func prepareDownloadDependencies(ctx context.Context, job downloadJob) ([]downloadJob, downloadJob, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, job, err
+	}
+	req := downloadRequestFromJob(job)
+	version := hydrateRequiredDependencies(req, job.Version)
+	if err := ctxErr(ctx); err != nil {
+		return nil, job, err
+	}
+
+	job.Version = version
+	job.dependenciesDone = true
+	dependencies, err := missingRequiredDependencyJobs(ctx, req, version, job.CurseForgeAPIKey, job.visited)
+	if err != nil {
+		return nil, job, err
+	}
+	return dependencies, job, nil
+}
+
+func downloadRequestFromJob(job downloadJob) appstructs.ModDownloadRequest {
+	return appstructs.ModDownloadRequest{
+		ProjectID:        job.ProjectID,
+		Result:           job.Result,
+		MinecraftVersion: job.MinecraftVersion,
+		ModLoader:        job.ModLoader,
+		TargetDir:        job.TargetDir,
+		InstanceID:       job.InstanceID,
+		VersionID:        job.Version.ID,
+	}
+}
+
+func missingRequiredDependencyJobs(ctx context.Context, req appstructs.ModDownloadRequest, version models.ModVersion, curseForgeAPIKey string, visited map[string]bool) ([]downloadJob, error) {
+	dependencies := make([]downloadJob, 0)
 	for _, dep := range version.Dependencies {
+		if err := ctxErr(ctx); err != nil {
+			return nil, err
+		}
 		if !isRequiredDependency(dep) {
 			continue
 		}
@@ -511,14 +597,28 @@ func queueMissingRequiredDependencies(ctx context.Context, req appstructs.ModDow
 			continue
 		}
 
-		if modbridge.InstallStatusPrecise(depReq) != modbridge.BtnStatusNew {
+		if installStatusPrecise(depReq) != modbridge.BtnStatusNew {
+			if err := ctxErr(ctx); err != nil {
+				return nil, err
+			}
 			continue
 		}
-		result := queueModDownload(ctx, depReq, curseForgeAPIKey, visited, events)
+		if err := ctxErr(ctx); err != nil {
+			return nil, err
+		}
+		job, result, ok := buildDownloadJob(depReq, curseForgeAPIKey, visited)
+		if err := ctxErr(ctx); err != nil {
+			return nil, err
+		}
 		if result.Skipped {
 			logging.Warn("required dependency queue skipped", "platform", depReq.Result.Platform, "projectID", depReq.ProjectID, "versionID", dep.DependencyVersionID, "reason", result.Reason)
+			continue
+		}
+		if ok {
+			dependencies = append(dependencies, job)
 		}
 	}
+	return dependencies, nil
 }
 
 func hydrateRequiredDependencies(req appstructs.ModDownloadRequest, version models.ModVersion) models.ModVersion {
@@ -526,11 +626,18 @@ func hydrateRequiredDependencies(req appstructs.ModDownloadRequest, version mode
 		return version
 	}
 
-	refreshed := providers.RefreshMatchingProjectVersions(req.Result, req.MinecraftVersion, req.ModLoader)
+	refreshed := refreshMatchingProjectVersions(req.Result, req.MinecraftVersion, req.ModLoader)
 	if refreshedVersion, found := modbridge.FindVersionByID(refreshed, version.ID); found && hasRequiredDependency(refreshedVersion.Dependencies) {
 		return refreshedVersion
 	}
 	return version
+}
+
+func ctxErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
 }
 
 func hasRequiredDependency(deps []models.ModDependency) bool {

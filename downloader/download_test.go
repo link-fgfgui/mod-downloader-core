@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/cavaliergopher/grab/v3"
+	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/modbridge"
 	"github.com/link-fgfgui/mod-downloader-core/models"
+	"github.com/link-fgfgui/mod-downloader-core/providers"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 	mcstructs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
@@ -29,6 +31,57 @@ func resetDownloadQueueForTest(t *testing.T) {
 	downloadQueue.running = false
 	downloadQueue.current = nil
 	downloadQueue.Unlock()
+	resetDownloaderHooksForTest(t)
+}
+
+func resetDownloaderHooksForTest(t *testing.T) {
+	t.Helper()
+	refreshMatchingProjectVersions = providers.RefreshMatchingProjectVersions
+	installStatusPrecise = modbridge.InstallStatusPrecise
+}
+
+func openDownloadTestDatabase(t *testing.T) {
+	t.Helper()
+	if err := database.OpenAt(filepath.Join(t.TempDir(), "mods.gob.zst")); err != nil {
+		t.Fatalf("database.OpenAt() error = %v", err)
+	}
+	t.Cleanup(database.Close)
+}
+
+func seedDownloadProjectVersion(t *testing.T, projectID string, version models.ModVersion) models.ModProject {
+	t.Helper()
+	project := models.ModProject{
+		ID:        "modrinth:" + projectID,
+		Platform:  "Modrinth",
+		ProjectID: projectID,
+		Slug:      projectID,
+		Title:     projectID,
+	}
+	if err := database.UpsertModPlatform(project); err != nil {
+		t.Fatalf("database.UpsertModPlatform(%q) error = %v", projectID, err)
+	}
+	if err := database.SetPlatformVersionSnapshot("Modrinth", projectID, []models.ModVersion{version}, time.Now().Unix(), []database.ModPlatformVersionScope{{
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+	}}); err != nil {
+		t.Fatalf("database.SetPlatformVersionSnapshot(%q) error = %v", projectID, err)
+	}
+	return project
+}
+
+func waitForDownloadState(t *testing.T, match func(appstructs.DownloadQueueState) bool) appstructs.DownloadQueueState {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		state := GetDownloadQueueState()
+		if match(state) {
+			return state
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	state := GetDownloadQueueState()
+	t.Fatalf("download state did not match before timeout: %#v", state)
+	return state
 }
 
 func TestGetDownloadStatesReturnsDefaultWhenSelectedInstanceHasNoLocalMods(t *testing.T) {
@@ -125,6 +178,116 @@ func TestQueueModDownloadAcceptsExplicitTargetWithoutSelectedInstance(t *testing
 	}
 	if result.Reason != "invalid request" {
 		t.Fatalf("reason = %q, want invalid request", result.Reason)
+	}
+}
+
+func TestCancelDownloadDuringDependencyAnalysisKeepsRetryableQueueItem(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	openDownloadTestDatabase(t)
+	targetDir := t.TempDir()
+	mainVersion := models.ModVersion{
+		ID:           "main-version",
+		Platform:     "Modrinth",
+		ProjectID:    "main",
+		FileName:     "main.jar",
+		DownloadURL:  "https://example.invalid/main.jar",
+		GameVersions: []string{"1.21.1"},
+		Loaders:      []string{"fabric"},
+	}
+	project := seedDownloadProjectVersion(t, "main", mainVersion)
+
+	analysisStarted := make(chan struct{})
+	releaseAnalysis := make(chan struct{})
+	refreshMatchingProjectVersions = func(result models.ModProject, minecraftVersion string, modLoader string) []models.ModVersion {
+		close(analysisStarted)
+		<-releaseAnalysis
+		mainVersion.Dependencies = []models.ModDependency{{
+			DependencyProjectID: "dependency",
+			DependencyType:      "required",
+		}}
+		return []models.ModVersion{mainVersion}
+	}
+	installStatusPrecise = func(req appstructs.ModDownloadRequest) string {
+		return modbridge.BtnStatusNew
+	}
+
+	result := QueueModDownload(context.Background(), appstructs.ModDownloadRequest{
+		ProjectID:        "modrinth:main",
+		Result:           project,
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+		TargetDir:        targetDir,
+		InstanceID:       "cli:" + targetDir,
+	}, "")
+	if !result.Queued {
+		t.Fatalf("QueueModDownload() = %#v, want queued", result)
+	}
+
+	select {
+	case <-analysisStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dependency analysis did not start")
+	}
+	running := waitForDownloadState(t, func(state appstructs.DownloadQueueState) bool {
+		return state.Running == 1 && len(state.Items) == 1 && state.Items[0].Cancelable
+	})
+	runningID := running.Items[0].ID
+	if runningID == "" {
+		t.Fatalf("running item has empty id: %#v", running.Items[0])
+	}
+
+	if !CancelDownload(context.Background(), runningID) {
+		t.Fatal("CancelDownload() = false, want true")
+	}
+	close(releaseAnalysis)
+
+	state := waitForDownloadState(t, func(state appstructs.DownloadQueueState) bool {
+		return state.Running == 0 && state.Pending == 0 && len(state.Items) == 1 && state.Items[0].Status == "canceled"
+	})
+	item := state.Items[0]
+	if item.ID != runningID || !item.Retryable || item.Cancelable {
+		t.Fatalf("canceled item = %#v", item)
+	}
+}
+
+func TestRetryCanceledDependencyAnalysisUsesFreshQueueID(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	downloadQueue.Lock()
+	downloadQueue.nextID = 1
+	downloadQueue.retryable = []retryableDownloadJob{{
+		Status: "canceled",
+		Reason: "canceled",
+		Job: downloadJob{
+			ID: "download-1",
+			Version: models.ModVersion{
+				ID:       "main-version",
+				Platform: "modrinth",
+				FileName: "main.jar",
+			},
+			Result: models.ModProject{
+				Title: "Main",
+			},
+			TargetDir:        t.TempDir(),
+			InstanceID:       "instance",
+			MinecraftVersion: "1.21.1",
+			ModLoader:        "fabric",
+		},
+	}}
+	// Suppress the background runner; this test only verifies retry queue state.
+	downloadQueue.running = true
+	downloadQueue.Unlock()
+
+	if !RetryDownload(nil, "download-1") {
+		t.Fatal("RetryDownload() = false, want true")
+	}
+
+	state := GetDownloadQueueState()
+	if state.Pending != 1 || len(state.Items) != 1 {
+		t.Fatalf("state = %#v", state)
+	}
+	item := state.Items[0]
+	if item.ID != "download-2" || item.Status != "pending" || !item.Cancelable || item.Retryable {
+		t.Fatalf("item = %#v", item)
 	}
 }
 
