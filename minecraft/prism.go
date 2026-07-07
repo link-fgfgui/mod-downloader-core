@@ -1,6 +1,7 @@
 package minecraft
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,10 +9,13 @@ import (
 	structs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
 
-// PrismInstanceGameDirName is the conventional Prism Launcher subfolder that
-// holds the actual Minecraft game files (versions/, mods/, etc.). Prism creates
-// this folder inside each instance directory by default.
-const PrismInstanceGameDirName = ".minecraft"
+// Prism instance game directories hold the actual Minecraft game files
+// (mods/, config/, and sometimes versions/). Prism commonly uses "minecraft";
+// older imported instances in this app may use ".minecraft".
+const (
+	PrismInstanceDotMinecraftDirName = ".minecraft"
+	PrismInstanceMinecraftDirName    = "minecraft"
+)
 
 // prismInstanceConfigFiles are marker files that uniquely identify a Prism
 // Launcher instance directory. Either one is sufficient for detection.
@@ -55,8 +59,10 @@ func isPrismInstanceDir(dir string) bool {
 	if dir == "" {
 		return false
 	}
-	if info, err := os.Stat(filepath.Join(dir, PrismInstanceGameDirName)); err == nil && info.IsDir() {
-		return true
+	for _, gameDirName := range prismInstanceGameDirNames() {
+		if info, err := os.Stat(filepath.Join(dir, gameDirName)); err == nil && info.IsDir() {
+			return true
+		}
 	}
 	for _, marker := range prismInstanceConfigFiles {
 		if info, err := os.Stat(filepath.Join(dir, marker)); err == nil && !info.IsDir() {
@@ -66,19 +72,25 @@ func isPrismInstanceDir(dir string) bool {
 	return false
 }
 
-// PrismInstanceGameDir returns the directory holding versions/ and mods/ for a
-// Prism instance directory. It prefers <instanceDir>/.minecraft and falls back
-// to <instanceDir> itself when no .minecraft/ subfolder exists (some Prism
-// instances are configured to use the instance root as the game dir).
+// PrismInstanceGameDir returns the directory holding mods/ for a Prism instance
+// directory. It prefers <instanceDir>/.minecraft for backward compatibility,
+// then Prism's common <instanceDir>/minecraft, and finally the instance root
+// for instances configured to use the root as the game dir.
 func PrismInstanceGameDir(instanceDir string) string {
 	if instanceDir == "" {
 		return ""
 	}
-	gameDir := filepath.Join(instanceDir, PrismInstanceGameDirName)
-	if info, err := os.Stat(gameDir); err == nil && info.IsDir() {
-		return gameDir
+	for _, gameDirName := range prismInstanceGameDirNames() {
+		gameDir := filepath.Join(instanceDir, gameDirName)
+		if info, err := os.Stat(gameDir); err == nil && info.IsDir() {
+			return gameDir
+		}
 	}
 	return instanceDir
+}
+
+func prismInstanceGameDirNames() []string {
+	return []string{PrismInstanceDotMinecraftDirName, PrismInstanceMinecraftDirName}
 }
 
 // MakePrismVersionID builds the composite version ID for a version that lives
@@ -105,6 +117,82 @@ func SplitPrismVersionID(id string) (instanceName, versionFolder string, ok bool
 	return id[:idx], id[idx+1:], true
 }
 
+type prismPack struct {
+	Components []prismPackComponent `json:"components"`
+}
+
+type prismPackComponent struct {
+	CachedName    string `json:"cachedName"`
+	CachedVersion string `json:"cachedVersion"`
+	UID           string `json:"uid"`
+	Version       string `json:"version"`
+}
+
+// prismVersionInfoFromPack parses Prism's mmc-pack.json into the same
+// VersionInfo shape used by standard launcher manifests. Prism instances often
+// do not have a per-instance versions/ directory, so this metadata is the
+// source of truth for the Minecraft target and mod loader.
+func prismVersionInfoFromPack(instanceDir string) (structs.VersionInfo, bool) {
+	raw, err := os.ReadFile(filepath.Join(instanceDir, "mmc-pack.json"))
+	if err != nil {
+		return structs.VersionInfo{}, false
+	}
+	var pack prismPack
+	if err := json.Unmarshal(raw, &pack); err != nil {
+		return structs.VersionInfo{}, false
+	}
+
+	minecraftVersion := ""
+	modLoader := ""
+	for _, component := range pack.Components {
+		uid := strings.ToLower(strings.TrimSpace(component.UID))
+		version := firstNonEmpty(component.Version, component.CachedVersion)
+		switch {
+		case uid == "net.minecraft":
+			minecraftVersion = version
+		case uid == "net.fabricmc.fabric-loader":
+			modLoader = "fabric"
+		case uid == "net.neoforged":
+			modLoader = "neoforge"
+		case strings.HasPrefix(uid, "net.minecraftforge"):
+			modLoader = "forge"
+		}
+	}
+	if minecraftVersion == "" || modLoader == "" {
+		return structs.VersionInfo{}, false
+	}
+
+	id := prismSyntheticVersionFolder(minecraftVersion, modLoader)
+	return structs.VersionInfo{
+		Name:             id,
+		ID:               id,
+		MinecraftVersion: minecraftVersion,
+		ModLoader:        modLoader,
+	}, true
+}
+
+func prismSyntheticVersionFolder(minecraftVersion, modLoader string) string {
+	switch strings.ToLower(strings.TrimSpace(modLoader)) {
+	case "fabric":
+		return "fabric-loader-" + strings.TrimSpace(minecraftVersion)
+	case "forge":
+		return "forge-" + strings.TrimSpace(minecraftVersion)
+	case "neoforge":
+		return "neoforge-" + strings.TrimSpace(minecraftVersion)
+	default:
+		return strings.TrimSpace(minecraftVersion)
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 // VersionFolderName returns the version folder name (the directory under
 // versions/ that contains the manifest and mods/) for the given version. For
 // composite Prism version IDs this is the part after the separator; otherwise
@@ -123,8 +211,10 @@ func VersionFolderName(version structs.VersionInfo) string {
 // given version, given the user-selected minecraft directory. The result is
 // where versions/<folder>/mods/ lives. Behavior:
 //   - For composite Prism version IDs (when mcDir is a Prism "instances/"
-//     folder): mcDir/<instanceName>/.minecraft/versions/<folder>, with the
-//     .minecraft part skipped when the instance has no such subfolder.
+//     folder): resolves the instance game dir (either .minecraft/, minecraft/,
+//     or the instance root). If that game dir has versions/<folder>, returns
+//     that directory for compatibility; otherwise returns the game dir itself
+//     so mods resolve to gameDir/mods.
 //   - Otherwise: mcDir/versions/<folder> (the standard .minecraft layout).
 func VersionDirPath(mcDir string, version structs.VersionInfo) string {
 	if mcDir == "" {

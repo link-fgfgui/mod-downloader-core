@@ -48,11 +48,16 @@ func TestIsPrismInstancesDirRejectsEmptyAndNonInstanceDirs(t *testing.T) {
 func TestIsPrismInstancesDirDetectsDotMinecraftSubfolder(t *testing.T) {
 	dir := t.TempDir()
 	instanceDir := filepath.Join(dir, "MyFabric")
-	if err := os.MkdirAll(filepath.Join(instanceDir, ".minecraft"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if !IsPrismInstancesDir(dir) {
-		t.Fatalf("IsPrismInstancesDir() = false after adding instance with .minecraft/")
+	for _, gameDirName := range prismInstanceGameDirNames() {
+		if err := os.RemoveAll(instanceDir); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(instanceDir, gameDirName), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if !IsPrismInstancesDir(dir) {
+			t.Fatalf("IsPrismInstancesDir() = false after adding instance with %s/", gameDirName)
+		}
 	}
 }
 
@@ -70,17 +75,48 @@ func TestIsPrismInstancesDirDetectsMarkerFiles(t *testing.T) {
 
 func TestPrismInstanceGameDirPrefersDotMinecraft(t *testing.T) {
 	instanceDir := t.TempDir()
-	// Without .minecraft/, returns the instance dir itself.
+	// Without a game-dir subfolder, returns the instance dir itself.
 	if got := PrismInstanceGameDir(instanceDir); got != instanceDir {
-		t.Fatalf("PrismInstanceGameDir() without .minecraft = %q, want %q", got, instanceDir)
+		t.Fatalf("PrismInstanceGameDir() without game dir = %q, want %q", got, instanceDir)
 	}
-	// With .minecraft/, returns the subfolder.
-	gameDir := filepath.Join(instanceDir, ".minecraft")
-	if err := os.MkdirAll(gameDir, 0o755); err != nil {
+	// Prism commonly uses minecraft/.
+	minecraftDir := filepath.Join(instanceDir, "minecraft")
+	if err := os.MkdirAll(minecraftDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if got := PrismInstanceGameDir(instanceDir); got != gameDir {
-		t.Fatalf("PrismInstanceGameDir() with .minecraft = %q, want %q", got, gameDir)
+	if got := PrismInstanceGameDir(instanceDir); got != minecraftDir {
+		t.Fatalf("PrismInstanceGameDir() with minecraft = %q, want %q", got, minecraftDir)
+	}
+	// If both exist, prefer .minecraft for backward compatibility.
+	dotMinecraftDir := filepath.Join(instanceDir, ".minecraft")
+	if err := os.MkdirAll(dotMinecraftDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := PrismInstanceGameDir(instanceDir); got != dotMinecraftDir {
+		t.Fatalf("PrismInstanceGameDir() with both game dirs = %q, want %q", got, dotMinecraftDir)
+	}
+}
+
+func TestPrismVersionInfoFromPack(t *testing.T) {
+	instanceDir := t.TempDir()
+	writeMarkerFile(t, filepath.Join(instanceDir, "mmc-pack.json"))
+	if err := os.WriteFile(filepath.Join(instanceDir, "mmc-pack.json"), []byte(`{
+		"components": [
+			{"uid": "org.lwjgl3", "version": "3.3.3"},
+			{"uid": "net.minecraft", "version": "1.21.1"},
+			{"uid": "net.neoforged", "version": "21.1.233"}
+		],
+		"formatVersion": 1
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := prismVersionInfoFromPack(instanceDir)
+	if !ok {
+		t.Fatal("prismVersionInfoFromPack() ok = false, want true")
+	}
+	if got.ID != "neoforge-1.21.1" || got.MinecraftVersion != "1.21.1" || got.ModLoader != "neoforge" {
+		t.Fatalf("prismVersionInfoFromPack() = %#v", got)
 	}
 }
 
@@ -129,12 +165,13 @@ func TestVersionDirPathResolvesPrismInstancesFolder(t *testing.T) {
 	instancesDir := t.TempDir()
 	instanceDir := filepath.Join(instancesDir, "MyFabric")
 	gameDir := filepath.Join(instanceDir, ".minecraft")
-	if err := os.MkdirAll(gameDir, 0o755); err != nil {
+	versionDir := filepath.Join(gameDir, "versions", "fabric-loader-1.21.1")
+	if err := os.MkdirAll(versionDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
 	got := VersionDirPath(instancesDir, structs.VersionInfo{ID: "MyFabric/fabric-loader-1.21.1"})
-	want := filepath.Join(gameDir, "versions", "fabric-loader-1.21.1")
+	want := versionDir
 	if got != want {
 		t.Fatalf("VersionDirPath() = %q, want %q", got, want)
 	}
@@ -145,11 +182,29 @@ func TestVersionDirPathResolvesPrismInstanceWithoutDotMinecraft(t *testing.T) {
 	instanceDir := filepath.Join(instancesDir, "BareInstance")
 	// Instance exists but has no .minecraft subfolder (uses instance root as game dir).
 	writeMarkerFile(t, filepath.Join(instanceDir, "instance.cfg"))
+	versionDir := filepath.Join(instanceDir, "versions", "fabric-loader-1.21.1")
+	if err := os.MkdirAll(versionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	got := VersionDirPath(instancesDir, structs.VersionInfo{ID: "BareInstance/fabric-loader-1.21.1"})
-	want := filepath.Join(instanceDir, "versions", "fabric-loader-1.21.1")
+	want := versionDir
 	if got != want {
 		t.Fatalf("VersionDirPath() = %q, want %q", got, want)
+	}
+}
+
+func TestVersionDirPathResolvesPrismGameDirWithoutVersionsFolder(t *testing.T) {
+	instancesDir := t.TempDir()
+	instanceDir := filepath.Join(instancesDir, "MyFabric")
+	gameDir := filepath.Join(instanceDir, "minecraft")
+	if err := os.MkdirAll(gameDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got := VersionDirPath(instancesDir, structs.VersionInfo{ID: "MyFabric/fabric-loader-1.21.1"})
+	if got != gameDir {
+		t.Fatalf("VersionDirPath() = %q, want %q", got, gameDir)
 	}
 }
 

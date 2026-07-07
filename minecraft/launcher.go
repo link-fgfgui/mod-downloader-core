@@ -86,7 +86,11 @@ func (prismLayout) LoadVersions(root string, loadGameDir GameDirVersionLoader) [
 		gameDir := PrismInstanceGameDir(instanceDir)
 		instanceVersions := loadGameDir(gameDir)
 		if len(instanceVersions) == 0 {
-			continue
+			info, ok := prismVersionInfoFromPack(instanceDir)
+			if !ok {
+				continue
+			}
+			instanceVersions = []structs.VersionInfo{info}
 		}
 		info := instanceVersions[0]
 		info.ID = MakePrismVersionID(instanceName, info.ID)
@@ -103,5 +107,9 @@ func (prismLayout) VersionDir(root string, version structs.VersionInfo) string {
 	}
 	instanceDir := filepath.Join(root, instanceName)
 	gameDir := PrismInstanceGameDir(instanceDir)
-	return filepath.Join(gameDir, "versions", folder)
+	versionDir := filepath.Join(gameDir, "versions", folder)
+	if info, err := os.Stat(versionDir); err == nil && info.IsDir() {
+		return versionDir
+	}
+	return gameDir
 }
