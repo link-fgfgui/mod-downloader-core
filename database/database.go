@@ -683,3 +683,34 @@ func copyFavoriteMod(mod FavoriteMod) FavoriteMod {
 	mod.Categories = copyStringSlice(mod.Categories)
 	return mod
 }
+
+func copyFavoriteModEntry(entry FavoriteModEntry) FavoriteModEntry {
+	entry.FavoriteMod = copyFavoriteMod(entry.FavoriteMod)
+	return entry
+}
+
+func copyFavoriteModEntries(entries []FavoriteModEntry) []FavoriteModEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]FavoriteModEntry, len(entries))
+	for i, entry := range entries {
+		out[i] = copyFavoriteModEntry(entry)
+	}
+	return out
+}
+
+func copyFavoriteListRefs(refs []FavoriteListRef) []FavoriteListRef {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]FavoriteListRef, len(refs))
+	copy(out, refs)
+	return out
+}
+
+func copyFavoriteListContents(contents FavoriteListContents) FavoriteListContents {
+	contents.Mods = copyFavoriteModEntries(contents.Mods)
+	contents.Refs = copyFavoriteListRefs(contents.Refs)
+	return contents
+}

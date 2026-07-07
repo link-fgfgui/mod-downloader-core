@@ -28,11 +28,33 @@ type PinnedMod struct {
 
 type FavoriteList struct {
 	ID        string `json:"id"`
+	GroupID   string `json:"groupId,omitempty"`
 	Name      string `json:"name"`
+	IconKind  string `json:"iconKind,omitempty"`
+	IconValue string `json:"iconValue,omitempty"`
+	IconURL   string `json:"iconUrl,omitempty"`
+	Pinned    bool   `json:"pinned,omitempty"`
 	CreatedAt int64  `json:"createdAt"`
 	UpdatedAt int64  `json:"updatedAt"`
 	SortOrder int    `json:"sortOrder"`
 	System    bool   `json:"system,omitempty"`
+}
+
+type FavoriteGroup struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt int64  `json:"createdAt"`
+	UpdatedAt int64  `json:"updatedAt"`
+	SortOrder int    `json:"sortOrder"`
+}
+
+type FavoriteListRef struct {
+	ID           string `json:"id"`
+	ParentListID string `json:"parentListId"`
+	ChildListID  string `json:"childListId"`
+	CreatedAt    int64  `json:"createdAt"`
+	UpdatedAt    int64  `json:"updatedAt"`
+	SortOrder    int    `json:"sortOrder"`
 }
 
 type FavoriteMod struct {
@@ -50,6 +72,19 @@ type FavoriteMod struct {
 	Categories       []string `json:"categories,omitempty"`
 	CreatedAt        int64    `json:"createdAt"`
 	UpdatedAt        int64    `json:"updatedAt"`
+}
+
+type FavoriteModEntry struct {
+	FavoriteMod
+	SourceListID   string `json:"sourceListId,omitempty"`
+	SourceListName string `json:"sourceListName,omitempty"`
+	Referenced     bool   `json:"referenced,omitempty"`
+}
+
+type FavoriteListContents struct {
+	ListID string             `json:"listId"`
+	Mods   []FavoriteModEntry `json:"mods"`
+	Refs   []FavoriteListRef  `json:"refs,omitempty"`
 }
 
 type ModPlatformVersionScope struct {
@@ -81,8 +116,25 @@ func normalizePinnedMod(p PinnedMod) PinnedMod {
 
 func normalizeFavoriteList(list FavoriteList) FavoriteList {
 	list.ID = strings.TrimSpace(list.ID)
+	list.GroupID = strings.TrimSpace(list.GroupID)
 	list.Name = strings.TrimSpace(list.Name)
+	list.IconKind = strings.ToLower(strings.TrimSpace(list.IconKind))
+	list.IconValue = strings.TrimSpace(list.IconValue)
+	list.IconURL = strings.TrimSpace(list.IconURL)
 	return list
+}
+
+func normalizeFavoriteGroup(group FavoriteGroup) FavoriteGroup {
+	group.ID = strings.TrimSpace(group.ID)
+	group.Name = strings.TrimSpace(group.Name)
+	return group
+}
+
+func normalizeFavoriteListRef(ref FavoriteListRef) FavoriteListRef {
+	ref.ID = strings.TrimSpace(ref.ID)
+	ref.ParentListID = strings.TrimSpace(ref.ParentListID)
+	ref.ChildListID = strings.TrimSpace(ref.ChildListID)
+	return ref
 }
 
 func normalizeFavoriteMod(mod FavoriteMod) FavoriteMod {
@@ -880,6 +932,126 @@ func ListFavoriteLists() []FavoriteList {
 	return lists
 }
 
+func UpdateFavoriteListMetadata(list FavoriteList) (FavoriteList, bool, error) {
+	d, err := readyUserDB()
+	if err != nil {
+		return FavoriteList{}, false, err
+	}
+	list = normalizeFavoriteList(list)
+	if list.ID == "" {
+		return FavoriteList{}, false, nil
+	}
+
+	updated, found, err := d.updateFavoriteListMetadata(list)
+	if err != nil {
+		logging.Error("update favorite list metadata failed", "id", list.ID, "error", err)
+		return FavoriteList{}, false, err
+	}
+	if found {
+		logging.Info("favorite list metadata updated", "id", updated.ID, "groupID", updated.GroupID, "pinned", updated.Pinned)
+	}
+	return updated, found, nil
+}
+
+func ReorderFavoriteLists(ids []string) error {
+	d, err := readyUserDB()
+	if err != nil {
+		return err
+	}
+	if err := d.reorderFavoriteLists(ids); err != nil {
+		logging.Error("reorder favorite lists failed", "error", err)
+		return err
+	}
+	return nil
+}
+
+func CreateFavoriteGroup(name string) (FavoriteGroup, error) {
+	d, err := readyUserDB()
+	if err != nil {
+		return FavoriteGroup{}, err
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return FavoriteGroup{}, nil
+	}
+
+	group, err := d.createFavoriteGroup(name)
+	if err != nil {
+		logging.Error("create favorite group failed", "name", name, "error", err)
+		return FavoriteGroup{}, err
+	}
+	logging.Info("favorite group created", "id", group.ID, "name", group.Name)
+	return group, nil
+}
+
+func UpdateFavoriteGroupName(id, name string) (FavoriteGroup, bool, error) {
+	d, err := readyUserDB()
+	if err != nil {
+		return FavoriteGroup{}, false, err
+	}
+	id = strings.TrimSpace(id)
+	name = strings.TrimSpace(name)
+	if id == "" || name == "" {
+		return FavoriteGroup{}, false, nil
+	}
+
+	group, found, err := d.updateFavoriteGroupName(id, name)
+	if err != nil {
+		logging.Error("rename favorite group failed", "id", id, "name", name, "error", err)
+		return FavoriteGroup{}, false, err
+	}
+	if found {
+		logging.Info("favorite group renamed", "id", id, "name", name)
+	}
+	return group, found, nil
+}
+
+func DeleteFavoriteGroup(id string) (bool, error) {
+	d, err := readyUserDB()
+	if err != nil {
+		return false, err
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, nil
+	}
+
+	deleted, err := d.deleteFavoriteGroup(id)
+	if err != nil {
+		logging.Error("delete favorite group failed", "id", id, "error", err)
+		return false, err
+	}
+	if deleted {
+		logging.Info("favorite group deleted", "id", id)
+	}
+	return deleted, nil
+}
+
+func ListFavoriteGroups() []FavoriteGroup {
+	d, err := readyUserDB()
+	if err != nil {
+		return nil
+	}
+	groups, err := d.listFavoriteGroups()
+	if err != nil {
+		logging.Error("list favorite groups failed", "error", err)
+		return nil
+	}
+	return groups
+}
+
+func ReorderFavoriteGroups(ids []string) error {
+	d, err := readyUserDB()
+	if err != nil {
+		return err
+	}
+	if err := d.reorderFavoriteGroups(ids); err != nil {
+		logging.Error("reorder favorite groups failed", "error", err)
+		return err
+	}
+	return nil
+}
+
 func UpsertFavoriteMod(mod FavoriteMod) (FavoriteMod, bool, error) {
 	d, err := readyUserDB()
 	if err != nil {
@@ -938,6 +1110,86 @@ func ListFavoriteMods(listID string) []FavoriteMod {
 		return nil
 	}
 	return mods
+}
+
+func CreateFavoriteListRef(parentListID, childListID string) (FavoriteListRef, bool, error) {
+	d, err := readyUserDB()
+	if err != nil {
+		return FavoriteListRef{}, false, err
+	}
+	parentListID = strings.TrimSpace(parentListID)
+	childListID = strings.TrimSpace(childListID)
+	if parentListID == "" || childListID == "" {
+		return FavoriteListRef{}, false, nil
+	}
+
+	ref, ok, err := d.createFavoriteListRef(parentListID, childListID)
+	if err != nil {
+		logging.Error("create favorite list reference failed", "parentListID", parentListID, "childListID", childListID, "error", err)
+		return FavoriteListRef{}, false, err
+	}
+	if ok {
+		logging.Info("favorite list reference created", "parentListID", ref.ParentListID, "childListID", ref.ChildListID)
+	}
+	return ref, ok, nil
+}
+
+func DeleteFavoriteListRef(parentListID, childListID string) (bool, error) {
+	d, err := readyUserDB()
+	if err != nil {
+		return false, err
+	}
+	parentListID = strings.TrimSpace(parentListID)
+	childListID = strings.TrimSpace(childListID)
+	if parentListID == "" || childListID == "" {
+		return false, nil
+	}
+
+	deleted, err := d.deleteFavoriteListRef(parentListID, childListID)
+	if err != nil {
+		logging.Error("delete favorite list reference failed", "parentListID", parentListID, "childListID", childListID, "error", err)
+		return false, err
+	}
+	if deleted {
+		logging.Info("favorite list reference deleted", "parentListID", parentListID, "childListID", childListID)
+	}
+	return deleted, nil
+}
+
+func ListFavoriteListRefs(parentListID string) []FavoriteListRef {
+	d, err := readyUserDB()
+	if err != nil {
+		return nil
+	}
+	parentListID = strings.TrimSpace(parentListID)
+	if parentListID == "" {
+		return nil
+	}
+
+	refs, err := d.listFavoriteListRefs(parentListID)
+	if err != nil {
+		logging.Error("list favorite list references failed", "parentListID", parentListID, "error", err)
+		return nil
+	}
+	return refs
+}
+
+func ListFavoriteContents(listID string) FavoriteListContents {
+	d, err := readyUserDB()
+	if err != nil {
+		return FavoriteListContents{}
+	}
+	listID = strings.TrimSpace(listID)
+	if listID == "" {
+		return FavoriteListContents{}
+	}
+
+	contents, err := d.listFavoriteContents(listID)
+	if err != nil {
+		logging.Error("list favorite contents failed", "listID", listID, "error", err)
+		return FavoriteListContents{}
+	}
+	return contents
 }
 
 // --- version mod IDs ---
