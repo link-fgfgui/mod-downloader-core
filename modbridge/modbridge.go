@@ -25,10 +25,11 @@ import (
 
 // Button status constants shared by downloader and modbridge.
 const (
-	BtnStatusNew       = "new"       // No same modId in instance -> standard download
-	BtnStatusInstalled = "installed" // Installed and same sha1 as latest -> disabled
-	BtnStatusUpdate    = "update"    // Same modId same project but not latest -> update
-	BtnStatusConflict  = "conflict"  // Same modId but not from this project's versions -> switch source
+	BtnStatusNew          = "new"          // No same modId in instance -> standard download
+	BtnStatusInstalled    = "installed"    // Installed and same sha1 as latest -> disabled
+	BtnStatusUpdate       = "update"       // Same modId same project but not latest -> update
+	BtnStatusConflict     = "conflict"     // Same modId but not from this project's versions -> switch source
+	BtnStatusIncompatible = "incompatible" // Requested version declares an incompatible installed project
 )
 
 // ResolveVersion returns the best matching platform version for a download request.
@@ -186,6 +187,10 @@ func InstallStatus(req appstructs.ModDownloadRequest) string {
 		return BtnStatusUpdate
 	}
 
+	if len(IncompatibleConflictsCached(req)) > 0 {
+		return BtnStatusIncompatible
+	}
+
 	// Search-list rendering reads memory + DB cache only (no remote JAR parse).
 	// On cache miss, marks the version for async backfill so a later refresh can
 	// resolve the correct state without blocking the initial render.
@@ -247,6 +252,139 @@ func InstallStatusPrecise(req appstructs.ModDownloadRequest) string {
 		}
 	}
 	return BtnStatusConflict
+}
+
+// IncompatibleConflicts resolves a request's platform-level incompatible
+// dependencies against local installed mods in the target instance.
+func IncompatibleConflicts(req appstructs.ModDownloadRequest) []appstructs.IncompatibleConflict {
+	return incompatibleConflicts(req, true)
+}
+
+// IncompatibleConflictsCached is the search-list variant. It never parses
+// remote jars; missing mod IDs are queued for the existing async backfill.
+func IncompatibleConflictsCached(req appstructs.ModDownloadRequest) []appstructs.IncompatibleConflict {
+	return incompatibleConflicts(req, false)
+}
+
+func incompatibleConflicts(req appstructs.ModDownloadRequest, precise bool) []appstructs.IncompatibleConflict {
+	req.ProjectID = strings.TrimSpace(req.ProjectID)
+	if req.ProjectID == "" {
+		req.ProjectID = providers.ProjectReferenceFromSearchResult(req.Result)
+	}
+
+	req, instanceID, targetDir, ok := ResolveInstallTarget(req)
+	if !ok || req.ProjectID == "" || req.MinecraftVersion == "" || req.ModLoader == "" {
+		return nil
+	}
+	ensureTargetModsScanned(targetDir, instanceID, req.MinecraftVersion, req.ModLoader)
+
+	version, ok := ResolveVersion(req)
+	if !ok {
+		return nil
+	}
+	if precise {
+		version = hydrateDependencyMetadata(req, version, hasIncompatibleDependency)
+	}
+	mainTitle := projectTitle(req.Result, req.ProjectID)
+	mainKey := providers.ProjectReferenceFromSearchResult(req.Result)
+	if mainKey == "" {
+		mainKey = req.ProjectID
+	}
+
+	conflicts := make([]appstructs.IncompatibleConflict, 0)
+	seenPaths := make(map[string]struct{})
+	for _, dep := range version.Dependencies {
+		if !IsDependencyType(dep, "incompatible") {
+			continue
+		}
+		depReq, ok := DependencyDownloadRequest(version.Platform, dep, req)
+		if !ok {
+			logging.Warn("incompatible dependency cannot be resolved", "platform", version.Platform, "projectID", dep.DependencyProjectID, "versionID", dep.DependencyVersionID, "type", dep.DependencyType)
+			continue
+		}
+		depVersion, ok := ResolveVersion(depReq)
+		if !ok {
+			logging.Warn("incompatible dependency version cannot be resolved", "platform", depReq.Result.Platform, "projectID", depReq.ProjectID, "versionID", dep.DependencyVersionID)
+			continue
+		}
+		var modIDs []string
+		if precise {
+			modIDs = VersionModIDs(depVersion, req.ModLoader)
+		} else {
+			modIDs = resolveVersionModIDs(depVersion)
+			if len(modIDs) == 0 {
+				markBackfill(depVersion, req.ModLoader)
+			}
+		}
+		if len(modIDs) == 0 {
+			continue
+		}
+		paths := LocalModPathsForModIDs(modIDs, instanceID)
+		if len(paths) == 0 {
+			continue
+		}
+		localMods := make([]appstructs.IncompatibleLocalMod, 0, len(paths))
+		for _, path := range paths {
+			if _, dup := seenPaths[path.Path]; dup {
+				continue
+			}
+			seenPaths[path.Path] = struct{}{}
+			localMods = append(localMods, appstructs.IncompatibleLocalMod{
+				Path:     path.Path,
+				FileName: filepath.Base(path.Path),
+				SHA1:     path.FileSHA1,
+			})
+		}
+		if len(localMods) == 0 {
+			continue
+		}
+		depKey := providers.ProjectReferenceFromSearchResult(depReq.Result)
+		if depKey == "" {
+			depKey = depReq.ProjectID
+		}
+		conflicts = append(conflicts, appstructs.IncompatibleConflict{
+			ProjectKey:             mainKey,
+			ProjectTitle:           mainTitle,
+			IncompatibleProjectKey: depKey,
+			IncompatibleTitle:      projectTitle(depReq.Result, depKey),
+			IncompatibleVersionID:  depReq.VersionID,
+			Paths:                  localMods,
+		})
+	}
+	return conflicts
+}
+
+func AnalyzeBatchIncompatibleConflicts(req appstructs.BatchDownloadRequest) appstructs.BatchIncompatibleAnalysis {
+	req.MinecraftVersion = strings.TrimSpace(req.MinecraftVersion)
+	req.ModLoader = strings.ToLower(strings.TrimSpace(req.ModLoader))
+	req.TargetDir = cleanPath(req.TargetDir)
+	req.InstanceID = strings.TrimSpace(req.InstanceID)
+
+	out := appstructs.BatchIncompatibleAnalysis{}
+	for _, result := range req.Results {
+		key := providers.ProjectReferenceFromSearchResult(result)
+		if key == "" {
+			continue
+		}
+		conflicts := IncompatibleConflicts(appstructs.ModDownloadRequest{
+			ProjectID:        key,
+			Result:           result,
+			MinecraftVersion: req.MinecraftVersion,
+			ModLoader:        req.ModLoader,
+			TargetDir:        req.TargetDir,
+			InstanceID:       req.InstanceID,
+		})
+		if len(conflicts) == 0 {
+			continue
+		}
+		out.Conflicts = append(out.Conflicts, appstructs.BatchIncompatibleConflict{
+			Key:       key,
+			Title:     projectTitle(result, key),
+			Result:    result,
+			Conflicts: conflicts,
+		})
+	}
+	return out
 }
 
 // DownloadStates returns button states for a list of search results.
@@ -589,10 +727,89 @@ func applyButtonStatus(state *appstructs.ModDownloadButtonState, status string) 
 	case BtnStatusConflict:
 		state.Icon = "mdi-download"
 		state.Color = "warning"
+	case BtnStatusIncompatible:
+		state.Icon = "mdi-alert-octagon-outline"
+		state.Color = "error"
 	default:
 		state.Icon = "mdi-download"
 		state.Color = "primary"
 	}
+}
+
+func DependencyDownloadRequest(platform string, dep models.ModDependency, parent appstructs.ModDownloadRequest) (appstructs.ModDownloadRequest, bool) {
+	projectID := strings.TrimSpace(dep.DependencyProjectID)
+	platform = strings.ToLower(strings.TrimSpace(platform))
+	if projectID == "" || (platform != "curseforge" && platform != "modrinth") {
+		return appstructs.ModDownloadRequest{}, false
+	}
+
+	ref := platform + ":" + projectID
+	project := models.ModProject{
+		ID:        ref,
+		Platform:  platform,
+		ProjectID: projectID,
+	}
+	if cached, ok := providers.GetProjectByID(ref); ok {
+		project = cached
+		if strings.TrimSpace(project.ID) == "" {
+			project.ID = ref
+		}
+		if strings.TrimSpace(project.Platform) == "" {
+			project.Platform = platform
+		}
+		if strings.TrimSpace(project.ProjectID) == "" {
+			project.ProjectID = projectID
+		}
+	}
+	return appstructs.ModDownloadRequest{
+		ProjectID:        ref,
+		Result:           project,
+		MinecraftVersion: parent.MinecraftVersion,
+		ModLoader:        parent.ModLoader,
+		VersionID:        strings.TrimSpace(dep.DependencyVersionID),
+		TargetDir:        parent.TargetDir,
+		InstanceID:       parent.InstanceID,
+	}, true
+}
+
+func IsDependencyType(dep models.ModDependency, dependencyType string) bool {
+	return strings.EqualFold(strings.TrimSpace(dep.DependencyType), dependencyType)
+}
+
+func hydrateDependencyMetadata(req appstructs.ModDownloadRequest, version models.ModVersion, match func([]models.ModDependency) bool) models.ModVersion {
+	if match(version.Dependencies) {
+		return version
+	}
+	refreshed := providers.RefreshMatchingProjectVersions(req.Result, req.MinecraftVersion, req.ModLoader)
+	if refreshedVersion, found := FindVersionByID(refreshed, version.ID); found && match(refreshedVersion.Dependencies) {
+		return refreshedVersion
+	}
+	return version
+}
+
+func hasIncompatibleDependency(deps []models.ModDependency) bool {
+	for _, dep := range deps {
+		if IsDependencyType(dep, "incompatible") {
+			return true
+		}
+	}
+	return false
+}
+
+func projectTitle(project models.ModProject, fallback string) string {
+	if title := strings.TrimSpace(project.Title); title != "" {
+		return title
+	}
+	if slug := strings.TrimSpace(project.Slug); slug != "" {
+		return slug
+	}
+	if projectID := strings.TrimSpace(project.ProjectID); projectID != "" {
+		return projectID
+	}
+	if fallback = strings.TrimSpace(fallback); fallback != "" {
+		return fallback
+	}
+	return "Mod"
 }
 
 func projectVersionSHA1Set(versions []models.ModVersion) map[string]bool {
