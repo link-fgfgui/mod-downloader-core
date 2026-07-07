@@ -191,3 +191,21 @@ func TestPreferencesAnimationDefaultsAndNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestPreferencesAutoScanUnusedDependenciesDefaultAndTOML(t *testing.T) {
+	defaults := Preferences{}
+	if !defaults.AutoScanUnusedDependenciesValue() {
+		t.Fatal("default auto scan unused dependencies = false, want true")
+	}
+
+	var cfg Config
+	if _, err := toml.Decode(`
+[preferences]
+auto_scan_unused_dependencies = false
+`, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Prefers.AutoScanUnusedDependenciesValue() {
+		t.Fatal("auto scan unused dependencies = true, want false")
+	}
+}

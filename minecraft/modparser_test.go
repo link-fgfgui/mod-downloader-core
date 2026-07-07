@@ -54,6 +54,37 @@ func TestParseFabricNestedJarsRecursively(t *testing.T) {
 	}
 }
 
+func TestParseFabricRequiredDependencies(t *testing.T) {
+	jar := testJar(t, map[string][]byte{
+		"fabric.mod.json": []byte(`{
+			"schemaVersion": 1,
+			"id": "top-fabric",
+			"version": "1.0.0",
+			"depends": {
+				"fabricloader": ">=0.15.0",
+				"minecraft": ">=1.21",
+				"java": ">=21",
+				"fabric-api": "*",
+				"cloth-config": ["*"],
+				"${placeholder}": "*"
+			},
+			"recommends": {
+				"optional-helper": "*"
+			}
+		}`),
+	})
+
+	mods := ParseModZipReader(testZipReader(t, jar), "top.jar", "fabric")
+	if len(mods) != 1 {
+		t.Fatalf("ParseModZipReader() returned %d mods, want 1: %#v", len(mods), mods)
+	}
+	got := dependencyIDs(mods[0].Dependencies)
+	want := []string{"fabric-api", "cloth-config"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("dependencies = %#v, want %#v", got, want)
+	}
+}
+
 func TestParseForgeJarJarRecursivelyAndIgnoresDependencyModIDs(t *testing.T) {
 	child := testJar(t, map[string][]byte{
 		"META-INF/mods.toml": []byte(`
@@ -105,6 +136,84 @@ mandatory=true
 	wantJij := []string{"childforge"}
 	if !reflect.DeepEqual(gotJij, wantJij) {
 		t.Fatalf("ParseModZipReader() JijMods ids = %#v, want %#v", gotJij, wantJij)
+	}
+}
+
+func TestParseForgeAndNeoForgeRequiredDependencies(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		path       string
+		loader     string
+		tomlSource string
+		want       []string
+	}{
+		{
+			name:   "forge mandatory",
+			path:   "META-INF/mods.toml",
+			loader: "forge",
+			tomlSource: `
+license="MIT"
+
+[[mods]]
+modId="topforge"
+
+[[dependencies.topforge]]
+modId="minecraft"
+mandatory=true
+
+[[dependencies.topforge]]
+modId="forge"
+mandatory=true
+
+[[dependencies.topforge]]
+modId="architectury"
+mandatory=true
+
+[[dependencies.topforge]]
+modId="optional-helper"
+mandatory=false
+`,
+			want: []string{"architectury"},
+		},
+		{
+			name:   "neoforge typed",
+			path:   "META-INF/neoforge.mods.toml",
+			loader: "neoforge",
+			tomlSource: `
+license="MIT"
+
+[[mods]]
+modId="topneo"
+
+[[dependencies.topneo]]
+modId="neoforge"
+type="required"
+
+[[dependencies.topneo]]
+modId="kotlinforforge"
+type="required"
+
+[[dependencies.topneo]]
+modId="optional-helper"
+type="optional"
+`,
+			want: []string{"kotlinforforge"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			jar := testJar(t, map[string][]byte{
+				tc.path: []byte(tc.tomlSource),
+			})
+
+			mods := ParseModZipReader(testZipReader(t, jar), "top.jar", tc.loader)
+			if len(mods) != 1 {
+				t.Fatalf("ParseModZipReader() returned %d mods, want 1: %#v", len(mods), mods)
+			}
+			got := dependencyIDs(mods[0].Dependencies)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("dependencies = %#v, want %#v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -278,6 +387,14 @@ func jijModIDs(mods []structs.JijModInfo) []string {
 	ids := make([]string, 0, len(mods))
 	for _, mod := range mods {
 		ids = append(ids, mod.ID)
+	}
+	return ids
+}
+
+func dependencyIDs(deps []structs.LocalModDependency) []string {
+	ids := make([]string, 0, len(deps))
+	for _, dep := range deps {
+		ids = append(ids, dep.ModID)
 	}
 	return ids
 }

@@ -169,3 +169,41 @@ func TestSaveCacheDirPreferencePersistsAndReopensDatabase(t *testing.T) {
 		t.Fatalf("persisted cache dir = %q, want %q", got, nextDir)
 	}
 }
+
+func TestSaveUnusedDependencyCleanupSettingsPersists(t *testing.T) {
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	appDir := t.TempDir()
+	if err := os.Chdir(appDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	svc := New(Options{Config: &configs.Config{}})
+	if !svc.GetSettings().AutoScanUnusedDependencies {
+		t.Fatal("default auto scan unused dependencies = false, want true")
+	}
+	view := svc.SaveUnusedDependencyCleanupSettings(SaveUnusedDependencyCleanupSettingsRequest{
+		AutoScanUnusedDependencies: false,
+	})
+	if view.AutoScanUnusedDependencies {
+		t.Fatal("view auto scan unused dependencies = true, want false")
+	}
+	if svc.Config().Prefers.AutoScanUnusedDependencies == nil || *svc.Config().Prefers.AutoScanUnusedDependencies {
+		t.Fatalf("config auto scan unused dependencies = %#v, want false", svc.Config().Prefers.AutoScanUnusedDependencies)
+	}
+
+	loaded, err := configs.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Prefers.AutoScanUnusedDependenciesValue() {
+		t.Fatal("persisted auto scan unused dependencies = true, want false")
+	}
+}
