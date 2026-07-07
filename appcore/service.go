@@ -126,6 +126,45 @@ type FavoriteBulkOperationResult struct {
 	Errors  []string `json:"errors,omitempty"`
 }
 
+type FavoriteMigrationRequest struct {
+	SourceListID     string `json:"sourceListId"`
+	TargetListID     string `json:"targetListId"`
+	MinecraftVersion string `json:"minecraftVersion"`
+	ModLoader        string `json:"modLoader"`
+	IgnoreConflicts  bool   `json:"ignoreConflicts,omitempty"`
+}
+
+type FavoriteMigrationPreview struct {
+	SourceListID string                      `json:"sourceListId"`
+	TargetListID string                      `json:"targetListId"`
+	Matched      []FavoriteMigrationMatch    `json:"matched"`
+	Conflicts    []FavoriteMigrationConflict `json:"conflicts"`
+	Errors       []string                    `json:"errors,omitempty"`
+}
+
+type FavoriteMigrationMatch struct {
+	Source  database.FavoriteModEntry `json:"source"`
+	Target  database.FavoriteMod      `json:"target"`
+	Project models.ModProject         `json:"project"`
+	Version models.ModVersion         `json:"version"`
+}
+
+type FavoriteMigrationConflict struct {
+	Source database.FavoriteModEntry `json:"source"`
+	Reason string                    `json:"reason"`
+}
+
+type FavoriteMigrationApplyResult struct {
+	Applied bool                        `json:"applied"`
+	Preview FavoriteMigrationPreview    `json:"preview"`
+	Result  FavoriteBulkOperationResult `json:"result"`
+}
+
+var (
+	favoriteMigrationLookupProjectByID   = providers.LookupProjectByPlatformID
+	favoriteMigrationLookupProjectBySlug = providers.LookupProjectByPlatformSlug
+)
+
 type InstallWaitResult struct {
 	Result appstructs.ModDownloadResult     `json:"result"`
 	State  appstructs.DownloadQueueState    `json:"state"`
@@ -423,6 +462,140 @@ func (s *Service) CopyFavoriteListToList(req FavoriteListCopyRequest) FavoriteBu
 		TargetListIDs: []string{targetListID},
 		Mods:          mods,
 	})
+}
+
+func (s *Service) PreviewFavoriteListMigration(req FavoriteMigrationRequest) FavoriteMigrationPreview {
+	sourceListID := strings.TrimSpace(req.SourceListID)
+	targetListID := strings.TrimSpace(req.TargetListID)
+	minecraftVersion := strings.TrimSpace(req.MinecraftVersion)
+	modLoader := strings.ToLower(strings.TrimSpace(req.ModLoader))
+	preview := FavoriteMigrationPreview{
+		SourceListID: sourceListID,
+		TargetListID: targetListID,
+	}
+	if sourceListID == "" || targetListID == "" {
+		preview.Errors = append(preview.Errors, "source and target list are required")
+		return preview
+	}
+	if minecraftVersion == "" || modLoader == "" {
+		preview.Errors = append(preview.Errors, "minecraft version and modloader are required")
+		return preview
+	}
+
+	contents := database.ListFavoriteContents(sourceListID)
+	for _, entry := range contents.Mods {
+		project, ok := s.favoriteMigrationProject(entry.FavoriteMod, minecraftVersion, modLoader)
+		if !ok {
+			preview.Conflicts = append(preview.Conflicts, FavoriteMigrationConflict{
+				Source: entry,
+				Reason: "project not found",
+			})
+			continue
+		}
+		versions := providers.ListMatchingProjectVersions(project, minecraftVersion, modLoader)
+		if len(versions) == 0 {
+			preview.Conflicts = append(preview.Conflicts, FavoriteMigrationConflict{
+				Source: entry,
+				Reason: "matching version not found",
+			})
+			continue
+		}
+		target := favoriteModForTargetList(entry.FavoriteMod, targetListID)
+		target.MinecraftVersion = minecraftVersion
+		target.ModLoader = modLoader
+		target.VersionID = favoriteMigrationVersionID(versions[0])
+		if strings.TrimSpace(target.ModID) == "" {
+			target.ModID = strings.TrimSpace(project.ProjectID)
+		}
+		if strings.TrimSpace(target.Platform) == "" {
+			target.Platform = strings.TrimSpace(project.Platform)
+		}
+		if strings.TrimSpace(target.Slug) == "" {
+			target.Slug = strings.TrimSpace(project.Slug)
+		}
+		preview.Matched = append(preview.Matched, FavoriteMigrationMatch{
+			Source:  entry,
+			Target:  target,
+			Project: project,
+			Version: versions[0],
+		})
+	}
+	return preview
+}
+
+func (s *Service) ApplyFavoriteListMigration(req FavoriteMigrationRequest) FavoriteMigrationApplyResult {
+	preview := s.PreviewFavoriteListMigration(req)
+	result := FavoriteMigrationApplyResult{Preview: preview}
+	if len(preview.Errors) > 0 {
+		result.Result.Errors = append(result.Result.Errors, preview.Errors...)
+		return result
+	}
+	if len(preview.Conflicts) > 0 && !req.IgnoreConflicts {
+		result.Result.Skipped = len(preview.Matched) + len(preview.Conflicts)
+		result.Result.Errors = append(result.Result.Errors, "migration conflicts must be ignored or resolved before applying")
+		return result
+	}
+	mods := make([]database.FavoriteMod, 0, len(preview.Matched))
+	for _, match := range preview.Matched {
+		mods = append(mods, match.Target)
+	}
+	result.Result = s.AddFavoriteModsToLists(FavoriteBulkAddRequest{
+		TargetListIDs: []string{preview.TargetListID},
+		Mods:          mods,
+	})
+	result.Result.Skipped += len(preview.Conflicts)
+	result.Applied = result.Result.Added > 0 || result.Result.Updated > 0
+	return result
+}
+
+func (s *Service) favoriteMigrationProject(mod database.FavoriteMod, minecraftVersion, modLoader string) (models.ModProject, bool) {
+	platform := strings.TrimSpace(mod.Platform)
+	modID := strings.TrimSpace(mod.ModID)
+	slug := strings.TrimSpace(mod.Slug)
+	if platform == "" {
+		return models.ModProject{}, false
+	}
+	if modID != "" {
+		if project, ok := database.GetModPlatform(platform, modID); ok {
+			return favoriteMigrationProjectWithID(project), true
+		}
+		if project, ok := database.GetModPlatformBySlug(platform, modID); ok {
+			return favoriteMigrationProjectWithID(project), true
+		}
+	}
+	if slug != "" {
+		if project, ok := database.GetModPlatformBySlug(platform, slug); ok {
+			return favoriteMigrationProjectWithID(project), true
+		}
+		if project, ok := database.GetModPlatform(platform, slug); ok {
+			return favoriteMigrationProjectWithID(project), true
+		}
+	}
+	if modID != "" {
+		if project, ok := favoriteMigrationLookupProjectByID(platform, modID, minecraftVersion, modLoader); ok {
+			return favoriteMigrationProjectWithID(project), true
+		}
+	}
+	if slug != "" {
+		if project, ok := favoriteMigrationLookupProjectBySlug(platform, slug, minecraftVersion, modLoader); ok {
+			return favoriteMigrationProjectWithID(project), true
+		}
+	}
+	return models.ModProject{}, false
+}
+
+func favoriteMigrationProjectWithID(project models.ModProject) models.ModProject {
+	if strings.TrimSpace(project.ID) == "" {
+		project.ID = models.ProjectKey(project.Platform, project.ProjectID)
+	}
+	return project
+}
+
+func favoriteMigrationVersionID(version models.ModVersion) string {
+	if id := strings.TrimSpace(version.VersionID); id != "" {
+		return id
+	}
+	return strings.TrimSpace(version.ID)
 }
 
 func (s *Service) AddFavoriteListReference(parentListID, childListID string) database.FavoriteListRef {
