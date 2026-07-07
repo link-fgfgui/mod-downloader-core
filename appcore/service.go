@@ -59,6 +59,7 @@ type RuntimeOptions struct {
 	ModLoader        string
 	CacheDir         string
 	CachePath        string
+	DefaultCacheDir  string
 	NoConfigFile     bool
 }
 
@@ -938,6 +939,9 @@ func (s *Service) cachePath() (string, error) {
 	cacheDir := firstNonEmpty(s.options.Runtime.CacheDir, s.Config().Runtime.CacheDir)
 	if cacheDir != "" {
 		return filepath.Join(s.resolveRuntimePath(cacheDir), database.CacheFileName), nil
+	}
+	if cacheDir := s.resolveRuntimePath(s.options.Runtime.DefaultCacheDir); cacheDir != "" {
+		return filepath.Join(cacheDir, database.CacheFileName), nil
 	}
 	return database.DefaultCachePath()
 }
