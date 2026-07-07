@@ -1,6 +1,8 @@
 package database
 
 import (
+	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -365,6 +367,225 @@ func TestFavoriteModRequiresExistingList(t *testing.T) {
 	})
 	if err != nil || ok || mod.ID != "" {
 		t.Fatalf("upsert without list = %#v, %v, %v", mod, ok, err)
+	}
+}
+
+func TestSQLiteSchemaV2MigratesExistingFavorites(t *testing.T) {
+	tmp := t.TempDir()
+	cachePath := filepath.Join(tmp, databaseFileName)
+	userPath := UserDataPathForCachePath(cachePath)
+	db, err := sql.Open(sqliteDriverName, userPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{
+		`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)`,
+		`CREATE TABLE favorite_lists (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			sort_order INTEGER NOT NULL,
+			system INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE favorite_mods (
+			id TEXT PRIMARY KEY,
+			list_id TEXT NOT NULL REFERENCES favorite_lists(id) ON DELETE CASCADE,
+			platform TEXT NOT NULL,
+			mod_id TEXT NOT NULL,
+			version_id TEXT NOT NULL DEFAULT '',
+			minecraft_version TEXT NOT NULL DEFAULT '',
+			mod_loader TEXT NOT NULL DEFAULT '',
+			title TEXT NOT NULL DEFAULT '',
+			slug TEXT NOT NULL DEFAULT '',
+			icon_url TEXT NOT NULL DEFAULT '',
+			description TEXT NOT NULL DEFAULT '',
+			categories_json TEXT NOT NULL DEFAULT '[]',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			UNIQUE(list_id, platform, mod_id, minecraft_version, mod_loader)
+		)`,
+		`INSERT INTO schema_migrations(version, applied_at) VALUES (1, 100)`,
+		`INSERT INTO favorite_lists(id, name, created_at, updated_at, sort_order, system)
+		 VALUES ('legacy-list', 'Legacy', 10, 11, 1, 0)`,
+		`INSERT INTO favorite_mods(id, list_id, platform, mod_id, version_id, minecraft_version, mod_loader, title, categories_json, created_at, updated_at)
+		 VALUES ('legacy-mod', 'legacy-list', 'modrinth', 'sodium', 'v1', '1.21.1', 'fabric', 'Sodium', '["performance"]', 12, 13)`,
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := OpenAt(cachePath); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(Close)
+
+	lists := ListFavoriteLists()
+	if len(lists) != 1 || lists[0].ID != "legacy-list" || lists[0].GroupID != "" || lists[0].Pinned {
+		t.Fatalf("migrated lists = %#v", lists)
+	}
+	mods := ListFavoriteMods("legacy-list")
+	if len(mods) != 1 || mods[0].ID != "legacy-mod" || len(mods[0].Categories) != 1 {
+		t.Fatalf("migrated mods = %#v", mods)
+	}
+	var version int
+	if err := userDB.db.QueryRow(`SELECT version FROM schema_migrations WHERE version = 2`).Scan(&version); err != nil || version != 2 {
+		t.Fatalf("schema version 2 = %d, %v", version, err)
+	}
+	if _, ok, err := UpdateFavoriteListMetadata(FavoriteList{ID: "legacy-list", IconKind: "mdi", IconValue: "mdi-star", Pinned: true}); err != nil || !ok {
+		t.Fatalf("update migrated list = %v, %v", ok, err)
+	}
+	lists = ListFavoriteLists()
+	if len(lists) != 1 || !lists[0].Pinned || lists[0].IconValue != "mdi-star" {
+		t.Fatalf("updated migrated list = %#v", lists)
+	}
+}
+
+func TestFavoriteGroupsAndListMetadataPersist(t *testing.T) {
+	path := openTestDB(t)
+
+	first, err := CreateFavoriteGroup(" Utilities ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := CreateFavoriteGroup("Performance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Name != "Utilities" || second.SortOrder <= first.SortOrder {
+		t.Fatalf("groups = %#v, %#v", first, second)
+	}
+	if err := ReorderFavoriteGroups([]string{second.ID, first.ID}); err != nil {
+		t.Fatal(err)
+	}
+	renamed, ok, err := UpdateFavoriteGroupName(first.ID, "Utility Mods")
+	if err != nil || !ok || renamed.Name != "Utility Mods" {
+		t.Fatalf("rename group = %#v, %v, %v", renamed, ok, err)
+	}
+
+	listA, err := CreateFavoriteList("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listB, err := CreateFavoriteList("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, ok, err := UpdateFavoriteListMetadata(FavoriteList{
+		ID:        listB.ID,
+		GroupID:   first.ID,
+		IconKind:  "MDI",
+		IconValue: " mdi-star ",
+		IconURL:   " https://example.com/icon.png ",
+		Pinned:    true,
+	})
+	if err != nil || !ok {
+		t.Fatalf("update list metadata = %#v, %v, %v", updated, ok, err)
+	}
+	if updated.GroupID != first.ID || updated.IconKind != "mdi" || updated.IconValue != "mdi-star" || updated.IconURL != "https://example.com/icon.png" || !updated.Pinned {
+		t.Fatalf("normalized list metadata = %#v", updated)
+	}
+	if err := ReorderFavoriteLists([]string{listB.ID, listA.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	reopenTestDB(t, path)
+
+	groups := ListFavoriteGroups()
+	if len(groups) != 2 || groups[0].ID != second.ID || groups[1].ID != first.ID || groups[1].Name != "Utility Mods" {
+		t.Fatalf("groups after reopen = %#v", groups)
+	}
+	lists := ListFavoriteLists()
+	if len(lists) != 2 || lists[0].ID != listB.ID || !lists[0].Pinned || lists[0].GroupID != first.ID {
+		t.Fatalf("lists after reopen = %#v", lists)
+	}
+	if deleted, err := DeleteFavoriteGroup(first.ID); err != nil || !deleted {
+		t.Fatalf("delete group = %v, %v", deleted, err)
+	}
+	lists = ListFavoriteLists()
+	for _, list := range lists {
+		if list.ID == listB.ID && list.GroupID != "" {
+			t.Fatalf("group id not cleared after delete: %#v", list)
+		}
+	}
+}
+
+func TestFavoriteListReferencesAndResolvedContents(t *testing.T) {
+	openTestDB(t)
+
+	root, err := CreateFavoriteList("Root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := CreateFavoriteList("Child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grandchild, err := CreateFavoriteList("Grandchild")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := UpsertFavoriteMod(FavoriteMod{ListID: root.ID, Platform: "modrinth", ModID: "sodium", Title: "Direct Sodium"}); err != nil || !ok {
+		t.Fatalf("upsert root mod: %v, %v", ok, err)
+	}
+	if _, ok, err := UpsertFavoriteMod(FavoriteMod{ListID: child.ID, Platform: "modrinth", ModID: "sodium", Title: "Referenced Sodium"}); err != nil || !ok {
+		t.Fatalf("upsert duplicate child mod: %v, %v", ok, err)
+	}
+	if _, ok, err := UpsertFavoriteMod(FavoriteMod{ListID: child.ID, Platform: "modrinth", ModID: "lithium", Title: "Lithium"}); err != nil || !ok {
+		t.Fatalf("upsert child mod: %v, %v", ok, err)
+	}
+	if _, ok, err := UpsertFavoriteMod(FavoriteMod{ListID: grandchild.ID, Platform: "curseforge", ModID: "jei", Title: "JEI"}); err != nil || !ok {
+		t.Fatalf("upsert grandchild mod: %v, %v", ok, err)
+	}
+
+	if _, ok, err := CreateFavoriteListRef(root.ID, child.ID); err != nil || !ok {
+		t.Fatalf("create root child ref: %v, %v", ok, err)
+	}
+	if _, ok, err := CreateFavoriteListRef(child.ID, grandchild.ID); err != nil || !ok {
+		t.Fatalf("create child grandchild ref: %v, %v", ok, err)
+	}
+	if _, ok, err := CreateFavoriteListRef(root.ID, root.ID); !errors.Is(err, errFavoriteListRefCycle) || ok {
+		t.Fatalf("self ref = %v, %v", ok, err)
+	}
+	if _, ok, err := CreateFavoriteListRef(grandchild.ID, root.ID); !errors.Is(err, errFavoriteListRefCycle) || ok {
+		t.Fatalf("cycle ref = %v, %v", ok, err)
+	}
+
+	refs := ListFavoriteListRefs(root.ID)
+	if len(refs) != 1 || refs[0].ChildListID != child.ID {
+		t.Fatalf("root refs = %#v", refs)
+	}
+	contents := ListFavoriteContents(root.ID)
+	if contents.ListID != root.ID || len(contents.Mods) != 3 {
+		t.Fatalf("contents = %#v", contents)
+	}
+	if contents.Mods[0].ModID != "sodium" || contents.Mods[0].Title != "Direct Sodium" || contents.Mods[0].Referenced {
+		t.Fatalf("direct duplicate was not preferred: %#v", contents.Mods)
+	}
+	foundLithium := false
+	foundJEI := false
+	for _, mod := range contents.Mods {
+		if mod.ModID == "lithium" {
+			foundLithium = mod.Referenced && mod.SourceListID == child.ID && mod.SourceListName == "Child"
+		}
+		if mod.ModID == "jei" {
+			foundJEI = mod.Referenced && mod.SourceListID == grandchild.ID
+		}
+	}
+	if !foundLithium || !foundJEI {
+		t.Fatalf("referenced mods missing metadata: %#v", contents.Mods)
+	}
+	if deleted, err := DeleteFavoriteListRef(root.ID, child.ID); err != nil || !deleted {
+		t.Fatalf("delete ref = %v, %v", deleted, err)
+	}
+	contents = ListFavoriteContents(root.ID)
+	if len(contents.Mods) != 1 || contents.Mods[0].ModID != "sodium" {
+		t.Fatalf("contents after ref delete = %#v", contents)
 	}
 }
 
