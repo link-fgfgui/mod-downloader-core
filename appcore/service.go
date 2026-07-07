@@ -552,6 +552,23 @@ func (s *Service) RetryDownload(id string) bool {
 	return downloader.RetryDownload(s.ctx, id, s.downloadEvents())
 }
 
+func (s *Service) DismissOptionalDependencyReminder(id string) bool {
+	return downloader.DismissOptionalDependencyReminder(id, s.downloadEvents())
+}
+
+func (s *Service) ClearOptionalDependencyReminders() bool {
+	return downloader.ClearOptionalDependencyReminders(s.downloadEvents())
+}
+
+func (s *Service) InstallOptionalDependencies(id string) []appstructs.ModDownloadResult {
+	return downloader.InstallOptionalDependencies(s.ctx, id, s.Config().Keys.CurseforgeApiKey, s.downloadEvents())
+}
+
+func (s *Service) AnalyzeBatchIncompatibleConflicts(req appstructs.BatchDownloadRequest) appstructs.BatchIncompatibleAnalysis {
+	req = s.applyRuntimeBatchDownloadRequest(req)
+	return downloader.AnalyzeBatchIncompatibleConflicts(req)
+}
+
 func (s *Service) GetDownloadStates(req appstructs.DownloadStatesRequest) []appstructs.ModDownloadButtonState {
 	req = s.applyRuntimeDownloadStatesRequest(req)
 	return downloader.GetDownloadStates(req, func() {
@@ -962,6 +979,21 @@ func (s *Service) applyRuntimeDownloadRequest(req appstructs.ModDownloadRequest)
 }
 
 func (s *Service) applyRuntimeDownloadStatesRequest(req appstructs.DownloadStatesRequest) appstructs.DownloadStatesRequest {
+	if strings.TrimSpace(req.TargetDir) == "" {
+		req.TargetDir = s.resolveRuntimePath(s.options.Runtime.TargetModsDir)
+	} else {
+		req.TargetDir = s.resolveRuntimePath(req.TargetDir)
+	}
+	if strings.TrimSpace(req.MinecraftVersion) == "" {
+		req.MinecraftVersion = firstNonEmpty(s.options.Runtime.MinecraftVersion, s.Config().Runtime.MinecraftVersion)
+	}
+	if strings.TrimSpace(req.ModLoader) == "" {
+		req.ModLoader = firstNonEmpty(s.options.Runtime.ModLoader, s.Config().Runtime.ModLoader)
+	}
+	return req
+}
+
+func (s *Service) applyRuntimeBatchDownloadRequest(req appstructs.BatchDownloadRequest) appstructs.BatchDownloadRequest {
 	if strings.TrimSpace(req.TargetDir) == "" {
 		req.TargetDir = s.resolveRuntimePath(s.options.Runtime.TargetModsDir)
 	} else {

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/global"
@@ -12,6 +13,15 @@ import (
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 	mcstructs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
+
+func openModbridgeTestDB(t *testing.T) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "mods.gob.zst")
+	if err := database.OpenAt(path); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(database.Close)
+}
 
 func TestFindVersionByID(t *testing.T) {
 	versions := []models.ModVersion{
@@ -178,6 +188,126 @@ func TestLocalModPathsForModIDsIncludesMultiModJarOnPartialTopLevelMatch(t *test
 	}
 	if paths[0].Path != base.Path {
 		t.Fatalf("LocalModPathsForModIDs() path = %q, want %q", paths[0].Path, base.Path)
+	}
+}
+
+func TestIncompatibleConflictsCachedFindsInstalledDependency(t *testing.T) {
+	openModbridgeTestDB(t)
+	global.ClearLocalMods()
+	t.Cleanup(global.ClearLocalMods)
+
+	if err := database.SetPlatformVersionSnapshot("Modrinth", "main", []models.ModVersion{{
+		ID:           "main-version",
+		VersionID:    "main-version",
+		Platform:     "Modrinth",
+		ProjectID:    "main",
+		Name:         "Main",
+		DownloadURL:  "https://example.invalid/main.jar",
+		GameVersions: []string{"1.21.1"},
+		Loaders:      []string{"fabric"},
+		Dependencies: []models.ModDependency{{
+			DependencyProjectID: "bad",
+			DependencyType:      "incompatible",
+		}},
+	}}, time.Now().Unix(), []database.ModPlatformVersionScope{{MinecraftVersion: "1.21.1", ModLoader: "fabric"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetPlatformVersionSnapshot("Modrinth", "bad", []models.ModVersion{{
+		ID:           "bad-version",
+		VersionID:    "bad-version",
+		Platform:     "Modrinth",
+		ProjectID:    "bad",
+		Name:         "Bad",
+		DownloadURL:  "https://example.invalid/bad.jar",
+		GameVersions: []string{"1.21.1"},
+		Loaders:      []string{"fabric"},
+		ModIDs:       []string{"badmod"},
+	}}, time.Now().Unix(), []database.ModPlatformVersionScope{{MinecraftVersion: "1.21.1", ModLoader: "fabric"}}); err != nil {
+		t.Fatal(err)
+	}
+	global.UpsertLocalMod(mcstructs.ModInfo{
+		ID:       "badmod",
+		FileName: "bad",
+		Path:     "mods/bad.jar",
+		SHA1:     "bad-sha1",
+		Enabled:  true,
+	}, "instance", "1.21.1", "fabric")
+
+	conflicts := IncompatibleConflictsCached(appstructs.ModDownloadRequest{
+		ProjectID:        "modrinth:main",
+		Result:           models.ModProject{ID: "modrinth:main", Platform: "Modrinth", ProjectID: "main", Title: "Main"},
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+		TargetDir:        t.TempDir(),
+		InstanceID:       "instance",
+	})
+	if len(conflicts) != 1 {
+		t.Fatalf("conflicts = %#v, want 1", conflicts)
+	}
+	if conflicts[0].IncompatibleProjectKey != "modrinth:bad" || len(conflicts[0].Paths) != 1 || conflicts[0].Paths[0].Path != "mods/bad.jar" {
+		t.Fatalf("conflict = %#v", conflicts[0])
+	}
+}
+
+func TestAnalyzeBatchIncompatibleConflictsGroupsBySelectedMod(t *testing.T) {
+	openModbridgeTestDB(t)
+	global.ClearLocalMods()
+	t.Cleanup(global.ClearLocalMods)
+
+	scope := []database.ModPlatformVersionScope{{MinecraftVersion: "1.21.1", ModLoader: "fabric"}}
+	now := time.Now().Unix()
+	if err := database.SetPlatformVersionSnapshot("Modrinth", "main", []models.ModVersion{{
+		ID:        "main-version",
+		VersionID: "main-version",
+		Platform:  "Modrinth",
+		ProjectID: "main",
+		Dependencies: []models.ModDependency{{
+			DependencyProjectID: "bad",
+			DependencyType:      "incompatible",
+		}},
+		GameVersions: []string{"1.21.1"},
+		Loaders:      []string{"fabric"},
+	}}, now, scope); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetPlatformVersionSnapshot("Modrinth", "clean", []models.ModVersion{{
+		ID:           "clean-version",
+		VersionID:    "clean-version",
+		Platform:     "Modrinth",
+		ProjectID:    "clean",
+		GameVersions: []string{"1.21.1"},
+		Loaders:      []string{"fabric"},
+	}}, now, scope); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.SetPlatformVersionSnapshot("Modrinth", "bad", []models.ModVersion{{
+		ID:           "bad-version",
+		VersionID:    "bad-version",
+		Platform:     "Modrinth",
+		ProjectID:    "bad",
+		ModIDs:       []string{"badmod"},
+		GameVersions: []string{"1.21.1"},
+		Loaders:      []string{"fabric"},
+	}}, now, scope); err != nil {
+		t.Fatal(err)
+	}
+	global.UpsertLocalMod(mcstructs.ModInfo{ID: "badmod", FileName: "bad", Path: "mods/bad.jar", SHA1: "bad-sha1", Enabled: true}, "instance", "1.21.1", "fabric")
+
+	analysis := AnalyzeBatchIncompatibleConflicts(appstructs.BatchDownloadRequest{
+		Results: []models.ModProject{
+			{ID: "modrinth:main", Platform: "Modrinth", ProjectID: "main", Title: "Main"},
+			{ID: "modrinth:clean", Platform: "Modrinth", ProjectID: "clean", Title: "Clean"},
+		},
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+		TargetDir:        t.TempDir(),
+		InstanceID:       "instance",
+	})
+	if len(analysis.Conflicts) != 1 {
+		t.Fatalf("analysis = %#v, want one conflicted selected mod", analysis)
+	}
+	if analysis.Conflicts[0].Key != "modrinth:main" || len(analysis.Conflicts[0].Conflicts) != 1 {
+		t.Fatalf("conflict group = %#v", analysis.Conflicts[0])
 	}
 }
 

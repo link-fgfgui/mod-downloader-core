@@ -45,10 +45,12 @@ type ModDownloadResult struct {
 }
 
 type DownloadQueueState struct {
-	Active  bool                `json:"active"`
-	Pending int                 `json:"pending"`
-	Running int                 `json:"running"`
-	Items   []DownloadQueueItem `json:"items,omitempty"`
+	Active            bool                         `json:"active"`
+	Pending           int                          `json:"pending"`
+	Running           int                          `json:"running"`
+	MessageCount      int                          `json:"messageCount"`
+	Items             []DownloadQueueItem          `json:"items,omitempty"`
+	OptionalReminders []OptionalDependencyReminder `json:"optionalReminders,omitempty"`
 }
 
 type DownloadQueueItem struct {
@@ -69,6 +71,61 @@ type DownloadFailedEvent struct {
 	FileName  string `json:"fileName"`
 	VersionID string `json:"versionId"`
 	Reason    string `json:"reason"`
+}
+
+type OptionalDependencyReminder struct {
+	ID               string                        `json:"id"`
+	MainProjectKey   string                        `json:"mainProjectKey"`
+	MainTitle        string                        `json:"mainTitle"`
+	MainVersionID    string                        `json:"mainVersionId"`
+	MinecraftVersion string                        `json:"minecraftVersion"`
+	ModLoader        string                        `json:"modLoader"`
+	Dependencies     []OptionalDependencyCandidate `json:"dependencies,omitempty"`
+}
+
+type OptionalDependencyCandidate struct {
+	ProjectKey string `json:"projectKey"`
+	Platform   string `json:"platform"`
+	ProjectID  string `json:"projectId"`
+	Title      string `json:"title"`
+	VersionID  string `json:"versionId,omitempty"`
+	Status     string `json:"status"`
+	Disabled   bool   `json:"disabled"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+type IncompatibleLocalMod struct {
+	Path     string `json:"path"`
+	FileName string `json:"fileName"`
+	SHA1     string `json:"sha1"`
+}
+
+type IncompatibleConflict struct {
+	ProjectKey             string                 `json:"projectKey"`
+	ProjectTitle           string                 `json:"projectTitle"`
+	IncompatibleProjectKey string                 `json:"incompatibleProjectKey"`
+	IncompatibleTitle      string                 `json:"incompatibleTitle"`
+	IncompatibleVersionID  string                 `json:"incompatibleVersionId,omitempty"`
+	Paths                  []IncompatibleLocalMod `json:"paths,omitempty"`
+}
+
+type BatchDownloadRequest struct {
+	Results          []models.ModProject `json:"results"`
+	MinecraftVersion string              `json:"minecraftVersion"`
+	ModLoader        string              `json:"modLoader"`
+	TargetDir        string              `json:"targetDir,omitempty"`
+	InstanceID       string              `json:"instanceId,omitempty"`
+}
+
+type BatchIncompatibleConflict struct {
+	Key       string                 `json:"key"`
+	Title     string                 `json:"title"`
+	Result    models.ModProject      `json:"result"`
+	Conflicts []IncompatibleConflict `json:"conflicts,omitempty"`
+}
+
+type BatchIncompatibleAnalysis struct {
+	Conflicts []BatchIncompatibleConflict `json:"conflicts,omitempty"`
 }
 
 type DownloadStatesRequest struct {

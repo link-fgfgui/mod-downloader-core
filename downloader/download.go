@@ -28,25 +28,31 @@ type Events struct {
 }
 
 type downloadJob struct {
-	ID               string
-	ProjectID        string
-	Version          models.ModVersion
-	Result           models.ModProject
-	TargetDir        string
-	InstanceID       string
-	MinecraftVersion string
-	ModLoader        string
-	CurseForgeAPIKey string
-	AutoAttempt      int
-	visited          map[string]bool
-	dependenciesDone bool
-	cancel           context.CancelFunc
+	ID                string
+	ProjectID         string
+	Version           models.ModVersion
+	Result            models.ModProject
+	TargetDir         string
+	InstanceID        string
+	MinecraftVersion  string
+	ModLoader         string
+	CurseForgeAPIKey  string
+	AutoAttempt       int
+	IncompatiblePaths []global.LocalModFilePath
+	visited           map[string]bool
+	dependenciesDone  bool
+	cancel            context.CancelFunc
 }
 
 type retryableDownloadJob struct {
 	Job    downloadJob
 	Status string
 	Reason string
+}
+
+type optionalDependencyReminderState struct {
+	Snapshot appstructs.OptionalDependencyReminder
+	Requests []appstructs.ModDownloadRequest
 }
 
 const (
@@ -65,14 +71,16 @@ var (
 
 var downloadQueue = struct {
 	sync.Mutex
-	nextID           int64
-	pending          []downloadJob
-	retryable        []retryableDownloadJob
-	cancelRequested  map[string]struct{}
-	finalizedCancel  map[string]struct{}
-	restartRequested map[string]struct{}
-	running          bool
-	current          *downloadJob
+	nextID            int64
+	nextReminderID    int64
+	pending           []downloadJob
+	retryable         []retryableDownloadJob
+	optionalReminders []optionalDependencyReminderState
+	cancelRequested   map[string]struct{}
+	finalizedCancel   map[string]struct{}
+	restartRequested  map[string]struct{}
+	running           bool
+	current           *downloadJob
 }{}
 
 func QueueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, curseForgeAPIKey string, events ...Events) appstructs.ModDownloadResult {
@@ -233,6 +241,82 @@ func RetryDownload(ctx context.Context, id string, events ...Events) bool {
 	return true
 }
 
+func DismissOptionalDependencyReminder(id string, events ...Events) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	eventSink := firstEvents(events)
+	downloadQueue.Lock()
+	index := -1
+	for i, reminder := range downloadQueue.optionalReminders {
+		if reminder.Snapshot.ID == id {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		downloadQueue.Unlock()
+		return false
+	}
+	downloadQueue.optionalReminders = append(downloadQueue.optionalReminders[:index], downloadQueue.optionalReminders[index+1:]...)
+	downloadQueue.Unlock()
+	emitDownloadQueueState(eventSink)
+	return true
+}
+
+func ClearOptionalDependencyReminders(events ...Events) bool {
+	eventSink := firstEvents(events)
+	downloadQueue.Lock()
+	if len(downloadQueue.optionalReminders) == 0 {
+		downloadQueue.Unlock()
+		return false
+	}
+	downloadQueue.optionalReminders = nil
+	downloadQueue.Unlock()
+	emitDownloadQueueState(eventSink)
+	return true
+}
+
+func InstallOptionalDependencies(ctx context.Context, id string, curseForgeAPIKey string, events ...Events) []appstructs.ModDownloadResult {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil
+	}
+	eventSink := firstEvents(events)
+	downloadQueue.Lock()
+	index := -1
+	var requests []appstructs.ModDownloadRequest
+	for i, reminder := range downloadQueue.optionalReminders {
+		if reminder.Snapshot.ID != id {
+			continue
+		}
+		index = i
+		requests = append(requests, reminder.Requests...)
+		break
+	}
+	if index >= 0 {
+		downloadQueue.optionalReminders = append(downloadQueue.optionalReminders[:index], downloadQueue.optionalReminders[index+1:]...)
+	}
+	downloadQueue.Unlock()
+	if index < 0 {
+		return nil
+	}
+	emitDownloadQueueState(eventSink)
+
+	results := make([]appstructs.ModDownloadResult, 0, len(requests))
+	visited := make(map[string]bool)
+	for _, req := range requests {
+		result := queueModDownload(ctx, req, curseForgeAPIKey, visited, eventSink)
+		results = append(results, result)
+	}
+	return results
+}
+
+func AnalyzeBatchIncompatibleConflicts(req appstructs.BatchDownloadRequest) appstructs.BatchIncompatibleAnalysis {
+	return modbridge.AnalyzeBatchIncompatibleConflicts(req)
+}
+
 func GetDownloadStates(req appstructs.DownloadStatesRequest, onBackfillComplete func()) []appstructs.ModDownloadButtonState {
 	states := modbridge.DownloadStates(req, onBackfillComplete)
 	queued := queuedProjectKeys()
@@ -382,7 +466,7 @@ func downloadModJob(ctx context.Context, job downloadJob, events Events) error {
 		return err
 	}
 	if !job.dependenciesDone {
-		dependencies, preparedJob, err := prepareDownloadDependencies(ctx, job)
+		dependencies, preparedJob, err := prepareDownloadDependencies(ctx, job, events)
 		if err != nil {
 			return err
 		}
@@ -395,6 +479,7 @@ func downloadModJob(ctx context.Context, job downloadJob, events Events) error {
 		}
 		job = preparedJob
 	}
+	archiveIncompatibleModJars(job.IncompatiblePaths)
 	if tryHardlinkInstall(job) {
 		return nil
 	}
@@ -537,6 +622,13 @@ func archiveSupersededModJars(paths []global.LocalModFilePath) {
 	}
 }
 
+func archiveIncompatibleModJars(paths []global.LocalModFilePath) {
+	if len(paths) == 0 {
+		return
+	}
+	archiveSupersededModJars(paths)
+}
+
 func nextOldJarPath(path string) string {
 	base := path + ".old"
 	if _, err := os.Stat(base); os.IsNotExist(err) {
@@ -550,17 +642,25 @@ func nextOldJarPath(path string) string {
 	}
 }
 
-func prepareDownloadDependencies(ctx context.Context, job downloadJob) ([]downloadJob, downloadJob, error) {
+func prepareDownloadDependencies(ctx context.Context, job downloadJob, events Events) ([]downloadJob, downloadJob, error) {
 	if err := ctxErr(ctx); err != nil {
 		return nil, job, err
 	}
 	req := downloadRequestFromJob(job)
-	version := hydrateRequiredDependencies(req, job.Version)
+	version := hydrateDownloadDependencies(req, job.Version)
 	if err := ctxErr(ctx); err != nil {
 		return nil, job, err
 	}
 
 	job.Version = version
+	job.IncompatiblePaths = incompatiblePathsFromConflicts(modbridge.IncompatibleConflicts(req), version.SHA1)
+	if err := ctxErr(ctx); err != nil {
+		return nil, job, err
+	}
+	appendOptionalDependencyReminder(req, version, events)
+	if err := ctxErr(ctx); err != nil {
+		return nil, job, err
+	}
 	job.dependenciesDone = true
 	dependencies, err := missingRequiredDependencyJobs(ctx, req, version, job.CurseForgeAPIKey, job.visited)
 	if err != nil {
@@ -591,7 +691,7 @@ func missingRequiredDependencyJobs(ctx context.Context, req appstructs.ModDownlo
 			continue
 		}
 
-		depReq, ok := dependencyDownloadRequest(version.Platform, dep, req)
+		depReq, ok := modbridge.DependencyDownloadRequest(version.Platform, dep, req)
 		if !ok {
 			logging.Warn("required dependency cannot be queued", "platform", version.Platform, "projectID", dep.DependencyProjectID, "versionID", dep.DependencyVersionID, "type", dep.DependencyType)
 			continue
@@ -621,13 +721,130 @@ func missingRequiredDependencyJobs(ctx context.Context, req appstructs.ModDownlo
 	return dependencies, nil
 }
 
-func hydrateRequiredDependencies(req appstructs.ModDownloadRequest, version models.ModVersion) models.ModVersion {
-	if hasRequiredDependency(version.Dependencies) {
+func appendOptionalDependencyReminder(parent appstructs.ModDownloadRequest, version models.ModVersion, events Events) {
+	candidates := make([]appstructs.OptionalDependencyCandidate, 0)
+	requests := make([]appstructs.ModDownloadRequest, 0)
+	for _, dep := range version.Dependencies {
+		if !isOptionalDependency(dep) {
+			continue
+		}
+		depReq, ok := modbridge.DependencyDownloadRequest(version.Platform, dep, parent)
+		if !ok {
+			logging.Warn("optional dependency cannot be resolved", "platform", version.Platform, "projectID", dep.DependencyProjectID, "versionID", dep.DependencyVersionID, "type", dep.DependencyType)
+			continue
+		}
+		candidate := optionalDependencyCandidate(depReq)
+		candidates = append(candidates, candidate)
+		if !candidate.Disabled {
+			requests = append(requests, depReq)
+		}
+	}
+	if len(candidates) == 0 || len(requests) == 0 {
+		return
+	}
+
+	mainKey := providers.ProjectReferenceFromSearchResult(parent.Result)
+	if mainKey == "" {
+		mainKey = strings.TrimSpace(parent.ProjectID)
+	}
+	snapshot := appstructs.OptionalDependencyReminder{
+		MainProjectKey:   mainKey,
+		MainTitle:        displayProjectTitle(parent.Result, mainKey),
+		MainVersionID:    version.ID,
+		MinecraftVersion: parent.MinecraftVersion,
+		ModLoader:        parent.ModLoader,
+		Dependencies:     candidates,
+	}
+
+	downloadQueue.Lock()
+	for i, existing := range downloadQueue.optionalReminders {
+		if existing.Snapshot.MainProjectKey == snapshot.MainProjectKey && existing.Snapshot.MainVersionID == snapshot.MainVersionID {
+			snapshot.ID = existing.Snapshot.ID
+			downloadQueue.optionalReminders[i] = optionalDependencyReminderState{Snapshot: snapshot, Requests: requests}
+			downloadQueue.Unlock()
+			emitDownloadQueueState(events)
+			return
+		}
+	}
+	downloadQueue.nextReminderID++
+	snapshot.ID = fmt.Sprintf("optional-%d", downloadQueue.nextReminderID)
+	downloadQueue.optionalReminders = append(downloadQueue.optionalReminders, optionalDependencyReminderState{Snapshot: snapshot, Requests: requests})
+	downloadQueue.Unlock()
+	emitDownloadQueueState(events)
+}
+
+func optionalDependencyCandidate(req appstructs.ModDownloadRequest) appstructs.OptionalDependencyCandidate {
+	status := installStatusPrecise(req)
+	disabled := status == modbridge.BtnStatusInstalled
+	reason := ""
+	if _, ok := modbridge.ResolveVersion(req); !ok {
+		disabled = true
+		reason = "no matching version"
+	}
+	return appstructs.OptionalDependencyCandidate{
+		ProjectKey: req.ProjectID,
+		Platform:   req.Result.Platform,
+		ProjectID:  req.Result.ProjectID,
+		Title:      displayProjectTitle(req.Result, req.ProjectID),
+		VersionID:  req.VersionID,
+		Status:     status,
+		Disabled:   disabled,
+		Reason:     reason,
+	}
+}
+
+func incompatiblePathsFromConflicts(conflicts []appstructs.IncompatibleConflict, targetSHA1 string) []global.LocalModFilePath {
+	if len(conflicts) == 0 {
+		return nil
+	}
+	targetSHA1 = strings.ToLower(strings.TrimSpace(targetSHA1))
+	seen := make(map[string]struct{})
+	out := make([]global.LocalModFilePath, 0)
+	for _, conflict := range conflicts {
+		for _, local := range conflict.Paths {
+			if local.Path == "" {
+				continue
+			}
+			if targetSHA1 != "" && strings.EqualFold(strings.TrimSpace(local.SHA1), targetSHA1) {
+				continue
+			}
+			if _, dup := seen[local.Path]; dup {
+				continue
+			}
+			seen[local.Path] = struct{}{}
+			out = append(out, global.LocalModFilePath{
+				ID:       local.Path,
+				FileSHA1: local.SHA1,
+				Path:     local.Path,
+			})
+		}
+	}
+	return out
+}
+
+func displayProjectTitle(project models.ModProject, fallback string) string {
+	if title := strings.TrimSpace(project.Title); title != "" {
+		return title
+	}
+	if slug := strings.TrimSpace(project.Slug); slug != "" {
+		return slug
+	}
+	if projectID := strings.TrimSpace(project.ProjectID); projectID != "" {
+		return projectID
+	}
+	if fallback = strings.TrimSpace(fallback); fallback != "" {
+		return fallback
+	}
+	return "Mod"
+}
+
+func hydrateDownloadDependencies(req appstructs.ModDownloadRequest, version models.ModVersion) models.ModVersion {
+	if hasDownloadDependency(version.Dependencies) {
 		return version
 	}
 
 	refreshed := refreshMatchingProjectVersions(req.Result, req.MinecraftVersion, req.ModLoader)
-	if refreshedVersion, found := modbridge.FindVersionByID(refreshed, version.ID); found && hasRequiredDependency(refreshedVersion.Dependencies) {
+	if refreshedVersion, found := modbridge.FindVersionByID(refreshed, version.ID); found && hasDownloadDependency(refreshedVersion.Dependencies) {
 		return refreshedVersion
 	}
 	return version
@@ -640,9 +857,9 @@ func ctxErr(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func hasRequiredDependency(deps []models.ModDependency) bool {
+func hasDownloadDependency(deps []models.ModDependency) bool {
 	for _, dep := range deps {
-		if isRequiredDependency(dep) {
+		if isRequiredDependency(dep) || isOptionalDependency(dep) || isIncompatibleDependency(dep) {
 			return true
 		}
 	}
@@ -650,29 +867,15 @@ func hasRequiredDependency(deps []models.ModDependency) bool {
 }
 
 func isRequiredDependency(dep models.ModDependency) bool {
-	return strings.EqualFold(strings.TrimSpace(dep.DependencyType), "required")
+	return modbridge.IsDependencyType(dep, "required")
 }
 
-func dependencyDownloadRequest(platform string, dep models.ModDependency, parent appstructs.ModDownloadRequest) (appstructs.ModDownloadRequest, bool) {
-	projectID := strings.TrimSpace(dep.DependencyProjectID)
-	platform = strings.ToLower(strings.TrimSpace(platform))
-	if projectID == "" || (platform != "curseforge" && platform != "modrinth") {
-		return appstructs.ModDownloadRequest{}, false
-	}
+func isOptionalDependency(dep models.ModDependency) bool {
+	return modbridge.IsDependencyType(dep, "optional")
+}
 
-	ref := platform + ":" + projectID
-	return appstructs.ModDownloadRequest{
-		ProjectID: ref,
-		Result: models.ModProject{
-			ID:       ref,
-			Platform: platform,
-		},
-		MinecraftVersion: parent.MinecraftVersion,
-		ModLoader:        parent.ModLoader,
-		VersionID:        strings.TrimSpace(dep.DependencyVersionID),
-		TargetDir:        parent.TargetDir,
-		InstanceID:       parent.InstanceID,
-	}, true
+func isIncompatibleDependency(dep models.ModDependency) bool {
+	return modbridge.IsDependencyType(dep, "incompatible")
 }
 
 func downloadModToTarget(ctx context.Context, job downloadJob, existing []global.LocalModFilePath) error {
@@ -886,11 +1089,17 @@ func currentDownloadQueueState() appstructs.DownloadQueueState {
 		queueItem.Reason = item.Reason
 		items = append(items, queueItem)
 	}
+	reminders := make([]appstructs.OptionalDependencyReminder, 0, len(downloadQueue.optionalReminders))
+	for _, reminder := range downloadQueue.optionalReminders {
+		reminders = append(reminders, reminder.Snapshot)
+	}
 	return appstructs.DownloadQueueState{
-		Active:  running > 0 || len(downloadQueue.pending) > 0 || len(downloadQueue.retryable) > 0,
-		Pending: len(downloadQueue.pending),
-		Running: running,
-		Items:   items,
+		Active:            running > 0 || len(downloadQueue.pending) > 0 || len(downloadQueue.retryable) > 0,
+		Pending:           len(downloadQueue.pending),
+		Running:           running,
+		MessageCount:      len(reminders),
+		Items:             items,
+		OptionalReminders: reminders,
 	}
 }
 

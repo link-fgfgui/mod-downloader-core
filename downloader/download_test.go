@@ -23,8 +23,10 @@ func resetDownloadQueueForTest(t *testing.T) {
 	t.Helper()
 	downloadQueue.Lock()
 	downloadQueue.nextID = 0
+	downloadQueue.nextReminderID = 0
 	downloadQueue.pending = nil
 	downloadQueue.retryable = nil
+	downloadQueue.optionalReminders = nil
 	downloadQueue.cancelRequested = nil
 	downloadQueue.finalizedCancel = nil
 	downloadQueue.restartRequested = nil
@@ -137,7 +139,7 @@ func TestPathInLocalModPathsMatchesRelativePaths(t *testing.T) {
 
 func TestDependencyDownloadRequestCarriesDependencyVersionID(t *testing.T) {
 	resetDownloadQueueForTest(t)
-	req, ok := dependencyDownloadRequest("Modrinth", models.ModDependency{
+	req, ok := modbridge.DependencyDownloadRequest("Modrinth", models.ModDependency{
 		DependencyProjectID: "fabric-api",
 		DependencyVersionID: "version-123",
 		DependencyType:      "required",
@@ -148,7 +150,7 @@ func TestDependencyDownloadRequestCarriesDependencyVersionID(t *testing.T) {
 		InstanceID:       "cli:/tmp/mods",
 	})
 	if !ok {
-		t.Fatal("dependencyDownloadRequest() ok = false")
+		t.Fatal("DependencyDownloadRequest() ok = false")
 	}
 	if req.VersionID != "version-123" {
 		t.Fatalf("VersionID = %q, want version-123", req.VersionID)
@@ -537,5 +539,70 @@ func TestDoDownloadWithStallTimeoutReturnsPromptlyWhenContextCanceled(t *testing
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("download wait did not return promptly after context cancellation")
+	}
+}
+
+func TestOptionalDependencyReminderStateDismissAndClear(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	downloadQueue.Lock()
+	downloadQueue.nextReminderID = 1
+	downloadQueue.optionalReminders = []optionalDependencyReminderState{{
+		Snapshot: appstructs.OptionalDependencyReminder{
+			ID:             "optional-1",
+			MainProjectKey: "modrinth:main",
+			MainTitle:      "Main",
+			Dependencies: []appstructs.OptionalDependencyCandidate{{
+				ProjectKey: "modrinth:optional",
+				Title:      "Optional",
+			}},
+		},
+	}}
+	downloadQueue.Unlock()
+
+	state := GetDownloadQueueState()
+	if state.Active || state.MessageCount != 1 || len(state.OptionalReminders) != 1 {
+		t.Fatalf("state = %#v", state)
+	}
+	if !DismissOptionalDependencyReminder("optional-1") {
+		t.Fatal("DismissOptionalDependencyReminder() = false, want true")
+	}
+	state = GetDownloadQueueState()
+	if state.MessageCount != 0 || len(state.OptionalReminders) != 0 {
+		t.Fatalf("state after dismiss = %#v", state)
+	}
+
+	downloadQueue.Lock()
+	downloadQueue.optionalReminders = []optionalDependencyReminderState{{Snapshot: appstructs.OptionalDependencyReminder{ID: "optional-2"}}}
+	downloadQueue.Unlock()
+	if !ClearOptionalDependencyReminders() {
+		t.Fatal("ClearOptionalDependencyReminders() = false, want true")
+	}
+	if state = GetDownloadQueueState(); state.MessageCount != 0 {
+		t.Fatalf("state after clear = %#v", state)
+	}
+}
+
+func TestInstallOptionalDependenciesConsumesReminder(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	downloadQueue.Lock()
+	downloadQueue.optionalReminders = []optionalDependencyReminderState{{
+		Snapshot: appstructs.OptionalDependencyReminder{ID: "optional-1"},
+		Requests: []appstructs.ModDownloadRequest{{
+			ProjectID:        "",
+			MinecraftVersion: "1.21.1",
+			ModLoader:        "fabric",
+			TargetDir:        t.TempDir(),
+			InstanceID:       "cli:test",
+		}},
+	}}
+	downloadQueue.Unlock()
+
+	results := InstallOptionalDependencies(nil, "optional-1", "")
+	if len(results) != 1 || !results[0].Skipped {
+		t.Fatalf("results = %#v, want one skipped result", results)
+	}
+	state := GetDownloadQueueState()
+	if state.MessageCount != 0 || len(state.OptionalReminders) != 0 {
+		t.Fatalf("state after install = %#v", state)
 	}
 }
