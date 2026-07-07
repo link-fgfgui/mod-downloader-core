@@ -109,6 +109,23 @@ type SaveAnimationSettingsRequest struct {
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
 }
 
+type FavoriteBulkAddRequest struct {
+	TargetListIDs []string               `json:"targetListIds"`
+	Mods          []database.FavoriteMod `json:"mods"`
+}
+
+type FavoriteListCopyRequest struct {
+	SourceListID string `json:"sourceListId"`
+	TargetListID string `json:"targetListId"`
+}
+
+type FavoriteBulkOperationResult struct {
+	Added   int      `json:"added"`
+	Updated int      `json:"updated"`
+	Skipped int      `json:"skipped"`
+	Errors  []string `json:"errors,omitempty"`
+}
+
 type InstallWaitResult struct {
 	Result appstructs.ModDownloadResult     `json:"result"`
 	State  appstructs.DownloadQueueState    `json:"state"`
@@ -327,6 +344,10 @@ func (s *Service) ListFavoriteMods(listID string) []database.FavoriteMod {
 	return database.ListFavoriteMods(listID)
 }
 
+func (s *Service) ListFavoriteContents(listID string) database.FavoriteListContents {
+	return database.ListFavoriteContents(listID)
+}
+
 func (s *Service) AddFavoriteMod(mod database.FavoriteMod) database.FavoriteMod {
 	saved, ok, err := database.UpsertFavoriteMod(mod)
 	if err != nil {
@@ -339,6 +360,96 @@ func (s *Service) AddFavoriteMod(mod database.FavoriteMod) database.FavoriteMod 
 	return saved
 }
 
+func (s *Service) AddFavoriteModsToLists(req FavoriteBulkAddRequest) FavoriteBulkOperationResult {
+	targetListIDs := uniqueNonEmpty(req.TargetListIDs)
+	if len(targetListIDs) == 0 || len(req.Mods) == 0 {
+		return FavoriteBulkOperationResult{Skipped: len(req.Mods)}
+	}
+
+	lists := favoriteListIDSet()
+	result := FavoriteBulkOperationResult{}
+	for _, targetListID := range targetListIDs {
+		if _, ok := lists[targetListID]; !ok {
+			result.Skipped += len(req.Mods)
+			result.Errors = append(result.Errors, "missing target list: "+targetListID)
+			continue
+		}
+
+		existing := favoriteModKeySet(database.ListFavoriteMods(targetListID))
+		for _, mod := range req.Mods {
+			copied := favoriteModForTargetList(mod, targetListID)
+			if copied.Platform == "" || copied.ModID == "" {
+				result.Skipped++
+				continue
+			}
+			key := favoriteModIdentityKey(copied)
+			_, wasExisting := existing[key]
+			if _, ok, err := database.UpsertFavoriteMod(copied); err != nil {
+				logging.Error("bulk add favorite mod failed", "targetListID", targetListID, "platform", copied.Platform, "modID", copied.ModID, "error", err)
+				result.Skipped++
+				result.Errors = append(result.Errors, err.Error())
+			} else if !ok {
+				result.Skipped++
+			} else if wasExisting {
+				result.Updated++
+			} else {
+				result.Added++
+				existing[key] = struct{}{}
+			}
+		}
+	}
+	return result
+}
+
+func (s *Service) CopyFavoriteListToList(req FavoriteListCopyRequest) FavoriteBulkOperationResult {
+	sourceListID := strings.TrimSpace(req.SourceListID)
+	targetListID := strings.TrimSpace(req.TargetListID)
+	if sourceListID == "" || targetListID == "" {
+		return FavoriteBulkOperationResult{}
+	}
+	if sourceListID == targetListID {
+		contents := database.ListFavoriteContents(sourceListID)
+		return FavoriteBulkOperationResult{
+			Skipped: len(contents.Mods),
+			Errors:  []string{"source and target lists are the same"},
+		}
+	}
+	contents := database.ListFavoriteContents(sourceListID)
+	mods := make([]database.FavoriteMod, 0, len(contents.Mods))
+	for _, entry := range contents.Mods {
+		mods = append(mods, entry.FavoriteMod)
+	}
+	return s.AddFavoriteModsToLists(FavoriteBulkAddRequest{
+		TargetListIDs: []string{targetListID},
+		Mods:          mods,
+	})
+}
+
+func (s *Service) AddFavoriteListReference(parentListID, childListID string) database.FavoriteListRef {
+	ref, ok, err := database.CreateFavoriteListRef(parentListID, childListID)
+	if err != nil {
+		logging.Error("add favorite list reference failed", "parentListID", parentListID, "childListID", childListID, "error", err)
+		return database.FavoriteListRef{}
+	}
+	if !ok {
+		return database.FavoriteListRef{}
+	}
+	return ref
+}
+
+func (s *Service) RemoveFavoriteListReference(parentListID, childListID string) bool {
+	deleted, err := database.DeleteFavoriteListRef(parentListID, childListID)
+	if err != nil {
+		logging.Error("remove favorite list reference failed", "parentListID", parentListID, "childListID", childListID, "error", err)
+		return false
+	}
+	return deleted
+}
+
+func (s *Service) ListFavoriteListRefs(parentListID string) []database.FavoriteListRef {
+	return database.ListFavoriteListRefs(parentListID)
+}
+
 func (s *Service) RemoveFavoriteMod(listID, platform, modID, mcVersion, modLoader string) bool {
 	deleted, err := database.DeleteFavoriteMod(listID, platform, modID, mcVersion, modLoader)
 	if err != nil {
@@ -346,6 +457,63 @@ func (s *Service) RemoveFavoriteMod(listID, platform, modID, mcVersion, modLoade
 		return false
 	}
 	return deleted
+}
+
+func uniqueNonEmpty(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
+func favoriteListIDSet() map[string]struct{} {
+	lists := database.ListFavoriteLists()
+	out := make(map[string]struct{}, len(lists))
+	for _, list := range lists {
+		if id := strings.TrimSpace(list.ID); id != "" {
+			out[id] = struct{}{}
+		}
+	}
+	return out
+}
+
+func favoriteModKeySet(mods []database.FavoriteMod) map[string]struct{} {
+	out := make(map[string]struct{}, len(mods))
+	for _, mod := range mods {
+		if key := favoriteModIdentityKey(mod); key != "" {
+			out[key] = struct{}{}
+		}
+	}
+	return out
+}
+
+func favoriteModForTargetList(mod database.FavoriteMod, targetListID string) database.FavoriteMod {
+	mod.ID = ""
+	mod.ListID = strings.TrimSpace(targetListID)
+	mod.CreatedAt = 0
+	mod.UpdatedAt = 0
+	return mod
+}
+
+func favoriteModIdentityKey(mod database.FavoriteMod) string {
+	platform := strings.ToLower(strings.TrimSpace(mod.Platform))
+	modID := strings.ToLower(strings.TrimSpace(mod.ModID))
+	mcVersion := strings.TrimSpace(mod.MinecraftVersion)
+	modLoader := strings.ToLower(strings.TrimSpace(mod.ModLoader))
+	if platform == "" || modID == "" {
+		return ""
+	}
+	return platform + "|" + modID + "|" + mcVersion + "|" + modLoader
 }
 
 func (s *Service) GetMinecraftReleaseVersions() []string {

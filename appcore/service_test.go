@@ -124,6 +124,114 @@ func TestFavoriteServiceWorkflow(t *testing.T) {
 	}
 }
 
+func TestFavoriteBulkAddCopiesSelectedMods(t *testing.T) {
+	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(database.Close)
+
+	svc := New(Options{})
+	source := svc.CreateFavoriteList("Source")
+	target := svc.CreateFavoriteList("Target")
+	mod := svc.AddFavoriteMod(database.FavoriteMod{
+		ListID:           source.ID,
+		Platform:         "Modrinth",
+		ModID:            "Sodium",
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "Fabric",
+		Title:            "Sodium",
+	})
+	if mod.ID == "" {
+		t.Fatalf("added source mod = %#v", mod)
+	}
+
+	result := svc.AddFavoriteModsToLists(FavoriteBulkAddRequest{
+		TargetListIDs: []string{target.ID, "missing", target.ID},
+		Mods:          []database.FavoriteMod{mod},
+	})
+	if result.Added != 1 || result.Updated != 0 || result.Skipped != 1 || len(result.Errors) != 1 {
+		t.Fatalf("bulk add result = %#v", result)
+	}
+	targetMods := svc.ListFavoriteMods(target.ID)
+	if len(targetMods) != 1 || targetMods[0].ID == mod.ID || targetMods[0].Title != "Sodium" {
+		t.Fatalf("target mods = %#v, source = %#v", targetMods, mod)
+	}
+
+	mod.Title = "Sodium Updated"
+	result = svc.AddFavoriteModsToLists(FavoriteBulkAddRequest{
+		TargetListIDs: []string{target.ID},
+		Mods:          []database.FavoriteMod{mod},
+	})
+	if result.Added != 0 || result.Updated != 1 || result.Skipped != 0 {
+		t.Fatalf("bulk update result = %#v", result)
+	}
+	targetMods = svc.ListFavoriteMods(target.ID)
+	if len(targetMods) != 1 || targetMods[0].Title != "Sodium Updated" {
+		t.Fatalf("target mods after update = %#v", targetMods)
+	}
+}
+
+func TestFavoriteListCopyUsesResolvedReferences(t *testing.T) {
+	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(database.Close)
+
+	svc := New(Options{})
+	source := svc.CreateFavoriteList("Source")
+	child := svc.CreateFavoriteList("Child")
+	target := svc.CreateFavoriteList("Target")
+	svc.AddFavoriteMod(database.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "sodium", Title: "Sodium"})
+	svc.AddFavoriteMod(database.FavoriteMod{ListID: child.ID, Platform: "curseforge", ModID: "jei", Title: "JEI"})
+	ref := svc.AddFavoriteListReference(source.ID, child.ID)
+	if ref.ID == "" {
+		t.Fatal("AddFavoriteListReference returned empty ref")
+	}
+
+	result := svc.CopyFavoriteListToList(FavoriteListCopyRequest{SourceListID: source.ID, TargetListID: target.ID})
+	if result.Added != 2 || result.Updated != 0 || result.Skipped != 0 {
+		t.Fatalf("copy result = %#v", result)
+	}
+	targetMods := svc.ListFavoriteMods(target.ID)
+	if len(targetMods) != 2 {
+		t.Fatalf("target mods = %#v", targetMods)
+	}
+
+	self := svc.CopyFavoriteListToList(FavoriteListCopyRequest{SourceListID: source.ID, TargetListID: source.ID})
+	if self.Skipped != 2 || len(self.Errors) != 1 {
+		t.Fatalf("self copy result = %#v", self)
+	}
+}
+
+func TestFavoriteListReferenceServiceMethods(t *testing.T) {
+	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(database.Close)
+
+	svc := New(Options{})
+	parent := svc.CreateFavoriteList("Parent")
+	child := svc.CreateFavoriteList("Child")
+
+	ref := svc.AddFavoriteListReference(parent.ID, child.ID)
+	if ref.ID == "" || ref.ParentListID != parent.ID || ref.ChildListID != child.ID {
+		t.Fatalf("ref = %#v", ref)
+	}
+	refs := svc.ListFavoriteListRefs(parent.ID)
+	if len(refs) != 1 || refs[0].ID != ref.ID {
+		t.Fatalf("refs = %#v", refs)
+	}
+	if cycle := svc.AddFavoriteListReference(child.ID, parent.ID); cycle.ID != "" {
+		t.Fatalf("cycle ref = %#v", cycle)
+	}
+	if !svc.RemoveFavoriteListReference(parent.ID, child.ID) {
+		t.Fatal("RemoveFavoriteListReference returned false")
+	}
+	if refs := svc.ListFavoriteListRefs(parent.ID); len(refs) != 0 {
+		t.Fatalf("refs after remove = %#v", refs)
+	}
+}
+
 func TestSaveCacheDirPreferencePersistsAndReopensDatabase(t *testing.T) {
 	oldwd, err := os.Getwd()
 	if err != nil {
