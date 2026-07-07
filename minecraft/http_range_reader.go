@@ -1,6 +1,7 @@
 package minecraft
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,26 +11,44 @@ import (
 )
 
 type httpRangeReaderAt struct {
-	client *http.Client
-	url    string
-	size   int64
+	client   *http.Client
+	url      string
+	size     int64
+	deadline time.Time
 }
 
 func NewHTTPRangeReaderAt(url string) (*httpRangeReaderAt, error) {
+	return newHTTPRangeReaderAt(url, 0)
+}
+
+func NewHTTPRangeReaderAtWithTimeout(url string, timeout time.Duration) (*httpRangeReaderAt, error) {
+	return newHTTPRangeReaderAt(url, timeout)
+}
+
+func newHTTPRangeReaderAt(url string, timeout time.Duration) (*httpRangeReaderAt, error) {
 	url = strings.TrimSpace(url)
 	if url == "" {
 		return nil, fmt.Errorf("empty url")
 	}
 
-	client := &http.Client{Timeout: 20 * time.Second}
-	resolvedURL, err := resolveHTTPDownloadURL(client, url)
+	clientTimeout := 20 * time.Second
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+		if timeout < clientTimeout {
+			clientTimeout = timeout
+		}
+	}
+
+	client := &http.Client{Timeout: clientTimeout}
+	resolvedURL, err := resolveHTTPDownloadURL(client, url, deadline)
 	if err != nil {
 		resolvedURL = url
 	}
 
-	size, err := probeHTTPRangeSize(client, resolvedURL)
+	size, err := probeHTTPRangeSize(client, resolvedURL, deadline)
 	if err != nil && resolvedURL != url {
-		size, err = probeHTTPRangeSize(client, url)
+		size, err = probeHTTPRangeSize(client, url, deadline)
 		resolvedURL = url
 	}
 	if err != nil {
@@ -37,17 +56,19 @@ func NewHTTPRangeReaderAt(url string) (*httpRangeReaderAt, error) {
 	}
 
 	return &httpRangeReaderAt{
-		client: client,
-		url:    resolvedURL,
-		size:   size,
+		client:   client,
+		url:      resolvedURL,
+		size:     size,
+		deadline: deadline,
 	}, nil
 }
 
-func resolveHTTPDownloadURL(client *http.Client, url string) (string, error) {
-	req, err := http.NewRequest(http.MethodHead, url, nil)
+func resolveHTTPDownloadURL(client *http.Client, url string, deadline time.Time) (string, error) {
+	req, cancel, err := newDeadlineRequest(http.MethodHead, url, deadline)
 	if err != nil {
 		return "", err
 	}
+	defer cancel()
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -61,11 +82,12 @@ func resolveHTTPDownloadURL(client *http.Client, url string) (string, error) {
 	return resp.Request.URL.String(), nil
 }
 
-func probeHTTPRangeSize(client *http.Client, url string) (int64, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func probeHTTPRangeSize(client *http.Client, url string, deadline time.Time) (int64, error) {
+	req, cancel, err := newDeadlineRequest(http.MethodGet, url, deadline)
 	if err != nil {
 		return 0, err
 	}
+	defer cancel()
 	req.Header.Set("Range", "bytes=0-0")
 
 	resp, err := client.Do(req)
@@ -102,11 +124,31 @@ func parseContentRangeSize(contentRange string) (int64, error) {
 	return strconv.ParseInt(sizeText, 10, 64)
 }
 
+func newDeadlineRequest(method string, url string, deadline time.Time) (*http.Request, context.CancelFunc, error) {
+	ctx := context.Background()
+	cancel := func() {}
+	if !deadline.IsZero() {
+		if time.Now().After(deadline) {
+			return nil, cancel, context.DeadlineExceeded
+		}
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		cancel()
+		return nil, func() {}, err
+	}
+	return req, cancel, nil
+}
+
 func (r *httpRangeReaderAt) Size() int64 {
 	return r.size
 }
 
 func (r *httpRangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if !r.deadline.IsZero() && time.Now().After(r.deadline) {
+		return 0, context.DeadlineExceeded
+	}
 	if off < 0 {
 		return 0, fmt.Errorf("negative offset")
 	}
@@ -124,10 +166,11 @@ func (r *httpRangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
 		want = int(end-off) + 1
 	}
 
-	req, err := http.NewRequest(http.MethodGet, r.url, nil)
+	req, cancel, err := newDeadlineRequest(http.MethodGet, r.url, r.deadline)
 	if err != nil {
 		return 0, err
 	}
+	defer cancel()
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, end))
 
 	resp, err := r.client.Do(req)

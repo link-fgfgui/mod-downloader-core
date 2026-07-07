@@ -1,11 +1,14 @@
 package minecraft
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestHTTPRangeReaderResolvesRedirectBeforeRangeProbe(t *testing.T) {
@@ -47,6 +50,53 @@ func TestHTTPRangeReaderResolvesRedirectBeforeRangeProbe(t *testing.T) {
 	}
 	if reader.Size() != int64(len(data)) {
 		t.Fatalf("reader size = %d, want %d", reader.Size(), len(data))
+	}
+}
+
+func TestHTTPRangeReaderConstructorHonorsTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Range", "bytes 0-0/10")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("0"))
+	}))
+	defer server.Close()
+
+	_, err := NewHTTPRangeReaderAtWithTimeout(server.URL+"/slow.jar", 30*time.Millisecond)
+	if err == nil {
+		t.Fatal("NewHTTPRangeReaderAtWithTimeout() error = nil, want timeout")
+	}
+}
+
+func TestHTTPRangeReaderReadAtHonorsTimeout(t *testing.T) {
+	data := []byte("0123456789")
+	probed := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		if r.Method == http.MethodHead {
+			return
+		}
+		if !probed {
+			probed = true
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(data)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[:1])
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+
+	reader, err := NewHTTPRangeReaderAtWithTimeout(server.URL+"/slow-read.jar", 80*time.Millisecond)
+	if err != nil {
+		t.Fatalf("NewHTTPRangeReaderAtWithTimeout() error = %v", err)
+	}
+	time.Sleep(90 * time.Millisecond)
+	_, err = reader.ReadAt(make([]byte, 1), 0)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ReadAt() error = %v, want deadline exceeded", err)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/global"
@@ -554,7 +555,7 @@ func ApplyProjectMetadataToModInfos(mods []mcstructs.ModInfo, project models.Mod
 
 // parseRemoteModJar downloads a JAR via HTTP range requests and parses its mod metadata.
 func parseRemoteModJar(downloadURL string, modLoader string) ([]mcstructs.ModInfo, error) {
-	reader, err := minecraft.NewHTTPRangeReaderAt(downloadURL)
+	reader, err := minecraft.NewHTTPRangeReaderAtWithTimeout(downloadURL, 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
