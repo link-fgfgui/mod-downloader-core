@@ -63,6 +63,7 @@ var downloadQueue = struct {
 	pending          []downloadJob
 	retryable        []retryableDownloadJob
 	cancelRequested  map[string]struct{}
+	finalizedCancel  map[string]struct{}
 	restartRequested map[string]struct{}
 	running          bool
 	current          *downloadJob
@@ -148,11 +149,16 @@ func CancelDownload(ctx context.Context, id string, events ...Events) bool {
 
 	var cancel context.CancelFunc
 	if downloadQueue.current != nil && downloadQueue.current.ID == id {
-		cancel = downloadQueue.current.cancel
-		if downloadQueue.cancelRequested == nil {
-			downloadQueue.cancelRequested = make(map[string]struct{})
+		job := *downloadQueue.current
+		cancel = job.cancel
+		if cancel != nil {
+			appendRetryableDownloadLocked(job, "canceled", "canceled")
+			downloadQueue.current = nil
+			if downloadQueue.finalizedCancel == nil {
+				downloadQueue.finalizedCancel = make(map[string]struct{})
+			}
+			downloadQueue.finalizedCancel[id] = struct{}{}
 		}
-		downloadQueue.cancelRequested[id] = struct{}{}
 	}
 	downloadQueue.Unlock()
 
@@ -301,7 +307,13 @@ func runDownloadQueue(ctx context.Context, events Events) {
 		downloadQueue.Unlock()
 		emitDownloadQueueState(events)
 
-		if err := downloadModJob(jobCtx, job); err != nil {
+		err := downloadModJob(jobCtx, job)
+		if consumeFinalizedDownloadCancel(job.ID) {
+			cancel()
+			emitDownloadQueueState(events)
+			continue
+		}
+		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				logging.Info("download mod canceled", "fileName", job.Version.FileName, "versionID", job.Version.ID, "targetDir", job.TargetDir)
 				if consumeDownloadRestartRequest(job.ID) {
@@ -821,6 +833,19 @@ func consumeDownloadCancelRequest(id string) bool {
 		return false
 	}
 	delete(downloadQueue.cancelRequested, id)
+	return true
+}
+
+func consumeFinalizedDownloadCancel(id string) bool {
+	downloadQueue.Lock()
+	defer downloadQueue.Unlock()
+	if downloadQueue.finalizedCancel == nil {
+		return false
+	}
+	if _, ok := downloadQueue.finalizedCancel[id]; !ok {
+		return false
+	}
+	delete(downloadQueue.finalizedCancel, id)
 	return true
 }
 

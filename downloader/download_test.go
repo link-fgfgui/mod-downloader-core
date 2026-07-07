@@ -1,9 +1,15 @@
 package downloader
 
 import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/cavaliergopher/grab/v3"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/modbridge"
 	"github.com/link-fgfgui/mod-downloader-core/models"
@@ -18,6 +24,7 @@ func resetDownloadQueueForTest(t *testing.T) {
 	downloadQueue.pending = nil
 	downloadQueue.retryable = nil
 	downloadQueue.cancelRequested = nil
+	downloadQueue.finalizedCancel = nil
 	downloadQueue.restartRequested = nil
 	downloadQueue.running = false
 	downloadQueue.current = nil
@@ -243,6 +250,50 @@ func TestRunningDownloadIsRetryableAndMarksRestartRequest(t *testing.T) {
 	}
 }
 
+func TestCancelRunningDownloadMovesItemToCanceledImmediately(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	canceled := false
+	downloadQueue.Lock()
+	downloadQueue.nextID = 1
+	downloadQueue.running = true
+	downloadQueue.current = &downloadJob{
+		ID: "download-1",
+		Version: models.ModVersion{
+			ID:       "version-1",
+			Platform: "modrinth",
+			FileName: "sodium.jar",
+		},
+		Result: models.ModProject{
+			Title: "Sodium",
+		},
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+		cancel: func() {
+			canceled = true
+		},
+	}
+	downloadQueue.Unlock()
+
+	if !CancelDownload(nil, "download-1") {
+		t.Fatal("CancelDownload() = false, want true")
+	}
+	if !canceled {
+		t.Fatal("running cancel did not cancel active attempt")
+	}
+
+	state := GetDownloadQueueState()
+	if state.Running != 0 || state.Pending != 0 || len(state.Items) != 1 {
+		t.Fatalf("state = %#v", state)
+	}
+	item := state.Items[0]
+	if item.ID != "download-1" || item.Status != "canceled" || !item.Retryable || item.Cancelable {
+		t.Fatalf("item = %#v", item)
+	}
+	if !consumeFinalizedDownloadCancel("download-1") {
+		t.Fatal("finalized cancel marker was not recorded")
+	}
+}
+
 func TestRetryStalledDownloadRequeuesUntilLimit(t *testing.T) {
 	resetDownloadQueueForTest(t)
 	downloadQueue.Lock()
@@ -282,5 +333,46 @@ func TestRetryStalledDownloadRequeuesUntilLimit(t *testing.T) {
 	}
 	if retryStalledDownload(nil, downloadJob{AutoAttempt: maxDownloadStallRetries}, Events{}) {
 		t.Fatal("retryStalledDownload() = true at retry limit, want false")
+	}
+}
+
+func TestDoDownloadWithStallTimeoutReturnsPromptlyWhenContextCanceled(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		close(release)
+	})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-release
+	}))
+	defer server.Close()
+
+	req, err := grab.NewRequest(t.TempDir(), server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := doDownloadWithStallTimeout(ctx, grab.NewClient(), req)
+		done <- err
+	}()
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("download wait did not return promptly after context cancellation")
 	}
 }
