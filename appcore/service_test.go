@@ -234,6 +234,59 @@ func TestFavoriteListReferenceServiceMethods(t *testing.T) {
 	}
 }
 
+func TestFavoriteGroupMetadataAndReorderServiceMethods(t *testing.T) {
+	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(database.Close)
+
+	svc := New(Options{})
+	first := svc.CreateFavoriteGroup("Utilities")
+	second := svc.CreateFavoriteGroup("Performance")
+	if first.ID == "" || second.ID == "" {
+		t.Fatalf("groups = %#v %#v", first, second)
+	}
+	if renamed := svc.RenameFavoriteGroup(first.ID, "Utility Mods"); renamed.ID != first.ID || renamed.Name != "Utility Mods" {
+		t.Fatalf("renamed group = %#v", renamed)
+	}
+	if !svc.ReorderFavoriteGroups([]string{second.ID, first.ID}) {
+		t.Fatal("ReorderFavoriteGroups returned false")
+	}
+	groups := svc.ListFavoriteGroups()
+	if len(groups) != 2 || groups[0].ID != second.ID || groups[1].ID != first.ID {
+		t.Fatalf("groups after reorder = %#v", groups)
+	}
+
+	listA := svc.CreateFavoriteList("A")
+	listB := svc.CreateFavoriteList("B")
+	updated := svc.UpdateFavoriteListMetadata(database.FavoriteList{
+		ID:        listA.ID,
+		GroupID:   second.ID,
+		IconKind:  "mdi",
+		IconValue: "mdi-star",
+		Pinned:    true,
+	})
+	if updated.ID != listA.ID || updated.GroupID != second.ID || updated.IconKind != "mdi" || !updated.Pinned {
+		t.Fatalf("updated list metadata = %#v", updated)
+	}
+	if !svc.ReorderFavoriteLists([]string{listB.ID, listA.ID}) {
+		t.Fatal("ReorderFavoriteLists returned false")
+	}
+	lists := svc.ListFavoriteLists()
+	if len(lists) != 2 || lists[0].ID != listA.ID || lists[0].SortOrder <= lists[1].SortOrder {
+		t.Fatalf("lists after pinned metadata and reorder = %#v", lists)
+	}
+	if !svc.DeleteFavoriteGroup(second.ID) {
+		t.Fatal("DeleteFavoriteGroup returned false")
+	}
+	lists = svc.ListFavoriteLists()
+	for _, list := range lists {
+		if list.GroupID == second.ID {
+			t.Fatalf("deleted group still assigned to list: %#v", lists)
+		}
+	}
+}
+
 func TestFavoriteMigrationPreviewAndApplyAllMatch(t *testing.T) {
 	svc := openFavoriteMigrationService(t)
 	storeFavoriteMigrationProject(t, "Modrinth", "sodium", "sodium", []models.ModVersion{

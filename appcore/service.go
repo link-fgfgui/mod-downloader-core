@@ -379,6 +379,68 @@ func (s *Service) DeleteFavoriteList(id string) bool {
 	return deleted
 }
 
+func (s *Service) UpdateFavoriteListMetadata(list database.FavoriteList) database.FavoriteList {
+	updated, ok, err := database.UpdateFavoriteListMetadata(list)
+	if err != nil {
+		logging.Error("update favorite list metadata failed", "id", list.ID, "error", err)
+		return database.FavoriteList{}
+	}
+	if !ok {
+		return database.FavoriteList{}
+	}
+	return updated
+}
+
+func (s *Service) ReorderFavoriteLists(ids []string) bool {
+	if err := database.ReorderFavoriteLists(ids); err != nil {
+		logging.Error("reorder favorite lists failed", "error", err)
+		return false
+	}
+	return true
+}
+
+func (s *Service) ListFavoriteGroups() []database.FavoriteGroup {
+	return database.ListFavoriteGroups()
+}
+
+func (s *Service) CreateFavoriteGroup(name string) database.FavoriteGroup {
+	group, err := database.CreateFavoriteGroup(name)
+	if err != nil {
+		logging.Error("create favorite group failed", "name", name, "error", err)
+		return database.FavoriteGroup{}
+	}
+	return group
+}
+
+func (s *Service) RenameFavoriteGroup(id, name string) database.FavoriteGroup {
+	group, ok, err := database.UpdateFavoriteGroupName(id, name)
+	if err != nil {
+		logging.Error("rename favorite group failed", "id", id, "name", name, "error", err)
+		return database.FavoriteGroup{}
+	}
+	if !ok {
+		return database.FavoriteGroup{}
+	}
+	return group
+}
+
+func (s *Service) DeleteFavoriteGroup(id string) bool {
+	deleted, err := database.DeleteFavoriteGroup(id)
+	if err != nil {
+		logging.Error("delete favorite group failed", "id", id, "error", err)
+		return false
+	}
+	return deleted
+}
+
+func (s *Service) ReorderFavoriteGroups(ids []string) bool {
+	if err := database.ReorderFavoriteGroups(ids); err != nil {
+		logging.Error("reorder favorite groups failed", "error", err)
+		return false
+	}
+	return true
+}
+
 func (s *Service) ListFavoriteMods(listID string) []database.FavoriteMod {
 	return database.ListFavoriteMods(listID)
 }
