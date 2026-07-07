@@ -29,9 +29,6 @@ type ModMetadataParser interface {
 type parsedModMetadata struct {
 	Mods       []structs.ModInfo
 	NestedJars []string
-	// TODO: Add Dependencies field for JAR-embedded dependency declarations.
-	// Each parser (Fabric: depends in fabric.mod.json, Forge/NeoForge: [[dependencies]] in mods.toml)
-	// should populate this. Not implemented yet — only platform-level dependencies are used.
 }
 
 // --- Fabric ---
@@ -51,10 +48,11 @@ func (fabricModParser) Parse(r *zip.Reader) (parsedModMetadata, error) {
 	}
 
 	var meta struct {
-		ID          string `json:"id"`
-		Name        string `json:"name"`
-		Version     string `json:"version"`
-		Description string `json:"description"`
+		ID          string         `json:"id"`
+		Name        string         `json:"name"`
+		Version     string         `json:"version"`
+		Description string         `json:"description"`
+		Depends     map[string]any `json:"depends"`
 		Jars        []struct {
 			File string `json:"file"`
 		} `json:"jars"`
@@ -68,10 +66,11 @@ func (fabricModParser) Parse(r *zip.Reader) (parsedModMetadata, error) {
 	}
 	if id := declaredModID(meta.ID); id != "" {
 		result.Mods = append(result.Mods, structs.ModInfo{
-			ID:          id,
-			Name:        meta.Name,
-			Version:     meta.Version,
-			Description: meta.Description,
+			ID:           id,
+			Name:         meta.Name,
+			Version:      meta.Version,
+			Description:  meta.Description,
+			Dependencies: localModDependenciesFromIDs(requiredFabricDependencyIDs(meta.Depends)),
 		})
 	}
 	for _, jar := range meta.Jars {
@@ -134,6 +133,11 @@ func parseModsToml(r *zip.Reader, path string) ([]structs.ModInfo, error) {
 			Version     string `toml:"version"`
 			Description string `toml:"description"`
 		} `toml:"mods"`
+		Dependencies map[string][]struct {
+			ModID     string `toml:"modId"`
+			Mandatory *bool  `toml:"mandatory"`
+			Type      string `toml:"type"`
+		} `toml:"dependencies"`
 	}
 	if err := toml.Unmarshal(data, &meta); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
@@ -146,13 +150,97 @@ func parseModsToml(r *zip.Reader, path string) ([]structs.ModInfo, error) {
 			continue
 		}
 		infos = append(infos, structs.ModInfo{
-			ID:          id,
-			Name:        resolveMetadataValue(m.DisplayName, properties),
-			Version:     resolveMetadataValue(m.Version, properties),
-			Description: resolveMetadataValue(m.Description, properties),
+			ID:           id,
+			Name:         resolveMetadataValue(m.DisplayName, properties),
+			Version:      resolveMetadataValue(m.Version, properties),
+			Description:  resolveMetadataValue(m.Description, properties),
+			Dependencies: localModDependenciesFromIDs(requiredForgeDependencyIDs(meta.Dependencies[id])),
 		})
 	}
 	return infos, nil
+}
+
+func requiredFabricDependencyIDs(depends map[string]any) []string {
+	if len(depends) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(depends))
+	for id := range depends {
+		id = cleanupDependencyModID(id)
+		if id == "" {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return uniqueDependencyIDs(ids)
+}
+
+func requiredForgeDependencyIDs(deps []struct {
+	ModID     string `toml:"modId"`
+	Mandatory *bool  `toml:"mandatory"`
+	Type      string `toml:"type"`
+}) []string {
+	ids := make([]string, 0, len(deps))
+	for _, dep := range deps {
+		if !forgeDependencyRequired(dep.Mandatory, dep.Type) {
+			continue
+		}
+		id := cleanupDependencyModID(dep.ModID)
+		if id == "" {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return uniqueDependencyIDs(ids)
+}
+
+func forgeDependencyRequired(mandatory *bool, depType string) bool {
+	depType = strings.ToLower(strings.TrimSpace(depType))
+	if depType != "" {
+		return depType == "required" || depType == "mandatory"
+	}
+	return mandatory != nil && *mandatory
+}
+
+func localModDependenciesFromIDs(ids []string) []structs.LocalModDependency {
+	if len(ids) == 0 {
+		return nil
+	}
+	deps := make([]structs.LocalModDependency, 0, len(ids))
+	for _, id := range ids {
+		deps = append(deps, structs.LocalModDependency{ModID: id, Type: "required"})
+	}
+	return deps
+}
+
+func cleanupDependencyModID(id string) string {
+	id = declaredModID(id)
+	if id == "" {
+		return ""
+	}
+	switch strings.ToLower(id) {
+	case "minecraft", "java", "fabricloader", "quilt_loader", "forge", "neoforge", "modloader":
+		return ""
+	default:
+		return id
+	}
+}
+
+func uniqueDependencyIDs(ids []string) []string {
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		key := strings.ToLower(strings.TrimSpace(id))
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
 
 func jarManifestProperties(r *zip.Reader) map[string]string {

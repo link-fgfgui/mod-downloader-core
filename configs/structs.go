@@ -107,6 +107,7 @@ type Preferences struct {
 	AnimationMode               AnimationMode `toml:"animation_mode" json:"animation_mode" env:"ANIMATION_MODE"`
 	AnimationsEnabled           *bool         `toml:"animations_enabled" json:"animations_enabled"`
 	AnimationDurationMultiplier float64       `toml:"animation_duration_multiplier" json:"animation_duration_multiplier" env:"ANIMATION_DURATION_MULTIPLIER"`
+	AutoScanUnusedDependencies  *bool         `toml:"auto_scan_unused_dependencies" json:"auto_scan_unused_dependencies"`
 }
 
 const (
@@ -115,6 +116,7 @@ const (
 	DefaultAnimationDurationMultiplier = 1.0
 	MinAnimationDurationMultiplier     = 0.25
 	MaxAnimationDurationMultiplier     = 3.0
+	DefaultAutoScanUnusedDependencies  = true
 )
 
 func BoolPtr(value bool) *bool {
@@ -143,6 +145,13 @@ func (p Preferences) AnimationsEnabledValue() bool {
 
 func (p Preferences) NormalizedAnimationDurationMultiplier() float64 {
 	return NormalizeAnimationDurationMultiplier(p.AnimationDurationMultiplier)
+}
+
+func (p Preferences) AutoScanUnusedDependenciesValue() bool {
+	if p.AutoScanUnusedDependencies == nil {
+		return DefaultAutoScanUnusedDependencies
+	}
+	return *p.AutoScanUnusedDependencies
 }
 
 func NormalizeAnimationDurationMultiplier(value float64) float64 {

@@ -89,6 +89,7 @@ type SettingsView struct {
 	AnimationMode               string  `json:"animationMode"`
 	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
+	AutoScanUnusedDependencies  bool    `json:"autoScanUnusedDependencies"`
 	MinecraftDir                string  `json:"minecraftDir"`
 	CacheDir                    string  `json:"cacheDir"`
 	CachePath                   string  `json:"cachePath"`
@@ -107,6 +108,10 @@ type SaveAnimationSettingsRequest struct {
 	AnimationMode               string  `json:"animationMode"`
 	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
+}
+
+type SaveUnusedDependencyCleanupSettingsRequest struct {
+	AutoScanUnusedDependencies bool `json:"autoScanUnusedDependencies"`
 }
 
 type InstallWaitResult struct {
@@ -376,6 +381,7 @@ func (s *Service) GetSettings() SettingsView {
 		AnimationMode:               configs.DefaultAnimationMode.String(),
 		AnimationEnabled:            configs.DefaultAnimationsEnabled,
 		AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
+		AutoScanUnusedDependencies:  configs.DefaultAutoScanUnusedDependencies,
 	}
 	if s.config != nil {
 		animationMode := s.config.Prefers.AnimationModeValue()
@@ -383,6 +389,7 @@ func (s *Service) GetSettings() SettingsView {
 		sv.AnimationMode = animationMode.String()
 		sv.AnimationEnabled = animationMode != configs.AnimationModeOff
 		sv.AnimationDurationMultiplier = s.config.Prefers.NormalizedAnimationDurationMultiplier()
+		sv.AutoScanUnusedDependencies = s.config.Prefers.AutoScanUnusedDependenciesValue()
 		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir))
 		sv.CacheDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Runtime.CacheDir))
 		sv.HasCurseforgeKey = strings.TrimSpace(s.config.Keys.CurseforgeApiKey) != ""
@@ -434,6 +441,17 @@ func (s *Service) SaveAnimationSettings(req SaveAnimationSettingsRequest) Settin
 	s.config.Prefers.AnimationDurationMultiplier = configs.NormalizeAnimationDurationMultiplier(req.AnimationDurationMultiplier)
 	if err := configs.Save(s.config); err != nil {
 		logging.Error("save animation settings failed", "animationMode", animationMode, "animationDurationMultiplier", req.AnimationDurationMultiplier, "error", err)
+	}
+	return s.GetSettings()
+}
+
+func (s *Service) SaveUnusedDependencyCleanupSettings(req SaveUnusedDependencyCleanupSettingsRequest) SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	s.config.Prefers.AutoScanUnusedDependencies = configs.BoolPtr(req.AutoScanUnusedDependencies)
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save unused dependency cleanup settings failed", "autoScanUnusedDependencies", req.AutoScanUnusedDependencies, "error", err)
 	}
 	return s.GetSettings()
 }
