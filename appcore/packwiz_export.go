@@ -31,6 +31,10 @@ func (s *Service) FavoriteListPackwizDefaultFilename(listID string) string {
 }
 
 func (s *Service) ExportFavoriteListPackwizZip(listID, destinationPath string) (ExportFavoriteListPackwizResult, error) {
+	return s.ExportFavoriteListPackwizZipForScope(listID, destinationPath, "", "")
+}
+
+func (s *Service) ExportFavoriteListPackwizZipForScope(listID, destinationPath, minecraftVersion, modLoader string) (ExportFavoriteListPackwizResult, error) {
 	listID = strings.TrimSpace(listID)
 	if listID == "" {
 		return ExportFavoriteListPackwizResult{}, fmt.Errorf("favorite list is required")
@@ -42,6 +46,10 @@ func (s *Service) ExportFavoriteListPackwizZip(listID, destinationPath string) (
 	items := database.ListFavoriteMods(listID)
 	if len(items) == 0 {
 		return ExportFavoriteListPackwizResult{}, fmt.Errorf("favorite list is empty")
+	}
+	items = favoritePackwizItemsForScope(items, minecraftVersion, modLoader)
+	if len(items) == 0 {
+		return ExportFavoriteListPackwizResult{}, fmt.Errorf("favorite list has no items for selected minecraft version and mod loader")
 	}
 	scope, err := favoritePackwizScope(items)
 	if err != nil {
@@ -75,6 +83,24 @@ func (s *Service) ExportFavoriteListPackwizZip(listID, destinationPath string) (
 	}
 	logging.Info("favorite list exported as packwiz zip", "listID", listID, "path", destinationPath, "modCount", len(mods))
 	return ExportFavoriteListPackwizResult{Path: destinationPath}, nil
+}
+
+func favoritePackwizItemsForScope(items []database.FavoriteMod, minecraftVersion, modLoader string) []database.FavoriteMod {
+	minecraftVersion = strings.TrimSpace(minecraftVersion)
+	modLoader = strings.ToLower(strings.TrimSpace(modLoader))
+	if minecraftVersion == "" && modLoader == "" {
+		return items
+	}
+	if minecraftVersion == "" || modLoader == "" {
+		return nil
+	}
+	filtered := make([]database.FavoriteMod, 0, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item.MinecraftVersion) == minecraftVersion && strings.ToLower(strings.TrimSpace(item.ModLoader)) == modLoader {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
 }
 
 func favoritePackwizScope(items []database.FavoriteMod) (favoriteExportScope, error) {
