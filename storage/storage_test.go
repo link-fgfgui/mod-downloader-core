@@ -1,4 +1,4 @@
-package database
+package storage
 
 import (
 	"database/sql"
@@ -27,7 +27,7 @@ func openTestDB(t *testing.T) string {
 			t.Fatal(err)
 		}
 	})
-	path := filepath.Join(tmp, databaseFileName)
+	path := filepath.Join(tmp, metadataCacheFileName)
 	if err := OpenAt(path); err != nil {
 		t.Fatal(err)
 	}
@@ -54,13 +54,13 @@ func TestDefaultCachePathUsesTempDir(t *testing.T) {
 	if rel, err := filepath.Rel(tempDir, path); err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
 		t.Fatalf("DefaultCachePath() = %q, want under %q", path, tempDir)
 	}
-	if filepath.Base(path) != databaseFileName {
-		t.Fatalf("DefaultCachePath() base = %q, want %q", filepath.Base(path), databaseFileName)
+	if filepath.Base(path) != metadataCacheFileName {
+		t.Fatalf("DefaultCachePath() base = %q, want %q", filepath.Base(path), metadataCacheFileName)
 	}
 }
 
 func TestOpenAtCreatesParentDirectoryOnClose(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "nested", "cache", databaseFileName)
+	path := filepath.Join(t.TempDir(), "nested", "cache", metadataCacheFileName)
 	if err := OpenAt(path); err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +76,96 @@ func TestOpenAtCreatesParentDirectoryOnClose(t *testing.T) {
 	Close()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("cache file after close: %v", err)
+	}
+}
+
+func TestUsageStatsAccumulateAndPersist(t *testing.T) {
+	path := openTestDB(t)
+
+	if got := GetUsageStats(); got != (UsageStats{}) {
+		t.Fatalf("initial stats = %#v, want zero", got)
+	}
+	for key, delta := range map[UsageStatKey]int64{
+		UsageStatDownloadsCompleted: 3,
+		UsageStatModsEnabled:        2,
+		UsageStatModsDisabled:       4,
+		UsageStatModsDeleted:        1,
+		UsageStatFavoritesAdded:     5,
+		UsageStatPackwizExports:     2,
+	} {
+		if err := IncrementUsageStat(key, delta); err != nil {
+			t.Fatalf("IncrementUsageStat(%q, %d): %v", key, delta, err)
+		}
+	}
+	if err := IncrementUsageStat(UsageStatDownloadsCompleted, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := IncrementUsageStat(UsageStatKey("unknown"), 99); err != nil {
+		t.Fatal(err)
+	}
+	if err := IncrementUsageStat(UsageStatModsDeleted, -1); err != nil {
+		t.Fatal(err)
+	}
+
+	want := UsageStats{
+		DownloadsCompleted: 5,
+		ModsEnabled:        2,
+		ModsDisabled:       4,
+		ModsDeleted:        1,
+		FavoritesAdded:     5,
+		PackwizExports:     2,
+	}
+	if got := GetUsageStats(); got != want {
+		t.Fatalf("stats = %#v, want %#v", got, want)
+	}
+
+	reopenTestDB(t, path)
+	if got := GetUsageStats(); got != want {
+		t.Fatalf("stats after reopen = %#v, want %#v", got, want)
+	}
+	var unknown int
+	if err := userDB.db.QueryRow(`SELECT COUNT(*) FROM usage_stats WHERE key = 'unknown'`).Scan(&unknown); err != nil || unknown != 0 {
+		t.Fatalf("unknown usage stat rows = %d, %v", unknown, err)
+	}
+}
+
+func TestLocalMetadataMissesNormalizeAndPersist(t *testing.T) {
+	path := openTestDB(t)
+	if err := SetLocalMetadataMisses(" Modrinth ", []string{" ABC123 ", "abc123", ""}, 1234); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := GetLocalMetadataMissCheckedAt("modrinth", "abc123"); !ok || got != 1234 {
+		t.Fatalf("metadata miss before reopen = %d, %v", got, ok)
+	}
+
+	reopenTestDB(t, path)
+	if got, ok := GetLocalMetadataMissCheckedAt("MODRINTH", " ABC123 "); !ok || got != 1234 {
+		t.Fatalf("metadata miss after reopen = %d, %v", got, ok)
+	}
+	if _, ok := GetLocalMetadataMissCheckedAt("modrinth", "missing"); ok {
+		t.Fatal("unexpected metadata miss for unknown identity")
+	}
+}
+
+func TestMinecraftReleaseVersionsNormalizeAndPersist(t *testing.T) {
+	path := openTestDB(t)
+	if err := SetMinecraftReleaseVersions([]string{" 1.21.1 ", "1.20.1", "1.21.1", ""}, 5678); err != nil {
+		t.Fatal(err)
+	}
+	versions, updatedAt := GetMinecraftReleaseVersions()
+	if updatedAt != 5678 || len(versions) != 2 || versions[0] != "1.21.1" || versions[1] != "1.20.1" {
+		t.Fatalf("release cache before reopen = %#v, %d", versions, updatedAt)
+	}
+
+	reopenTestDB(t, path)
+	versions, updatedAt = GetMinecraftReleaseVersions()
+	if updatedAt != 5678 || len(versions) != 2 || versions[0] != "1.21.1" || versions[1] != "1.20.1" {
+		t.Fatalf("release cache after reopen = %#v, %d", versions, updatedAt)
+	}
+	versions[0] = "mutated"
+	again, _ := GetMinecraftReleaseVersions()
+	if again[0] != "1.21.1" {
+		t.Fatalf("release cache returned shared slice: %#v", again)
 	}
 }
 
@@ -372,7 +462,7 @@ func TestFavoriteModRequiresExistingList(t *testing.T) {
 
 func TestSQLiteSchemaV2MigratesExistingFavorites(t *testing.T) {
 	tmp := t.TempDir()
-	cachePath := filepath.Join(tmp, databaseFileName)
+	cachePath := filepath.Join(tmp, metadataCacheFileName)
 	userPath := UserDataPathForCachePath(cachePath)
 	db, err := sql.Open(sqliteDriverName, userPath)
 	if err != nil {
@@ -586,76 +676,6 @@ func TestFavoriteListReferencesAndResolvedContents(t *testing.T) {
 	contents = ListFavoriteContents(root.ID)
 	if len(contents.Mods) != 1 || contents.Mods[0].ModID != "sodium" {
 		t.Fatalf("contents after ref delete = %#v", contents)
-	}
-}
-
-func TestLegacyGobUserDataMigratesToSQLite(t *testing.T) {
-	tmp := t.TempDir()
-	path := filepath.Join(tmp, databaseFileName)
-	state := newCacheState()
-	state.PinnedMods[makePinnedModKey("Modrinth", "Sodium", "1.21.1", "Fabric")] = PinnedMod{
-		Platform:         "Modrinth",
-		ModID:            "Sodium",
-		VersionID:        "v1",
-		MinecraftVersion: "1.21.1",
-		ModLoader:        "Fabric",
-	}
-	listID := "legacy-list"
-	state.FavoriteLists[listID] = FavoriteList{
-		ID:        listID,
-		Name:      "Legacy",
-		CreatedAt: 10,
-		UpdatedAt: 11,
-		SortOrder: 1,
-	}
-	state.FavoriteMods[makeFavoriteModKey(listID, "Modrinth", "Sodium", "1.21.1", "Fabric")] = FavoriteMod{
-		ListID:           listID,
-		Platform:         "Modrinth",
-		ModID:            "Sodium",
-		VersionID:        "v1",
-		MinecraftVersion: "1.21.1",
-		ModLoader:        "Fabric",
-		Title:            "Sodium",
-		Categories:       []string{"performance"},
-		CreatedAt:        12,
-		UpdatedAt:        13,
-	}
-	legacyDB := &cacheDB{path: path, state: state, strings: newStringPool()}
-	if err := legacyDB.save(); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := OpenAt(path); err != nil {
-		t.Fatal(err)
-	}
-	if pin, ok := GetPinnedMod("modrinth", "sodium", "1.21.1", "fabric"); !ok || pin.VersionID != "v1" {
-		t.Fatalf("migrated pin = %#v, %v", pin, ok)
-	}
-	lists := ListFavoriteLists()
-	if len(lists) != 1 || lists[0].ID != listID || lists[0].Name != "Legacy" {
-		t.Fatalf("migrated lists = %#v", lists)
-	}
-	mods := ListFavoriteMods(listID)
-	if len(mods) != 1 || mods[0].VersionID != "v1" || len(mods[0].Categories) != 1 {
-		t.Fatalf("migrated mods = %#v", mods)
-	}
-	Close()
-
-	reloaded, err := loadCacheState(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reloaded.normalize()
-	if len(reloaded.PinnedMods) != 0 || len(reloaded.FavoriteLists) != 0 || len(reloaded.FavoriteMods) != 0 {
-		t.Fatalf("legacy user data still in gob cache: pins=%d lists=%d mods=%d", len(reloaded.PinnedMods), len(reloaded.FavoriteLists), len(reloaded.FavoriteMods))
-	}
-
-	if err := OpenAt(path); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(Close)
-	if pin, ok := GetPinnedMod("modrinth", "sodium", "1.21.1", "fabric"); !ok || pin.VersionID != "v1" {
-		t.Fatalf("sqlite pin after reopen = %#v, %v", pin, ok)
 	}
 }
 

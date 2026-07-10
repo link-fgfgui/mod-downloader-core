@@ -13,6 +13,10 @@ import (
 
 const configFileName = "mod-downloader.toml"
 
+type loggingOnlyConfig struct {
+	Logging LoggingConfig `toml:"logging" env-prefix:"LOGGING_"`
+}
+
 // AppConfigPath returns the path to the config file in pwd.
 func AppConfigPath() (string, error) {
 	dir, err := os.Getwd()
@@ -50,6 +54,27 @@ func Load() (*Config, error) {
 
 	logging.Info("config loaded from file", "path", path, "hasCurseforgeKey", cfg.Keys.CurseforgeApiKey != "", "hasModrinthKey", cfg.Keys.ModrinthApiKey != "", "minecraftDir", cfg.Prefers.MinecraftDir)
 	return &cfg, nil
+}
+
+// LoadLogging reads only the logging bootstrap settings without emitting logs.
+// App startup uses it before the regular config loader so disabled logging is
+// honored from the first config-loader message onward.
+func LoadLogging() (LoggingConfig, error) {
+	var cfg loggingOnlyConfig
+	path, err := AppConfigPath()
+	if err != nil {
+		return LoggingConfig{}, err
+	}
+	if err := cleanenv.ReadConfig(path, &cfg); err != nil {
+		if os.IsNotExist(err) {
+			if err := cleanenv.ReadEnv(&cfg); err != nil {
+				return LoggingConfig{}, err
+			}
+			return cfg.Logging, nil
+		}
+		return LoggingConfig{}, err
+	}
+	return cfg.Logging, nil
 }
 
 func readEnv(cfg *Config) error {

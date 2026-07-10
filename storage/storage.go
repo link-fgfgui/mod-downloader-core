@@ -1,4 +1,4 @@
-package database
+package storage
 
 import (
 	"crypto/rand"
@@ -17,10 +17,10 @@ import (
 )
 
 const (
-	CacheFileName    = "mods.gob.zst"
-	UserDataFileName = "user-data.sqlite"
-	databaseFileName = CacheFileName
-	cacheVersion     = 4
+	CacheFileName         = "mod-metadata.tmp"
+	UserDataFileName      = "mod-favs.sqlite"
+	metadataCacheFileName = CacheFileName
+	cacheVersion          = 6
 )
 
 var (
@@ -30,7 +30,7 @@ var (
 	userDBPath string
 )
 
-var errDatabaseNotOpen = errors.New("database is not open")
+var errMetadataCacheNotOpen = errors.New("metadata cache is not open")
 var errUserDatabaseNotOpen = errors.New("user database is not open")
 
 type cacheDB struct {
@@ -41,16 +41,15 @@ type cacheDB struct {
 }
 
 type cacheState struct {
-	Version               int
-	ModPlatforms          map[platformKey]models.ModProject
-	PlatformAssociations  map[string]PlatformAssociation
-	PlatformVersions      map[versionKey]models.ModVersion
-	PlatformVersionScopes map[versionScopeKey]storedVersionScope
-	// Legacy user-owned records are decoded only for one-time SQLite migration.
-	PinnedMods             map[pinnedModKey]PinnedMod
-	FavoriteLists          map[string]FavoriteList
-	FavoriteMods           map[favoriteModKey]FavoriteMod
+	Version                int
+	ModPlatforms           map[platformKey]models.ModProject
+	PlatformAssociations   map[string]PlatformAssociation
+	PlatformVersions       map[versionKey]models.ModVersion
+	PlatformVersionScopes  map[versionScopeKey]storedVersionScope
 	PlatformVersionKeyByID map[string]versionKey
+	LocalMetadataMisses    map[localMetadataMissKey]int64
+	MinecraftReleases      []string
+	MinecraftReleasesAt    int64
 }
 
 type platformKey struct {
@@ -69,6 +68,11 @@ type versionScopeKey struct {
 	ProjectID        string
 	MinecraftVersion string
 	ModLoader        string
+}
+
+type localMetadataMissKey struct {
+	Provider string
+	Identity string
 }
 
 type pinnedModKey struct {
@@ -118,7 +122,7 @@ func DefaultCachePath() (string, error) {
 	if strings.TrimSpace(dir) == "" {
 		return "", errors.New("empty temp dir")
 	}
-	return filepath.Join(dir, "mod-downloader", databaseFileName), nil
+	return filepath.Join(dir, "mod-downloader", metadataCacheFileName), nil
 }
 
 func UserDataPathForCachePath(cachePath string) string {
@@ -148,7 +152,6 @@ func OpenAt(path string) error {
 		logging.Info("cache path changed, closing previous store", "previousPath", dbPath, "nextPath", targetPath)
 		Close()
 	}
-
 	logging.Info("opening cache", "path", targetPath)
 	state, err := loadCacheState(targetPath)
 	if err != nil {
@@ -160,11 +163,6 @@ func OpenAt(path string) error {
 	if err != nil {
 		logging.Error("open user database failed", "path", targetUserPath, "error", err)
 		return fmt.Errorf("open user database: %w", err)
-	}
-	if err := nextUserDB.migrateLegacyUserData(&state); err != nil {
-		_ = nextUserDB.close()
-		logging.Error("migrate legacy user data failed", "path", targetUserPath, "error", err)
-		return fmt.Errorf("migrate legacy user data: %w", err)
 	}
 	pool := newStringPool()
 	state.intern(&pool)
@@ -200,7 +198,7 @@ func Close() {
 func readyDB() (*cacheDB, error) {
 	if db == nil {
 		logging.Warn("cache access attempted before open")
-		return nil, errDatabaseNotOpen
+		return nil, errMetadataCacheNotOpen
 	}
 	return db, nil
 }
@@ -274,17 +272,11 @@ func (s *cacheState) normalize() {
 	if s.PlatformVersionScopes == nil {
 		s.PlatformVersionScopes = make(map[versionScopeKey]storedVersionScope)
 	}
-	if s.PinnedMods == nil {
-		s.PinnedMods = make(map[pinnedModKey]PinnedMod)
-	}
-	if s.FavoriteLists == nil {
-		s.FavoriteLists = make(map[string]FavoriteList)
-	}
-	if s.FavoriteMods == nil {
-		s.FavoriteMods = make(map[favoriteModKey]FavoriteMod)
-	}
 	if s.PlatformVersionKeyByID == nil {
 		s.PlatformVersionKeyByID = make(map[string]versionKey)
+	}
+	if s.LocalMetadataMisses == nil {
+		s.LocalMetadataMisses = make(map[localMetadataMissKey]int64)
 	}
 	s.normalizeKeys()
 }
@@ -346,58 +338,16 @@ func (s *cacheState) normalizeKeys() {
 	}
 	s.PlatformVersionScopes = scopes
 
-	pinnedMods := make(map[pinnedModKey]PinnedMod, len(s.PinnedMods))
-	for key, pin := range s.PinnedMods {
-		key = makePinnedModKey(key.Platform, key.ModID, key.MinecraftVersion, key.ModLoader)
-		pin = normalizePinnedMod(pin)
-		if pin.ID == "" {
-			pin.ID = key.Platform + ":" + key.ModID + ":" + key.MinecraftVersion + ":" + key.ModLoader
+	misses := make(map[localMetadataMissKey]int64, len(s.LocalMetadataMisses))
+	for key, checkedAt := range s.LocalMetadataMisses {
+		key = makeLocalMetadataMissKey(key.Provider, key.Identity)
+		if key.Provider != "" && key.Identity != "" && checkedAt > 0 {
+			misses[key] = checkedAt
 		}
-		pinnedMods[key] = pin
 	}
-	s.PinnedMods = pinnedMods
+	s.LocalMetadataMisses = misses
+	s.MinecraftReleases = copyStringSlice(s.MinecraftReleases)
 
-	favoriteLists := make(map[string]FavoriteList, len(s.FavoriteLists))
-	for id, list := range s.FavoriteLists {
-		list = normalizeFavoriteList(list)
-		if list.ID == "" {
-			list.ID = strings.TrimSpace(id)
-		}
-		if list.ID == "" {
-			continue
-		}
-		favoriteLists[list.ID] = list
-	}
-	s.FavoriteLists = favoriteLists
-
-	favoriteMods := make(map[favoriteModKey]FavoriteMod, len(s.FavoriteMods))
-	for key, mod := range s.FavoriteMods {
-		if mod.ListID == "" {
-			mod.ListID = key.ListID
-		}
-		if mod.Platform == "" {
-			mod.Platform = key.Platform
-		}
-		if mod.ModID == "" {
-			mod.ModID = key.ModID
-		}
-		if mod.MinecraftVersion == "" {
-			mod.MinecraftVersion = key.MinecraftVersion
-		}
-		if mod.ModLoader == "" {
-			mod.ModLoader = key.ModLoader
-		}
-		mod = normalizeFavoriteMod(mod)
-		key = makeFavoriteModKey(mod.ListID, mod.Platform, mod.ModID, mod.MinecraftVersion, mod.ModLoader)
-		if key.ListID == "" || key.Platform == "" || key.ModID == "" {
-			continue
-		}
-		if mod.ID == "" {
-			mod.ID = key.ListID + ":" + key.Platform + ":" + key.ModID + ":" + key.MinecraftVersion + ":" + key.ModLoader
-		}
-		favoriteMods[key] = mod
-	}
-	s.FavoriteMods = favoriteMods
 }
 
 func (s *cacheState) intern(pool *stringPool) {
@@ -435,41 +385,22 @@ func (s *cacheState) intern(pool *stringPool) {
 	}
 	s.PlatformVersionScopes = scopes
 
-	pinnedMods := make(map[pinnedModKey]PinnedMod, len(s.PinnedMods))
-	for key, pin := range s.PinnedMods {
-		key = internPinnedModKey(pool, key)
-		pin = internPinnedMod(pool, pin)
-		pinnedMods[key] = pin
-	}
-	s.PinnedMods = pinnedMods
-
-	favoriteLists := make(map[string]FavoriteList, len(s.FavoriteLists))
-	for id, list := range s.FavoriteLists {
-		id = pool.Intern(id)
-		list = internFavoriteList(pool, list)
-		favoriteLists[id] = list
-	}
-	s.FavoriteLists = favoriteLists
-
-	favoriteMods := make(map[favoriteModKey]FavoriteMod, len(s.FavoriteMods))
-	for key, mod := range s.FavoriteMods {
-		key = internFavoriteModKey(pool, key)
-		mod = internFavoriteMod(pool, mod)
-		favoriteMods[key] = mod
-	}
-	s.FavoriteMods = favoriteMods
-
 	versionKeyByID := make(map[string]versionKey, len(s.PlatformVersionKeyByID))
 	for id, key := range s.PlatformVersionKeyByID {
 		versionKeyByID[id] = internVersionKey(pool, key)
 	}
 	s.PlatformVersionKeyByID = versionKeyByID
-}
 
-func (s *cacheState) clearLegacyUserData() {
-	s.PinnedMods = make(map[pinnedModKey]PinnedMod)
-	s.FavoriteLists = make(map[string]FavoriteList)
-	s.FavoriteMods = make(map[favoriteModKey]FavoriteMod)
+	misses := make(map[localMetadataMissKey]int64, len(s.LocalMetadataMisses))
+	for key, checkedAt := range s.LocalMetadataMisses {
+		key.Provider = pool.Intern(key.Provider)
+		key.Identity = pool.Intern(key.Identity)
+		misses[key] = checkedAt
+	}
+	s.LocalMetadataMisses = misses
+	for i := range s.MinecraftReleases {
+		s.MinecraftReleases[i] = pool.Intern(s.MinecraftReleases[i])
+	}
 }
 
 func internPlatformKey(pool *stringPool, key platformKey) platformKey {
@@ -487,23 +418,6 @@ func internVersionKey(pool *stringPool, key versionKey) versionKey {
 func internVersionScopeKey(pool *stringPool, key versionScopeKey) versionScopeKey {
 	key.Platform = pool.Intern(key.Platform)
 	key.ProjectID = pool.Intern(key.ProjectID)
-	key.MinecraftVersion = pool.Intern(key.MinecraftVersion)
-	key.ModLoader = pool.Intern(key.ModLoader)
-	return key
-}
-
-func internPinnedModKey(pool *stringPool, key pinnedModKey) pinnedModKey {
-	key.Platform = pool.Intern(key.Platform)
-	key.ModID = pool.Intern(key.ModID)
-	key.MinecraftVersion = pool.Intern(key.MinecraftVersion)
-	key.ModLoader = pool.Intern(key.ModLoader)
-	return key
-}
-
-func internFavoriteModKey(pool *stringPool, key favoriteModKey) favoriteModKey {
-	key.ListID = pool.Intern(key.ListID)
-	key.Platform = pool.Intern(key.Platform)
-	key.ModID = pool.Intern(key.ModID)
 	key.MinecraftVersion = pool.Intern(key.MinecraftVersion)
 	key.ModLoader = pool.Intern(key.ModLoader)
 	return key
@@ -555,38 +469,6 @@ func internStoredVersionScope(pool *stringPool, scope storedVersionScope) stored
 	scope.MinecraftVersion = pool.Intern(scope.MinecraftVersion)
 	scope.ModLoader = pool.Intern(scope.ModLoader)
 	return scope
-}
-
-func internPinnedMod(pool *stringPool, pin PinnedMod) PinnedMod {
-	pin.ID = pool.Intern(pin.ID)
-	pin.Platform = pool.Intern(pin.Platform)
-	pin.ModID = pool.Intern(pin.ModID)
-	pin.VersionID = pool.Intern(pin.VersionID)
-	pin.MinecraftVersion = pool.Intern(pin.MinecraftVersion)
-	pin.ModLoader = pool.Intern(pin.ModLoader)
-	return pin
-}
-
-func internFavoriteList(pool *stringPool, list FavoriteList) FavoriteList {
-	list.ID = pool.Intern(list.ID)
-	list.Name = pool.Intern(list.Name)
-	return list
-}
-
-func internFavoriteMod(pool *stringPool, mod FavoriteMod) FavoriteMod {
-	mod.ID = pool.Intern(mod.ID)
-	mod.ListID = pool.Intern(mod.ListID)
-	mod.Platform = pool.Intern(mod.Platform)
-	mod.ModID = pool.Intern(mod.ModID)
-	mod.VersionID = pool.Intern(mod.VersionID)
-	mod.MinecraftVersion = pool.Intern(mod.MinecraftVersion)
-	mod.ModLoader = pool.Intern(mod.ModLoader)
-	mod.Title = pool.Intern(mod.Title)
-	mod.Slug = pool.Intern(mod.Slug)
-	mod.IconURL = pool.Intern(mod.IconURL)
-	mod.Description = pool.Intern(mod.Description)
-	mod.Categories = internStringSlice(pool, mod.Categories)
-	return mod
 }
 
 func (d *cacheDB) view(fn func(*cacheState) error) error {

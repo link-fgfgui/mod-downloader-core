@@ -8,6 +8,7 @@ import (
 
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/logging"
+	"github.com/link-fgfgui/mod-downloader-core/networking"
 	structs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
 
@@ -27,7 +28,7 @@ var pinnedMinecraftReleaseVersions = []string{
 }
 
 func FetchMinecraftReleaseVersions() ([]string, error) {
-	client := http.Client{Timeout: 10 * time.Second}
+	client := networking.NewClient(10 * time.Second)
 	resp, err := client.Get(minecraftVersionManifestURL)
 	if err != nil {
 		return nil, err

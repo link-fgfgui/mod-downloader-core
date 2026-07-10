@@ -1,14 +1,29 @@
 package providers
 
 import (
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/link-fgfgui/mod-downloader-core/database"
+	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/logging"
 	"github.com/link-fgfgui/mod-downloader-core/models"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 )
+
+const localMetadataMissTTL = 24 * time.Hour
+
+var localMetadataResolveMu sync.Mutex
+
+var providerBackground = struct {
+	lifecycle sync.Mutex
+	mu        sync.Mutex
+	accepting bool
+	wg        sync.WaitGroup
+}{accepting: true}
 
 func SearchMods(req appstructs.SearchModsRequest, emitUpdate func(appstructs.SearchModsUpdate)) {
 	req = normalizeSearchModsRequest(req)
@@ -152,38 +167,149 @@ func normalizeSearchModsRequest(req appstructs.SearchModsRequest) appstructs.Sea
 	return req
 }
 
-func ResolveProjectsByHashes(hashes []string) map[string]models.ModProject {
-	if len(hashes) == 0 {
-		return nil
+func ResolveMetadataByHashes(hashes []string) (map[string]models.ModProject, map[string]models.ModVersion) {
+	files := make(map[string]uint32, len(hashes))
+	for _, hash := range hashes {
+		if hash = strings.ToLower(strings.TrimSpace(hash)); hash != "" {
+			files[hash] = 0
+		}
 	}
-	resolved, err := modrinthProvider{}.resolveProjectsByHashes(hashes)
-	if err != nil {
-		logging.Error("resolve projects by hashes failed", "hashCount", len(hashes), "error", err)
-		return nil
+	return ResolveMetadataByLocalFiles(files)
+}
+
+// ResolveMetadataByLocalFiles resolves local SHA1 values through Modrinth and
+// CurseForge fingerprints through CurseForge. Results are keyed by SHA1.
+func ResolveMetadataByLocalFiles(files map[string]uint32) (map[string]models.ModProject, map[string]models.ModVersion) {
+	localMetadataResolveMu.Lock()
+	defer localMetadataResolveMu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-localMetadataMissTTL).Unix()
+	hashes := make([]string, 0, len(files))
+	fingerprintSet := make(map[uint32]struct{})
+	for hash, fingerprint := range files {
+		if hash = strings.ToLower(strings.TrimSpace(hash)); hash != "" && !hasRecentLocalMetadataMiss("modrinth", hash, cutoff) {
+			hashes = append(hashes, hash)
+		}
+		if fingerprint != 0 && !hasRecentLocalMetadataMiss("curseforge", strconv.FormatUint(uint64(fingerprint), 10), cutoff) {
+			fingerprintSet[fingerprint] = struct{}{}
+		}
 	}
-	// Cache projects to the database.
-	for _, project := range resolved.projects {
+	if len(hashes) == 0 && len(fingerprintSet) == 0 {
+		return nil, nil
+	}
+	sort.Strings(hashes)
+	projects := make(map[string]models.ModProject)
+	versions := make(map[string]models.ModVersion)
+	if len(hashes) > 0 && global.GetModrinthClient() != nil {
+		resolved, err := modrinthProvider{}.resolveProjectsByHashes(hashes)
+		if err != nil {
+			logging.Error("resolve Modrinth projects by hashes failed", "hashCount", len(hashes), "error", err)
+		} else {
+			for hash, project := range resolved.projects {
+				projects[strings.ToLower(hash)] = project
+			}
+			for hash, version := range resolved.versions {
+				versions[strings.ToLower(hash)] = version
+			}
+			recordLocalMetadataMisses("modrinth", hashes, func(identity string) bool {
+				_, ok := resolved.projects[identity]
+				return ok
+			}, now.Unix())
+		}
+	}
+	fingerprints := make([]uint32, 0, len(fingerprintSet))
+	for fingerprint := range fingerprintSet {
+		fingerprints = append(fingerprints, fingerprint)
+	}
+	sort.Slice(fingerprints, func(i, j int) bool { return fingerprints[i] < fingerprints[j] })
+	if len(fingerprints) > 0 && global.GetCurseForgeClient() != nil {
+		curseForgeResolved, err := curseForgeProvider{}.resolveProjectsByFingerprints(fingerprints)
+		if err != nil {
+			logging.Error("resolve CurseForge projects by fingerprints failed", "fingerprintCount", len(fingerprints), "error", err)
+		} else {
+			identities := make([]string, 0, len(fingerprints))
+			for _, fingerprint := range fingerprints {
+				identities = append(identities, strconv.FormatUint(uint64(fingerprint), 10))
+			}
+			recordLocalMetadataMisses("curseforge", identities, func(identity string) bool {
+				fingerprint, parseErr := strconv.ParseUint(identity, 10, 32)
+				if parseErr != nil {
+					return false
+				}
+				_, ok := curseForgeResolved.projects[uint32(fingerprint)]
+				return ok
+			}, now.Unix())
+			for hash, fingerprint := range files {
+				hash = strings.ToLower(strings.TrimSpace(hash))
+				if hash == "" || fingerprint == 0 {
+					continue
+				}
+				if _, exists := projects[hash]; exists {
+					continue
+				}
+				if project, ok := curseForgeResolved.projects[fingerprint]; ok {
+					projects[hash] = project
+					version := curseForgeResolved.versions[fingerprint]
+					if strings.TrimSpace(version.SHA1) == "" {
+						version.SHA1 = hash
+					}
+					versions[hash] = version
+				}
+			}
+		}
+	}
+	cacheResolvedMetadata(projects, versions)
+	return projects, versions
+}
+
+func hasRecentLocalMetadataMiss(provider, identity string, cutoff int64) bool {
+	checkedAt, ok := storage.GetLocalMetadataMissCheckedAt(provider, identity)
+	return ok && checkedAt >= cutoff
+}
+
+func recordLocalMetadataMisses(provider string, identities []string, resolved func(string) bool, checkedAt int64) {
+	misses := make([]string, 0, len(identities))
+	for _, identity := range identities {
+		if !resolved(identity) {
+			misses = append(misses, identity)
+		}
+	}
+	if err := storage.SetLocalMetadataMisses(provider, misses, checkedAt); err != nil {
+		logging.Error("cache local metadata misses failed", "provider", provider, "identityCount", len(misses), "error", err)
+	}
+}
+
+func cacheResolvedMetadata(projects map[string]models.ModProject, versions map[string]models.ModVersion) {
+	for _, project := range projects {
 		if strings.TrimSpace(project.Title) == "" {
 			continue
 		}
-		if err := database.UpsertModPlatform(project); err != nil {
+		if err := storage.UpsertModPlatform(project); err != nil {
 			logging.Error("cache resolved project failed", "platform", project.Platform, "projectID", project.ProjectID, "error", err)
 		}
 	}
 	// Cache versions so that GetVersionBySHA1 finds them on next sync pass.
 	versionsByProject := make(map[string][]models.ModVersion)
-	for _, v := range resolved.versions {
+	for _, v := range versions {
 		if v.ProjectID == "" {
 			continue
 		}
-		versionsByProject[v.ProjectID] = append(versionsByProject[v.ProjectID], v)
+		key := models.ProjectKey(v.Platform, v.ProjectID)
+		versionsByProject[key] = append(versionsByProject[key], v)
 	}
-	for projectID, versions := range versionsByProject {
-		if err := database.SetPlatformVersions("Modrinth", projectID, versions); err != nil {
-			logging.Error("cache resolved versions failed", "projectID", projectID, "error", err)
+	for key, projectVersions := range versionsByProject {
+		platform, projectID := models.ParseProjectKey(key)
+		if err := storage.SetPlatformVersions(platform, projectID, projectVersions); err != nil {
+			logging.Error("cache resolved versions failed", "platform", platform, "projectID", projectID, "error", err)
 		}
 	}
-	return resolved.projects
+}
+
+// ResolveProjectsByHashes preserves the project-only API for existing core consumers.
+func ResolveProjectsByHashes(hashes []string) map[string]models.ModProject {
+	projects, _ := ResolveMetadataByHashes(hashes)
+	return projects
 }
 
 func cacheSearchResults(results []models.ModProject) {
@@ -191,7 +317,7 @@ func cacheSearchResults(results []models.ModProject) {
 		if strings.TrimSpace(r.Title) == "" {
 			continue
 		}
-		if err := database.UpsertModPlatform(r); err != nil {
+		if err := storage.UpsertModPlatform(r); err != nil {
 			logging.Error("cache search result failed", "platform", r.Platform, "projectID", r.ProjectID, "error", err)
 		}
 	}
@@ -203,7 +329,9 @@ func ListMatchingProjectVersions(result models.ModProject, minecraftVersion stri
 		return nil
 	}
 
-	go refreshProjectMetadataIfStale(provider, provider.Name(), projectIDOrSlug)
+	startBackgroundTask(func() {
+		refreshProjectMetadataIfStale(provider, provider.Name(), projectIDOrSlug)
+	})
 	req := appstructs.SearchModsRequest{
 		Version:   strings.TrimSpace(minecraftVersion),
 		ModLoader: strings.ToLower(strings.TrimSpace(modLoader)),
@@ -234,6 +362,40 @@ func RefreshMatchingProjectVersions(result models.ModProject, minecraftVersion s
 		logging.Error("save refreshed project versions snapshot failed", "platform", provider.Name(), "requestedProject", projectIDOrSlug, "projectID", projectID, "versionCount", len(versions), "error", err)
 	}
 	return filterProjectVersionsForFilter(versions, filter)
+}
+
+func StartBackgroundTasks() {
+	providerBackground.lifecycle.Lock()
+	providerBackground.mu.Lock()
+	providerBackground.accepting = true
+	providerBackground.mu.Unlock()
+	providerBackground.lifecycle.Unlock()
+}
+
+func StopBackgroundTasks() {
+	providerBackground.lifecycle.Lock()
+	providerBackground.mu.Lock()
+	providerBackground.accepting = false
+	providerBackground.mu.Unlock()
+	providerBackground.wg.Wait()
+	providerBackground.lifecycle.Unlock()
+}
+
+func startBackgroundTask(task func()) {
+	if task == nil {
+		return
+	}
+	providerBackground.mu.Lock()
+	if !providerBackground.accepting {
+		providerBackground.mu.Unlock()
+		return
+	}
+	providerBackground.wg.Add(1)
+	go func() {
+		defer providerBackground.wg.Done()
+		task()
+	}()
+	providerBackground.mu.Unlock()
 }
 
 func LookupProjectByPlatform(platform, idOrSlug, mcVersion, modLoader string) (models.ModProject, bool) {
@@ -352,7 +514,9 @@ type associatedPlatformProject struct {
 }
 
 func addProjectVersionSHA1s(set map[string]bool, provider modProvider, project string) {
-	go refreshProjectMetadataIfStale(provider, provider.Name(), project)
+	startBackgroundTask(func() {
+		refreshProjectMetadataIfStale(provider, provider.Name(), project)
+	})
 	for _, v := range listProjectVersions(provider, project) {
 		if s := strings.ToLower(strings.TrimSpace(v.SHA1)); s != "" {
 			set[s] = true
@@ -369,11 +533,11 @@ func associatedPlatformProjects(provider modProvider, project string) []associat
 
 	switch platform {
 	case "curseforge":
-		if association, ok := database.GetAssociationByCurseForge(project); ok && strings.TrimSpace(association.ModrinthProjectID) != "" {
+		if association, ok := storage.GetAssociationByCurseForge(project); ok && strings.TrimSpace(association.ModrinthProjectID) != "" {
 			return []associatedPlatformProject{{provider: modrinthProvider{}, projectID: association.ModrinthProjectID}}
 		}
 	case "modrinth":
-		if association, ok := database.GetAssociationByModrinth(project); ok && strings.TrimSpace(association.CurseForgeProjectID) != "" {
+		if association, ok := storage.GetAssociationByModrinth(project); ok && strings.TrimSpace(association.CurseForgeProjectID) != "" {
 			return []associatedPlatformProject{{provider: curseForgeProvider{}, projectID: association.CurseForgeProjectID}}
 		}
 	}

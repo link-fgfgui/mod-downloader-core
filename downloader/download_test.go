@@ -1,20 +1,23 @@
 package downloader
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/cavaliergopher/grab/v3"
-	"github.com/link-fgfgui/mod-downloader-core/database"
+	"github.com/link-fgfgui/mod-downloader-core/downloader/filetransfer"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/modbridge"
 	"github.com/link-fgfgui/mod-downloader-core/models"
 	"github.com/link-fgfgui/mod-downloader-core/providers"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 	mcstructs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
@@ -30,9 +33,11 @@ func resetDownloadQueueForTest(t *testing.T) {
 	downloadQueue.cancelRequested = nil
 	downloadQueue.finalizedCancel = nil
 	downloadQueue.restartRequested = nil
-	downloadQueue.running = false
+	downloadQueue.workers = 0
+	downloadQueue.maxConcurrent = 1
 	downloadQueue.current = nil
 	downloadQueue.Unlock()
+	downloadFileConcurrency.Store(filetransfer.DefaultConcurrency)
 	resetDownloaderHooksForTest(t)
 }
 
@@ -40,14 +45,15 @@ func resetDownloaderHooksForTest(t *testing.T) {
 	t.Helper()
 	refreshMatchingProjectVersions = providers.RefreshMatchingProjectVersions
 	installStatusPrecise = modbridge.InstallStatusPrecise
+	newFileTransferBackend = func() filetransfer.Backend { return filetransfer.NewStdlibBackend(nil) }
 }
 
 func openDownloadTestDatabase(t *testing.T) {
 	t.Helper()
-	if err := database.OpenAt(filepath.Join(t.TempDir(), "mods.gob.zst")); err != nil {
-		t.Fatalf("database.OpenAt() error = %v", err)
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
+		t.Fatalf("storage.OpenAt() error = %v", err)
 	}
-	t.Cleanup(database.Close)
+	t.Cleanup(storage.Close)
 }
 
 func seedDownloadProjectVersion(t *testing.T, projectID string, version models.ModVersion) models.ModProject {
@@ -59,14 +65,14 @@ func seedDownloadProjectVersion(t *testing.T, projectID string, version models.M
 		Slug:      projectID,
 		Title:     projectID,
 	}
-	if err := database.UpsertModPlatform(project); err != nil {
-		t.Fatalf("database.UpsertModPlatform(%q) error = %v", projectID, err)
+	if err := storage.UpsertModPlatform(project); err != nil {
+		t.Fatalf("storage.UpsertModPlatform(%q) error = %v", projectID, err)
 	}
-	if err := database.SetPlatformVersionSnapshot("Modrinth", projectID, []models.ModVersion{version}, time.Now().Unix(), []database.ModPlatformVersionScope{{
+	if err := storage.SetPlatformVersionSnapshot("Modrinth", projectID, []models.ModVersion{version}, time.Now().Unix(), []storage.ModPlatformVersionScope{{
 		MinecraftVersion: "1.21.1",
 		ModLoader:        "fabric",
 	}}); err != nil {
-		t.Fatalf("database.SetPlatformVersionSnapshot(%q) error = %v", projectID, err)
+		t.Fatalf("storage.SetPlatformVersionSnapshot(%q) error = %v", projectID, err)
 	}
 	return project
 }
@@ -183,6 +189,56 @@ func TestQueueModDownloadAcceptsExplicitTargetWithoutSelectedInstance(t *testing
 	}
 }
 
+func TestDownloadCompletedEventOnlyFiresForNewInstalledFile(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	openDownloadTestDatabase(t)
+	newFileTransferBackend = func() filetransfer.Backend {
+		return successfulTransferBackend{content: []byte("downloaded jar")}
+	}
+	targetDir := t.TempDir()
+	completed := make(chan struct{}, 2)
+	events := Events{OnDownloadCompleted: func() { completed <- struct{}{} }}
+	job := downloadJob{
+		Version: models.ModVersion{
+			ID:          "version-1",
+			VersionID:   "version-1",
+			Platform:    "Modrinth",
+			ProjectID:   "example",
+			FileName:    "example.jar",
+			DownloadURL: "https://example.test/example.jar",
+		},
+		TargetDir:        targetDir,
+		InstanceID:       "test:" + targetDir,
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+		dependenciesDone: true,
+	}
+	seedDownloadProjectVersion(t, "example", job.Version)
+	if !modbridge.PersistVersionModIDs(job.Version.ID, []string{"example"}) {
+		t.Fatal("PersistVersionModIDs returned false")
+	}
+
+	enqueueDownload(t.Context(), job, events)
+	select {
+	case <-completed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("new install did not emit completion")
+	}
+	waitForDownloadState(t, func(state appstructs.DownloadQueueState) bool {
+		return state.Running == 0 && state.Pending == 0
+	})
+
+	enqueueDownload(t.Context(), job, events)
+	waitForDownloadState(t, func(state appstructs.DownloadQueueState) bool {
+		return state.Running == 0 && state.Pending == 0
+	})
+	select {
+	case <-completed:
+		t.Fatal("existing target emitted a second completion")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestCancelDownloadDuringDependencyAnalysisKeepsRetryableQueueItem(t *testing.T) {
 	resetDownloadQueueForTest(t)
 	openDownloadTestDatabase(t)
@@ -276,7 +332,7 @@ func TestRetryCanceledDependencyAnalysisUsesFreshQueueID(t *testing.T) {
 		},
 	}}
 	// Suppress the background runner; this test only verifies retry queue state.
-	downloadQueue.running = true
+	downloadQueue.workers = 1
 	downloadQueue.Unlock()
 
 	if !RetryDownload(nil, "download-1") {
@@ -353,7 +409,7 @@ func TestRetryDownloadRequeuesRetryableItemWithFreshID(t *testing.T) {
 		},
 	}}
 	// Suppress the background runner; this test only needs to verify requeue state.
-	downloadQueue.running = true
+	downloadQueue.workers = 1
 	downloadQueue.Unlock()
 
 	if !RetryDownload(nil, "download-1") {
@@ -378,8 +434,8 @@ func TestRunningDownloadIsRetryableAndMarksRestartRequest(t *testing.T) {
 	canceled := false
 	downloadQueue.Lock()
 	downloadQueue.nextID = 1
-	downloadQueue.running = true
-	downloadQueue.current = &downloadJob{
+	downloadQueue.workers = 1
+	downloadQueue.current = map[string]downloadJob{"download-1": {
 		ID: "download-1",
 		Version: models.ModVersion{
 			ID:       "version-1",
@@ -394,7 +450,7 @@ func TestRunningDownloadIsRetryableAndMarksRestartRequest(t *testing.T) {
 		cancel: func() {
 			canceled = true
 		},
-	}
+	}}
 	downloadQueue.Unlock()
 
 	state := GetDownloadQueueState()
@@ -420,8 +476,8 @@ func TestCancelRunningDownloadMovesItemToCanceledImmediately(t *testing.T) {
 	canceled := false
 	downloadQueue.Lock()
 	downloadQueue.nextID = 1
-	downloadQueue.running = true
-	downloadQueue.current = &downloadJob{
+	downloadQueue.workers = 1
+	downloadQueue.current = map[string]downloadJob{"download-1": {
 		ID: "download-1",
 		Version: models.ModVersion{
 			ID:       "version-1",
@@ -436,7 +492,7 @@ func TestCancelRunningDownloadMovesItemToCanceledImmediately(t *testing.T) {
 		cancel: func() {
 			canceled = true
 		},
-	}
+	}}
 	downloadQueue.Unlock()
 
 	if !CancelDownload(nil, "download-1") {
@@ -462,7 +518,7 @@ func TestCancelRunningDownloadMovesItemToCanceledImmediately(t *testing.T) {
 func TestRetryStalledDownloadRequeuesUntilLimit(t *testing.T) {
 	resetDownloadQueueForTest(t)
 	downloadQueue.Lock()
-	downloadQueue.running = true
+	downloadQueue.workers = 1
 	downloadQueue.nextID = 1
 	downloadQueue.Unlock()
 
@@ -517,17 +573,16 @@ func TestDoDownloadWithStallTimeoutReturnsPromptlyWhenContextCanceled(t *testing
 	}))
 	defer server.Close()
 
-	req, err := grab.NewRequest(t.TempDir(), server.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req = req.WithContext(ctx)
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := doDownloadWithStallTimeout(ctx, grab.NewClient(), req)
+		_, err := doDownloadWithStallTimeout(ctx, filetransfer.NewStdlibBackend(server.Client()), filetransfer.Request{
+			URL:               server.URL,
+			Destination:       filepath.Join(t.TempDir(), "blocked.jar"),
+			OverwriteExisting: true,
+		})
 		done <- err
 	}()
 
@@ -539,6 +594,223 @@ func TestDoDownloadWithStallTimeoutReturnsPromptlyWhenContextCanceled(t *testing
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("download wait did not return promptly after context cancellation")
+	}
+}
+
+type blockingTransferBackend struct{}
+
+type successfulTransferBackend struct {
+	content []byte
+}
+
+func (successfulTransferBackend) Kind() filetransfer.BackendKind {
+	return filetransfer.BackendStdlib
+}
+
+func (b successfulTransferBackend) Download(_ context.Context, req filetransfer.Request, _ *filetransfer.ProgressTracker) (filetransfer.Result, error) {
+	if err := os.WriteFile(req.Destination, b.content, 0o644); err != nil {
+		return filetransfer.Result{}, err
+	}
+	return filetransfer.Result{
+		Path:          req.Destination,
+		BytesComplete: int64(len(b.content)),
+		TotalBytes:    int64(len(b.content)),
+	}, nil
+}
+
+func (blockingTransferBackend) Kind() filetransfer.BackendKind {
+	return filetransfer.BackendStdlib
+}
+
+type recordingBlockingTransferBackend struct {
+	requests chan filetransfer.Request
+}
+
+func (*recordingBlockingTransferBackend) Kind() filetransfer.BackendKind {
+	return filetransfer.BackendStdlib
+}
+
+func (b *recordingBlockingTransferBackend) Download(ctx context.Context, req filetransfer.Request, _ *filetransfer.ProgressTracker) (filetransfer.Result, error) {
+	b.requests <- req
+	<-ctx.Done()
+	return filetransfer.Result{}, ctx.Err()
+}
+
+func TestConfigureControlsFileAndQueueConcurrency(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	Configure(Config{FileConcurrency: 8, ConcurrentDownloads: 2})
+	backend := &recordingBlockingTransferBackend{requests: make(chan filetransfer.Request, 2)}
+	newFileTransferBackend = func() filetransfer.Backend { return backend }
+	t.Cleanup(func() {
+		newFileTransferBackend = func() filetransfer.Backend { return filetransfer.NewStdlibBackend(nil) }
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	targetDir := t.TempDir()
+	for i := 1; i <= 2; i++ {
+		enqueueDownload(ctx, downloadJob{
+			Version: models.ModVersion{
+				ID:          fmt.Sprintf("version-%d", i),
+				FileName:    fmt.Sprintf("mod-%d.jar", i),
+				DownloadURL: fmt.Sprintf("https://example.test/mod-%d.jar", i),
+			},
+			TargetDir:        targetDir,
+			ModLoader:        "fabric",
+			dependenciesDone: true,
+		}, Events{})
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case req := <-backend.requests:
+			if req.Concurrency != 8 {
+				t.Fatalf("file concurrency = %d, want 8", req.Concurrency)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("two downloads did not start concurrently")
+		}
+	}
+	state := GetDownloadQueueState()
+	if state.Running != 2 || state.Pending != 0 {
+		t.Fatalf("queue state = %#v, want two running downloads", state)
+	}
+	cancel()
+	waitForDownloadState(t, func(state appstructs.DownloadQueueState) bool {
+		return state.Running == 0 && state.Pending == 0
+	})
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		downloadQueue.Lock()
+		workers := downloadQueue.workers
+		downloadQueue.Unlock()
+		if workers == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("download workers did not exit")
+}
+
+func (blockingTransferBackend) Download(ctx context.Context, _ filetransfer.Request, _ *filetransfer.ProgressTracker) (filetransfer.Result, error) {
+	<-ctx.Done()
+	return filetransfer.Result{}, ctx.Err()
+}
+
+func TestDoDownloadWithStallTimeoutCancelsBackend(t *testing.T) {
+	previousTimeout := downloadStallTimeout
+	previousInterval := downloadProgressPollInterval
+	downloadStallTimeout = 20 * time.Millisecond
+	downloadProgressPollInterval = 5 * time.Millisecond
+	t.Cleanup(func() {
+		downloadStallTimeout = previousTimeout
+		downloadProgressPollInterval = previousInterval
+	})
+
+	_, err := doDownloadWithStallTimeout(context.Background(), blockingTransferBackend{}, filetransfer.Request{
+		URL:         "https://example.invalid/file.jar",
+		Destination: filepath.Join(t.TempDir(), "file.jar"),
+	})
+	if !errors.Is(err, errDownloadStalled) {
+		t.Fatalf("err = %v, want errDownloadStalled", err)
+	}
+}
+
+func TestDownloadFileToTempUsesJobFilenameHeadersAndContent(t *testing.T) {
+	content := []byte("downloaded-content")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if got := req.Header.Get("User-Agent"); got != "mod-downloader/v1.2.3" {
+			t.Errorf("User-Agent = %q", got)
+		}
+		w.Header().Set("Content-Length", fmt.Sprint(len(content)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content)
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	path, err := downloadFileToTemp(t.Context(), downloadJob{
+		Version: models.ModVersion{
+			DownloadURL: server.URL + "/fallback-name.jar",
+			FileName:    "provided-name.jar",
+		},
+		TargetDir: filepath.Join(root, "versions", "test", "mods"),
+		UserAgent: "mod-downloader/v1.2.3",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(path) != "provided-name.jar" {
+		t.Fatalf("path = %q", path)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("content = %q", got)
+	}
+}
+
+func TestDownloadFileToTempPreservesProviderURL(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	requests := make(chan filetransfer.Request, 1)
+	newFileTransferBackend = func() filetransfer.Backend {
+		return requestCaptureTransferBackend{requests: requests}
+	}
+	t.Cleanup(func() {
+		newFileTransferBackend = func() filetransfer.Backend { return filetransfer.NewStdlibBackend(nil) }
+	})
+	const providerURL = "https://cdn.modrinth.com/data/project/version/mod.jar?download=1"
+	if _, err := downloadFileToTemp(t.Context(), downloadJob{
+		Version:   models.ModVersion{DownloadURL: providerURL, FileName: "mod.jar"},
+		TargetDir: filepath.Join(t.TempDir(), "mods"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if req := <-requests; req.URL != providerURL {
+		t.Fatalf("transfer URL = %q, want provider URL %q", req.URL, providerURL)
+	}
+}
+
+type requestCaptureTransferBackend struct {
+	requests chan<- filetransfer.Request
+}
+
+func (requestCaptureTransferBackend) Kind() filetransfer.BackendKind {
+	return filetransfer.BackendStdlib
+}
+
+func (b requestCaptureTransferBackend) Download(_ context.Context, req filetransfer.Request, _ *filetransfer.ProgressTracker) (filetransfer.Result, error) {
+	b.requests <- req
+	return filetransfer.Result{Path: req.Destination}, nil
+}
+
+func TestSetDownloadRequestHeaders(t *testing.T) {
+	headers := downloadHeaders(downloadJob{
+		Version:          models.ModVersion{DownloadURL: "https://edge.forgecdn.net/files/example.jar"},
+		CurseForgeAPIKey: "secret",
+		UserAgent:        "mod-downloader/v1.2.3",
+	})
+	if got := headers["User-Agent"]; got != "mod-downloader/v1.2.3" {
+		t.Fatalf("User-Agent = %q", got)
+	}
+	if got := headers["x-api-key"]; got != "secret" {
+		t.Fatalf("x-api-key = %q", got)
+	}
+}
+
+func TestDiscardFetchFromNetworkSetsUserAgent(t *testing.T) {
+	got := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		got <- req.Header.Get("User-Agent")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	DiscardFetchFromNetwork(server.URL, "", "mod-downloader/v1.2.3")
+	if userAgent := <-got; userAgent != "mod-downloader/v1.2.3" {
+		t.Fatalf("User-Agent = %q", userAgent)
 	}
 }
 

@@ -22,11 +22,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/logging"
 	"github.com/link-fgfgui/mod-downloader-core/models"
 	"github.com/link-fgfgui/mod-downloader-core/providers"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 )
 
@@ -298,7 +298,7 @@ func (s *Server) resolveAcceptedPayload(ap acceptedPayload, mcVersion, modLoader
 			if v.ID == ap.versionID {
 				modID := extractModID(project)
 				if modID != "" {
-					if err := database.UpsertPinnedMod(database.PinnedMod{
+					if err := storage.UpsertPinnedMod(storage.PinnedMod{
 						Platform:         strings.ToLower(strings.TrimSpace(project.Platform)),
 						ModID:            modID,
 						VersionID:        ap.versionID,

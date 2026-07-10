@@ -148,6 +148,20 @@ func SetSelectedVersion(version structs.VersionInfo) {
 	previousKey := selectedVersionKey
 	selectedVersionKey = versionKey(version)
 	selectedVersionDir = mcDir
+	if _, ok := versionMap[selectedVersionKey]; ok {
+		for i := range versions {
+			if versionKey(versions[i]) == selectedVersionKey {
+				versions[i] = version
+				break
+			}
+		}
+		if version.Name != "" {
+			versionMap[version.Name] = version
+		}
+		if version.ID != "" {
+			versionMap[version.ID] = version
+		}
+	}
 	logging.Info("global selected version set", "previousKey", previousKey, "key", selectedVersionKey, "minecraftDir", selectedVersionDir)
 }
 

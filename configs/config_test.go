@@ -209,3 +209,129 @@ auto_scan_unused_dependencies = false
 		t.Fatal("auto scan unused dependencies = true, want false")
 	}
 }
+
+func TestPreferencesMCIMDefaultTOMLAndEnvironment(t *testing.T) {
+	if (Preferences{}).MCIMEnabledValue() {
+		t.Fatal("default MCIM enabled = true, want false")
+	}
+
+	var cfg Config
+	if _, err := toml.Decode(`
+[preferences]
+mcim_enabled = true
+`, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Prefers.MCIMEnabledValue() {
+		t.Fatal("TOML MCIM enabled = false, want true")
+	}
+
+	t.Setenv("PREFERS_MCIM_ENABLED", "true")
+	cfg = Config{}
+	if err := readEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Prefers.MCIMEnabledValue() {
+		t.Fatal("environment MCIM enabled = false, want true")
+	}
+}
+
+func TestNetworkConfigDefaultsAndTOML(t *testing.T) {
+	defaults := Config{}
+	if got := defaults.Downloads.FileConcurrencyValue(); got != DefaultFileConcurrency {
+		t.Fatalf("default file concurrency = %d, want %d", got, DefaultFileConcurrency)
+	}
+	if got := defaults.Downloads.ConcurrentDownloadsValue(); got != DefaultConcurrentDownloads {
+		t.Fatalf("default concurrent downloads = %d, want %d", got, DefaultConcurrentDownloads)
+	}
+	if got := defaults.API.RequestsPerSecondValue(); got != 0 {
+		t.Fatalf("default API rate = %d, want unlimited", got)
+	}
+
+	var cfg Config
+	if _, err := toml.Decode(`
+[downloads]
+file_concurrency = 8
+concurrent_downloads = 3
+[api]
+requests_per_second = 12
+`, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Downloads.FileConcurrencyValue() != 8 || cfg.Downloads.ConcurrentDownloadsValue() != 3 {
+		t.Fatalf("downloads = %#v", cfg.Downloads)
+	}
+	if cfg.API.RequestsPerSecondValue() != 12 {
+		t.Fatalf("API = %#v", cfg.API)
+	}
+}
+
+func TestLoggingConfigTOMLAndEnvironment(t *testing.T) {
+	var cfg Config
+	if _, err := toml.Decode(`
+[logging]
+disabled = true
+force_file = true
+`, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Logging.Disabled || !cfg.Logging.ForceFile {
+		t.Fatalf("logging TOML = %#v", cfg.Logging)
+	}
+
+	t.Setenv("LOGGING_DISABLED", "true")
+	t.Setenv("LOGGING_FORCE_FILE", "true")
+	cfg = Config{}
+	if err := readEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Logging.Disabled || !cfg.Logging.ForceFile {
+		t.Fatalf("logging env = %#v", cfg.Logging)
+	}
+}
+
+func TestLoadLoggingReadsFileAndEnvironmentOnly(t *testing.T) {
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := os.WriteFile(filepath.Join(dir, configFileName), []byte(`
+[logging]
+disabled = true
+force_file = false
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LOGGING_FORCE_FILE", "true")
+
+	loggingConfig, err := LoadLogging()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loggingConfig.Disabled || !loggingConfig.ForceFile {
+		t.Fatalf("logging bootstrap = %#v", loggingConfig)
+	}
+}
+
+func TestNetworkConfigReadsPrefixedEnvironment(t *testing.T) {
+	t.Setenv("DOWNLOADS_FILE_CONCURRENCY", "6")
+	t.Setenv("DOWNLOADS_CONCURRENT_DOWNLOADS", "2")
+	t.Setenv("API_REQUESTS_PER_SECOND", "9")
+
+	var cfg Config
+	if err := readEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Downloads.FileConcurrency != 6 || cfg.Downloads.ConcurrentDownloads != 2 || cfg.API.RequestsPerSecond != 9 {
+		t.Fatalf("config = %#v", cfg)
+	}
+}

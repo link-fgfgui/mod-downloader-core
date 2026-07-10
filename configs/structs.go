@@ -108,6 +108,7 @@ type Preferences struct {
 	AnimationsEnabled           *bool         `toml:"animations_enabled" json:"animations_enabled"`
 	AnimationDurationMultiplier float64       `toml:"animation_duration_multiplier" json:"animation_duration_multiplier" env:"ANIMATION_DURATION_MULTIPLIER"`
 	AutoScanUnusedDependencies  *bool         `toml:"auto_scan_unused_dependencies" json:"auto_scan_unused_dependencies"`
+	MCIMEnabled                 bool          `toml:"mcim_enabled" json:"mcim_enabled" env:"MCIM_ENABLED"`
 }
 
 const (
@@ -154,6 +155,10 @@ func (p Preferences) AutoScanUnusedDependenciesValue() bool {
 	return *p.AutoScanUnusedDependencies
 }
 
+func (p Preferences) MCIMEnabledValue() bool {
+	return p.MCIMEnabled
+}
+
 func NormalizeAnimationDurationMultiplier(value float64) float64 {
 	if math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
 		return DefaultAnimationDurationMultiplier
@@ -173,8 +178,51 @@ type RuntimeConfig struct {
 	CacheDir         string `toml:"cache_dir" json:"cacheDir" env:"MOD_DOWNLOADER_CACHE_DIR"`
 }
 
+const (
+	DefaultFileConcurrency     = 4
+	DefaultConcurrentDownloads = 1
+)
+
+type DownloadConfig struct {
+	FileConcurrency     int `toml:"file_concurrency" json:"fileConcurrency" env:"FILE_CONCURRENCY"`
+	ConcurrentDownloads int `toml:"concurrent_downloads" json:"concurrentDownloads" env:"CONCURRENT_DOWNLOADS"`
+}
+
+func (c DownloadConfig) FileConcurrencyValue() int {
+	if c.FileConcurrency <= 0 {
+		return DefaultFileConcurrency
+	}
+	return c.FileConcurrency
+}
+
+func (c DownloadConfig) ConcurrentDownloadsValue() int {
+	if c.ConcurrentDownloads <= 0 {
+		return DefaultConcurrentDownloads
+	}
+	return c.ConcurrentDownloads
+}
+
+type APIConfig struct {
+	RequestsPerSecond int `toml:"requests_per_second" json:"requestsPerSecond" env:"REQUESTS_PER_SECOND"`
+}
+
+type LoggingConfig struct {
+	Disabled  bool `toml:"disabled" json:"disabled" env:"DISABLED"`
+	ForceFile bool `toml:"force_file" json:"forceFile" env:"FORCE_FILE"`
+}
+
+func (c APIConfig) RequestsPerSecondValue() int {
+	if c.RequestsPerSecond < 0 {
+		return 0
+	}
+	return c.RequestsPerSecond
+}
+
 type Config struct {
-	Keys    APIKeys       `toml:"keys" json:"keys" env-prefix:"KEYS_"`
-	Prefers Preferences   `toml:"preferences" json:"preferences" env-prefix:"PREFERS_"`
-	Runtime RuntimeConfig `toml:"runtime" json:"runtime"`
+	Keys      APIKeys        `toml:"keys" json:"keys" env-prefix:"KEYS_"`
+	Prefers   Preferences    `toml:"preferences" json:"preferences" env-prefix:"PREFERS_"`
+	Runtime   RuntimeConfig  `toml:"runtime" json:"runtime"`
+	Downloads DownloadConfig `toml:"downloads" json:"downloads" env-prefix:"DOWNLOADS_"`
+	API       APIConfig      `toml:"api" json:"api" env-prefix:"API_"`
+	Logging   LoggingConfig  `toml:"logging" json:"logging" env-prefix:"LOGGING_"`
 }

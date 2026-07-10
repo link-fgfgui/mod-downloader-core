@@ -3,14 +3,39 @@ package minecraft
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"testing"
 
 	structs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
+
+func TestFileHashesUsesRawSHA1AndWhitespaceNormalizedFingerprint(t *testing.T) {
+	raw := []byte("abc \t\ndef\r")
+	path := filepath.Join(t.TempDir(), "mod.jar")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gotSHA1, gotFingerprint := FileHashes(path)
+	wantSHA1 := sha1.Sum(raw)
+	if gotSHA1 != hex.EncodeToString(wantSHA1[:]) {
+		t.Fatalf("SHA1 = %q, want %q", gotSHA1, hex.EncodeToString(wantSHA1[:]))
+	}
+
+	normalizedPath := filepath.Join(t.TempDir(), "normalized.jar")
+	if err := os.WriteFile(normalizedPath, []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, normalizedFingerprint := FileHashes(normalizedPath)
+	if gotFingerprint == 0 || gotFingerprint != normalizedFingerprint {
+		t.Fatalf("fingerprints = %d/%d, want same non-zero value", gotFingerprint, normalizedFingerprint)
+	}
+}
 
 func TestParseFabricNestedJarsRecursively(t *testing.T) {
 	grandchild := testJar(t, map[string][]byte{
@@ -80,6 +105,8 @@ func TestParseFabricRequiredDependencies(t *testing.T) {
 	}
 	got := dependencyIDs(mods[0].Dependencies)
 	want := []string{"fabric-api", "cloth-config"}
+	sort.Strings(got)
+	sort.Strings(want)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dependencies = %#v, want %#v", got, want)
 	}

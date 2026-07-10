@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/modbridge"
 	"github.com/link-fgfgui/mod-downloader-core/models"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 	structs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
@@ -50,8 +50,30 @@ func TestLocalModsInDirScansExplicitModsDir(t *testing.T) {
 	}
 }
 
+func TestRefreshSelectedVersionModsPersistsRefreshedSnapshot(t *testing.T) {
+	_, modsDir := setupSelectedLocalModInstance(t)
+	svc := New(Options{})
+	if got := svc.RefreshSelectedVersionMods(); len(got.Mods) != 0 {
+		t.Fatalf("initial mods = %#v, want none", got.Mods)
+	}
+
+	writeFabricJar(t, filepath.Join(modsDir, "refreshed.jar"))
+	refreshed := svc.RefreshSelectedVersionMods()
+	if len(refreshed.Mods) != 1 || refreshed.Mods[0].ID != "example" {
+		t.Fatalf("refreshed mods = %#v, want scanned mod", refreshed.Mods)
+	}
+	selected := svc.GetSelectedVersion()
+	if len(selected.Mods) != 1 || selected.Mods[0].ID != "example" {
+		t.Fatalf("selected mods after refresh = %#v, want scanned mod", selected.Mods)
+	}
+}
+
 func TestApplyLocalModBatchOperationDisableEnableInvertDelete(t *testing.T) {
 	root, modsDir := setupSelectedLocalModInstance(t)
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(storage.Close)
 	enabled := filepath.Join(modsDir, "enabled.jar")
 	disabled := filepath.Join(modsDir, "disabled.jar.disabled")
 	removed := filepath.Join(modsDir, "remove.jar")
@@ -96,6 +118,11 @@ func TestApplyLocalModBatchOperationDisableEnableInvertDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertMissing(t, removed)
+
+	stats := svc.GetUsageStats()
+	if stats.ModsEnabled != 2 || stats.ModsDisabled != 2 || stats.ModsDeleted != 1 {
+		t.Fatalf("local mod usage stats = %#v", stats)
+	}
 }
 
 func TestApplyLocalModBatchOperationDeduplicatesPaths(t *testing.T) {
@@ -149,10 +176,10 @@ func TestApplyLocalModBatchOperationRejectsMissingOutsideAndCollision(t *testing
 }
 
 func TestEnrichModMetadataPrefersOnlineDisplayFields(t *testing.T) {
-	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(database.Close)
+	t.Cleanup(storage.Close)
 
 	project := models.ModProject{
 		Platform:   "Modrinth",
@@ -162,14 +189,16 @@ func TestEnrichModMetadataPrefersOnlineDisplayFields(t *testing.T) {
 		IconURL:    "https://example.com/icon.png",
 		Categories: []string{"library", "magic"},
 	}
-	if err := database.UpsertModPlatform(project); err != nil {
+	if err := storage.UpsertModPlatform(project); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.SetPlatformVersions("Modrinth", "project-1", []models.ModVersion{{
+	if err := storage.SetPlatformVersions("Modrinth", "project-1", []models.ModVersion{{
 		ID:        "version-1",
 		VersionID: "version-1",
 		ProjectID: "project-1",
 		Platform:  "Modrinth",
+		Version:   "1.0.1+online",
+		FileName:  "online-project-1.0.1.jar",
 		SHA1:      "abc123",
 	}}); err != nil {
 		t.Fatal(err)
@@ -195,7 +224,44 @@ func TestEnrichModMetadataPrefersOnlineDisplayFields(t *testing.T) {
 	if got.OnlineName != "Online Project" || got.IconURL != "https://example.com/icon.png" || got.OnlinePlatform != "Modrinth" || got.OnlineProjectID != "project-1" || got.OnlineSlug != "online-project" {
 		t.Fatalf("online fields = %#v", got)
 	}
+	if got.OnlineVersion != "1.0.1+online" || got.OnlineVersionID != "version-1" || got.OnlineFileName != "online-project-1.0.1.jar" {
+		t.Fatalf("online version fields = %#v", got)
+	}
 	assertStringSlice(t, got.Categories, []string{"library", "magic"})
+}
+
+func TestApplyResolvedModMetadataClearsLoadingWithoutMatch(t *testing.T) {
+	mods := []structs.ModInfo{{
+		ID: "local", SHA1: "ABC123", OnlineMetadataLoading: true,
+	}, {
+		ID: "unrelated", SHA1: "other", OnlineMetadataLoading: false,
+	}}
+	updated, changed := applyResolvedModMetadata(mods, map[string]uint32{"abc123": 42}, nil, nil)
+	if !changed || updated[0].OnlineMetadataLoading {
+		t.Fatalf("pending metadata was not cleared: changed=%v mods=%#v", changed, updated)
+	}
+	if mods[0].OnlineMetadataLoading != true {
+		t.Fatalf("input slice was mutated: %#v", mods)
+	}
+	if updated[1].ID != mods[1].ID || updated[1].SHA1 != mods[1].SHA1 || updated[1].OnlineMetadataLoading != mods[1].OnlineMetadataLoading {
+		t.Fatalf("unrelated mod changed: %#v", updated[1])
+	}
+}
+
+func TestApplyResolvedModMetadataAppliesMatchAndClearsLoading(t *testing.T) {
+	mods := []structs.ModInfo{{ID: "local", Version: "jar-version", SHA1: "abc123", OnlineMetadataLoading: true}}
+	updated, changed := applyResolvedModMetadata(
+		mods,
+		map[string]uint32{"abc123": 42},
+		map[string]models.ModProject{"abc123": {Platform: "CurseForge", ProjectID: "123", Title: "Online"}},
+		map[string]models.ModVersion{"abc123": {ID: "456", Version: "online-version"}},
+	)
+	if !changed || updated[0].OnlineMetadataLoading || updated[0].OnlineName != "Online" || updated[0].OnlineVersionID != "456" {
+		t.Fatalf("resolved metadata = changed=%v mods=%#v", changed, updated)
+	}
+	if updated[0].Version != "jar-version" {
+		t.Fatalf("local version changed: %#v", updated[0])
+	}
 }
 
 func assertStringSlice(t *testing.T, got []string, want []string) {

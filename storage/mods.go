@@ -1,4 +1,4 @@
-package database
+package storage
 
 import (
 	"sort"
@@ -85,6 +85,26 @@ type FavoriteListContents struct {
 	ListID string             `json:"listId"`
 	Mods   []FavoriteModEntry `json:"mods"`
 	Refs   []FavoriteListRef  `json:"refs,omitempty"`
+}
+
+type UsageStatKey string
+
+const (
+	UsageStatDownloadsCompleted UsageStatKey = "downloads_completed"
+	UsageStatModsEnabled        UsageStatKey = "mods_enabled"
+	UsageStatModsDisabled       UsageStatKey = "mods_disabled"
+	UsageStatModsDeleted        UsageStatKey = "mods_deleted"
+	UsageStatFavoritesAdded     UsageStatKey = "favorites_added"
+	UsageStatPackwizExports     UsageStatKey = "packwiz_exports"
+)
+
+type UsageStats struct {
+	DownloadsCompleted int64 `json:"downloadsCompleted"`
+	ModsEnabled        int64 `json:"modsEnabled"`
+	ModsDisabled       int64 `json:"modsDisabled"`
+	ModsDeleted        int64 `json:"modsDeleted"`
+	FavoritesAdded     int64 `json:"favoritesAdded"`
+	PackwizExports     int64 `json:"packwizExports"`
 }
 
 type ModPlatformVersionScope struct {
@@ -503,6 +523,110 @@ func GetVersionBySHA1(platform, sha1 string) (models.ModVersion, bool) {
 		return models.ModVersion{}, false
 	}
 	return best, true
+}
+
+func GetLocalMetadataMissCheckedAt(provider, identity string) (int64, bool) {
+	d, err := readyDB()
+	if err != nil {
+		return 0, false
+	}
+	key := makeLocalMetadataMissKey(provider, identity)
+	if key.Provider == "" || key.Identity == "" {
+		return 0, false
+	}
+
+	var checkedAt int64
+	var found bool
+	err = d.view(func(state *cacheState) error {
+		checkedAt, found = state.LocalMetadataMisses[key]
+		return nil
+	})
+	return checkedAt, err == nil && found
+}
+
+func SetLocalMetadataMisses(provider string, identities []string, checkedAt int64) error {
+	d, err := readyDB()
+	if err != nil {
+		return err
+	}
+	if checkedAt <= 0 {
+		return nil
+	}
+	keys := make([]localMetadataMissKey, 0, len(identities))
+	seen := make(map[localMetadataMissKey]struct{}, len(identities))
+	for _, identity := range identities {
+		key := makeLocalMetadataMissKey(provider, identity)
+		if key.Provider == "" || key.Identity == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	return d.update(func(state *cacheState, pool *stringPool) error {
+		for _, key := range keys {
+			key.Provider = pool.Intern(key.Provider)
+			key.Identity = pool.Intern(key.Identity)
+			state.LocalMetadataMisses[key] = checkedAt
+		}
+		return nil
+	})
+}
+
+func makeLocalMetadataMissKey(provider, identity string) localMetadataMissKey {
+	return localMetadataMissKey{
+		Provider: strings.ToLower(strings.TrimSpace(provider)),
+		Identity: strings.ToLower(strings.TrimSpace(identity)),
+	}
+}
+
+func GetMinecraftReleaseVersions() ([]string, int64) {
+	d, err := readyDB()
+	if err != nil {
+		return nil, 0
+	}
+	var versions []string
+	var updatedAt int64
+	if err := d.view(func(state *cacheState) error {
+		versions = copyStringSlice(state.MinecraftReleases)
+		updatedAt = state.MinecraftReleasesAt
+		return nil
+	}); err != nil {
+		return nil, 0
+	}
+	return versions, updatedAt
+}
+
+func SetMinecraftReleaseVersions(versions []string, updatedAt int64) error {
+	d, err := readyDB()
+	if err != nil {
+		return err
+	}
+	if len(versions) == 0 || updatedAt <= 0 {
+		return nil
+	}
+	return d.update(func(state *cacheState, pool *stringPool) error {
+		state.MinecraftReleases = make([]string, 0, len(versions))
+		seen := make(map[string]struct{}, len(versions))
+		for _, version := range versions {
+			version = strings.TrimSpace(version)
+			if version == "" {
+				continue
+			}
+			if _, ok := seen[version]; ok {
+				continue
+			}
+			seen[version] = struct{}{}
+			state.MinecraftReleases = append(state.MinecraftReleases, pool.Intern(version))
+		}
+		state.MinecraftReleasesAt = updatedAt
+		return nil
+	})
 }
 
 // --- mod platform versions ---
@@ -1092,6 +1216,55 @@ func DeleteFavoriteMod(listID, platform, modID, mcVersion, modLoader string) (bo
 		logging.Info("favorite mod deleted", "listID", key.ListID, "platform", key.Platform, "modID", key.ModID)
 	}
 	return deleted, nil
+}
+
+func IncrementUsageStat(key UsageStatKey, delta int64) error {
+	if delta <= 0 || !validUsageStatKey(key) {
+		return nil
+	}
+	d, err := readyUserDB()
+	if err != nil {
+		return err
+	}
+	if err := d.incrementUsageStat(key, delta); err != nil {
+		logging.Error("increment usage stat failed", "key", key, "delta", delta, "error", err)
+		return err
+	}
+	return nil
+}
+
+func GetUsageStats() UsageStats {
+	d, err := readyUserDB()
+	if err != nil {
+		return UsageStats{}
+	}
+	values, err := d.usageStatValues()
+	if err != nil {
+		logging.Error("list usage stats failed", "error", err)
+		return UsageStats{}
+	}
+	return UsageStats{
+		DownloadsCompleted: values[UsageStatDownloadsCompleted],
+		ModsEnabled:        values[UsageStatModsEnabled],
+		ModsDisabled:       values[UsageStatModsDisabled],
+		ModsDeleted:        values[UsageStatModsDeleted],
+		FavoritesAdded:     values[UsageStatFavoritesAdded],
+		PackwizExports:     values[UsageStatPackwizExports],
+	}
+}
+
+func validUsageStatKey(key UsageStatKey) bool {
+	switch key {
+	case UsageStatDownloadsCompleted,
+		UsageStatModsEnabled,
+		UsageStatModsDisabled,
+		UsageStatModsDeleted,
+		UsageStatFavoritesAdded,
+		UsageStatPackwizExports:
+		return true
+	default:
+		return false
+	}
 }
 
 func ListFavoriteMods(listID string) []FavoriteMod {

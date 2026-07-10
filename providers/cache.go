@@ -1,9 +1,9 @@
 package providers
 
 import (
-	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/logging"
 	"github.com/link-fgfgui/mod-downloader-core/models"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
 	"strings"
 )
 
@@ -14,7 +14,7 @@ func GetProjectByID(id string) (models.ModProject, bool) {
 		return models.ModProject{}, false
 	}
 
-	return database.GetModPlatform(platform, projectID)
+	return storage.GetModPlatform(platform, projectID)
 }
 
 func GetProjectsByIDs(ids []string) []models.ModProject {
@@ -40,7 +40,7 @@ func GetVersionByID(platform, projectID, versionID string) (models.ModVersion, b
 		return models.ModVersion{}, false
 	}
 
-	versions, err := database.GetPlatformVersions(platform, projectID)
+	versions, err := storage.GetPlatformVersions(platform, projectID)
 	if err != nil || len(versions) == 0 {
 		return models.ModVersion{}, false
 	}
@@ -62,7 +62,7 @@ func GetVersionsByProject(platform, projectID string) []models.ModVersion {
 		return nil
 	}
 
-	versions, err := database.GetPlatformVersions(platform, projectID)
+	versions, err := storage.GetPlatformVersions(platform, projectID)
 	if err != nil || len(versions) == 0 {
 		return nil
 	}
@@ -71,7 +71,7 @@ func GetVersionsByProject(platform, projectID string) []models.ModVersion {
 }
 
 func StoreProject(project models.ModProject) error {
-	return database.UpsertModPlatform(project)
+	return storage.UpsertModPlatform(project)
 }
 
 func StoreVersion(version models.ModVersion) error {
@@ -82,7 +82,7 @@ func StoreVersion(version models.ModVersion) error {
 		return nil
 	}
 
-	return database.SetPlatformVersions(platform, projectID, []models.ModVersion{version})
+	return storage.SetPlatformVersions(platform, projectID, []models.ModVersion{version})
 }
 
 func StoreVersions(platform, projectID string, versions []models.ModVersion) error {
@@ -93,5 +93,5 @@ func StoreVersions(platform, projectID string, versions []models.ModVersion) err
 		return nil
 	}
 
-	return database.SetPlatformVersions(platform, projectID, versions)
+	return storage.SetPlatformVersions(platform, projectID, versions)
 }

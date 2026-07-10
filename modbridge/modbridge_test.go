@@ -7,20 +7,20 @@ import (
 	"testing"
 	"time"
 
-	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/models"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 	mcstructs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
 
 func openModbridgeTestDB(t *testing.T) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "mods.gob.zst")
-	if err := database.OpenAt(path); err != nil {
+	path := filepath.Join(t.TempDir(), storage.CacheFileName)
+	if err := storage.OpenAt(path); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(database.Close)
+	t.Cleanup(storage.Close)
 }
 
 func TestFindVersionByID(t *testing.T) {
@@ -35,6 +35,29 @@ func TestFindVersionByID(t *testing.T) {
 	}
 	if _, ok := FindVersionByID(versions, "missing"); ok {
 		t.Fatal("FindVersionByID() found missing version")
+	}
+}
+
+func TestApplyPlatformMetadataToModInfoPreservesJarVersion(t *testing.T) {
+	info := ApplyPlatformMetadataToModInfo(mcstructs.ModInfo{
+		ID:      "jar-id",
+		Name:    "Jar Name",
+		Version: "1.0.0-local",
+	}, models.ModProject{
+		Platform:  "Modrinth",
+		ProjectID: "project-1",
+		Title:     "Online Name",
+	}, models.ModVersion{
+		VersionID: "online-version-id",
+		Version:   "1.0.1-online",
+		FileName:  "online-name-1.0.1.jar",
+	})
+
+	if info.ID != "jar-id" || info.Name != "Jar Name" || info.Version != "1.0.0-local" {
+		t.Fatalf("local metadata changed: %#v", info)
+	}
+	if info.OnlineVersion != "1.0.1-online" || info.OnlineVersionID != "online-version-id" || info.OnlineFileName != "online-name-1.0.1.jar" {
+		t.Fatalf("online version metadata = %#v", info)
 	}
 }
 
@@ -196,7 +219,7 @@ func TestIncompatibleConflictsCachedFindsInstalledDependency(t *testing.T) {
 	global.ClearLocalMods()
 	t.Cleanup(global.ClearLocalMods)
 
-	if err := database.SetPlatformVersionSnapshot("Modrinth", "main", []models.ModVersion{{
+	if err := storage.SetPlatformVersionSnapshot("Modrinth", "main", []models.ModVersion{{
 		ID:           "main-version",
 		VersionID:    "main-version",
 		Platform:     "Modrinth",
@@ -209,10 +232,10 @@ func TestIncompatibleConflictsCachedFindsInstalledDependency(t *testing.T) {
 			DependencyProjectID: "bad",
 			DependencyType:      "incompatible",
 		}},
-	}}, time.Now().Unix(), []database.ModPlatformVersionScope{{MinecraftVersion: "1.21.1", ModLoader: "fabric"}}); err != nil {
+	}}, time.Now().Unix(), []storage.ModPlatformVersionScope{{MinecraftVersion: "1.21.1", ModLoader: "fabric"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.SetPlatformVersionSnapshot("Modrinth", "bad", []models.ModVersion{{
+	if err := storage.SetPlatformVersionSnapshot("Modrinth", "bad", []models.ModVersion{{
 		ID:           "bad-version",
 		VersionID:    "bad-version",
 		Platform:     "Modrinth",
@@ -222,7 +245,7 @@ func TestIncompatibleConflictsCachedFindsInstalledDependency(t *testing.T) {
 		GameVersions: []string{"1.21.1"},
 		Loaders:      []string{"fabric"},
 		ModIDs:       []string{"badmod"},
-	}}, time.Now().Unix(), []database.ModPlatformVersionScope{{MinecraftVersion: "1.21.1", ModLoader: "fabric"}}); err != nil {
+	}}, time.Now().Unix(), []storage.ModPlatformVersionScope{{MinecraftVersion: "1.21.1", ModLoader: "fabric"}}); err != nil {
 		t.Fatal(err)
 	}
 	global.UpsertLocalMod(mcstructs.ModInfo{
@@ -254,9 +277,9 @@ func TestAnalyzeBatchIncompatibleConflictsGroupsBySelectedMod(t *testing.T) {
 	global.ClearLocalMods()
 	t.Cleanup(global.ClearLocalMods)
 
-	scope := []database.ModPlatformVersionScope{{MinecraftVersion: "1.21.1", ModLoader: "fabric"}}
+	scope := []storage.ModPlatformVersionScope{{MinecraftVersion: "1.21.1", ModLoader: "fabric"}}
 	now := time.Now().Unix()
-	if err := database.SetPlatformVersionSnapshot("Modrinth", "main", []models.ModVersion{{
+	if err := storage.SetPlatformVersionSnapshot("Modrinth", "main", []models.ModVersion{{
 		ID:        "main-version",
 		VersionID: "main-version",
 		Platform:  "Modrinth",
@@ -270,7 +293,7 @@ func TestAnalyzeBatchIncompatibleConflictsGroupsBySelectedMod(t *testing.T) {
 	}}, now, scope); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.SetPlatformVersionSnapshot("Modrinth", "clean", []models.ModVersion{{
+	if err := storage.SetPlatformVersionSnapshot("Modrinth", "clean", []models.ModVersion{{
 		ID:           "clean-version",
 		VersionID:    "clean-version",
 		Platform:     "Modrinth",
@@ -280,7 +303,7 @@ func TestAnalyzeBatchIncompatibleConflictsGroupsBySelectedMod(t *testing.T) {
 	}}, now, scope); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.SetPlatformVersionSnapshot("Modrinth", "bad", []models.ModVersion{{
+	if err := storage.SetPlatformVersionSnapshot("Modrinth", "bad", []models.ModVersion{{
 		ID:           "bad-version",
 		VersionID:    "bad-version",
 		Platform:     "Modrinth",
@@ -338,12 +361,12 @@ func TestResolveVersionModIDsReturnsNilForUnknownVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		database.Close()
+		storage.Close()
 		if err := os.Chdir(oldwd); err != nil {
 			t.Fatal(err)
 		}
 	})
-	if err := database.OpenAt(filepath.Join(tmp, "mods.gob.zst")); err != nil {
+	if err := storage.OpenAt(filepath.Join(tmp, storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
 

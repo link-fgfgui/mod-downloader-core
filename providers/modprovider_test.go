@@ -1,11 +1,192 @@
 package providers
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	modrinth "codeberg.org/jmansfield/go-modrinth/modrinth"
+	"github.com/link-fgfgui/mod-downloader-core/global"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
+	curseforge "github.com/sjet47/go-curseforge"
+	cfAPI "github.com/sjet47/go-curseforge/api"
 	cfSchema "github.com/sjet47/go-curseforge/schema"
 )
+
+type providerRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn providerRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func TestResolveMetadataByLocalFilesFallsBackToCurseForgeFingerprint(t *testing.T) {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(storage.Close)
+	const fingerprint = uint32(3456789012)
+	transport := providerRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body string
+		switch req.URL.Path {
+		case "/v1/fingerprints/432":
+			var input struct {
+				Fingerprints []uint32 `json:"fingerprints"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&input); err != nil {
+				t.Fatal(err)
+			}
+			if len(input.Fingerprints) != 1 || input.Fingerprints[0] != fingerprint {
+				t.Fatalf("fingerprints request = %#v", input.Fingerprints)
+			}
+			body = `{"data":{"isCacheBuilt":true,"exactMatches":[{"id":123,"file":{"id":456,"gameId":432,"modId":123,"displayName":"CF Version","fileName":"cf-mod.jar","downloadUrl":"https://edge.forgecdn.net/files/cf-mod.jar","gameVersions":["1.21.1","Fabric"],"fileFingerprint":3456789012}}]}}`
+		case "/v1/mods":
+			body = `{"data":[{"id":123,"gameId":432,"name":"CF Mod","slug":"cf-mod","summary":"From CurseForge","classId":6,"logo":{"thumbnailUrl":"https://example.com/cf.png"},"categories":[{"name":"Technology","slug":"technology"}]}]}`
+		default:
+			t.Fatalf("unexpected CurseForge request path %q", req.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})
+	previous := global.GetCurseForgeClient()
+	previousModrinth := global.GetModrinthClient()
+	global.SetCurseForgeClient(&curseforge.Client{API: cfAPI.New(transport)})
+	global.SetModrinthClient(nil)
+	t.Cleanup(func() {
+		global.SetCurseForgeClient(previous)
+		global.SetModrinthClient(previousModrinth)
+	})
+
+	projects, versions := ResolveMetadataByLocalFiles(map[string]uint32{"abc123": fingerprint})
+	project, ok := projects["abc123"]
+	if !ok || project.Platform != "CurseForge" || project.ProjectID != "123" || project.Title != "CF Mod" {
+		t.Fatalf("resolved project = %#v, %v", project, ok)
+	}
+	version, ok := versions["abc123"]
+	if !ok || version.ID != "456" || version.SHA1 != "abc123" || version.FileName != "cf-mod.jar" {
+		t.Fatalf("resolved version = %#v, %v", version, ok)
+	}
+	if cached, ok := storage.GetVersionBySHA1("curseforge", "abc123"); !ok || cached.ID != "456" {
+		t.Fatalf("cached version = %#v, %v", cached, ok)
+	}
+}
+
+func TestStopBackgroundTasksWaitsAndRejectsNewWork(t *testing.T) {
+	StartBackgroundTasks()
+	t.Cleanup(StartBackgroundTasks)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	startBackgroundTask(func() {
+		close(started)
+		<-release
+	})
+	<-started
+	go func() {
+		StopBackgroundTasks()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+		t.Fatal("background wait returned before task completion")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("background wait did not return")
+	}
+	rejected := make(chan struct{}, 1)
+	startBackgroundTask(func() { rejected <- struct{}{} })
+	select {
+	case <-rejected:
+		t.Fatal("background work accepted after stop")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestResolveMetadataByLocalFilesCachesProviderMiss(t *testing.T) {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(storage.Close)
+	const fingerprint = uint32(123456789)
+	requests := 0
+	transport := providerRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"data":{"isCacheBuilt":true,"exactMatches":[]}}`)),
+			Request:    req,
+		}, nil
+	})
+	previousCurseForge := global.GetCurseForgeClient()
+	previousModrinth := global.GetModrinthClient()
+	global.SetCurseForgeClient(&curseforge.Client{API: cfAPI.New(transport)})
+	global.SetModrinthClient(nil)
+	t.Cleanup(func() {
+		global.SetCurseForgeClient(previousCurseForge)
+		global.SetModrinthClient(previousModrinth)
+	})
+
+	files := map[string]uint32{"abc123": fingerprint}
+	ResolveMetadataByLocalFiles(files)
+	ResolveMetadataByLocalFiles(files)
+	if requests != 1 {
+		t.Fatalf("fingerprint requests = %d, want 1", requests)
+	}
+	if _, ok := storage.GetLocalMetadataMissCheckedAt("curseforge", "123456789"); !ok {
+		t.Fatal("CurseForge miss was not cached")
+	}
+	if err := storage.SetLocalMetadataMisses("curseforge", []string{"123456789"}, time.Now().Add(-localMetadataMissTTL-time.Minute).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	ResolveMetadataByLocalFiles(files)
+	if requests != 2 {
+		t.Fatalf("fingerprint requests after TTL = %d, want 2", requests)
+	}
+}
+
+func TestResolveMetadataByLocalFilesDoesNotCacheProviderError(t *testing.T) {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(storage.Close)
+	const fingerprint = uint32(987654321)
+	requests := 0
+	transport := providerRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		requests++
+		return nil, errors.New("temporary provider failure")
+	})
+	previousCurseForge := global.GetCurseForgeClient()
+	previousModrinth := global.GetModrinthClient()
+	global.SetCurseForgeClient(&curseforge.Client{API: cfAPI.New(transport)})
+	global.SetModrinthClient(nil)
+	t.Cleanup(func() {
+		global.SetCurseForgeClient(previousCurseForge)
+		global.SetModrinthClient(previousModrinth)
+	})
+
+	files := map[string]uint32{"abc123": fingerprint}
+	ResolveMetadataByLocalFiles(files)
+	ResolveMetadataByLocalFiles(files)
+	if requests != 2 {
+		t.Fatalf("fingerprint requests = %d, want retry after error", requests)
+	}
+	if _, ok := storage.GetLocalMetadataMissCheckedAt("curseforge", "987654321"); ok {
+		t.Fatal("provider error was cached as a miss")
+	}
+}
 
 func TestCurseForgeLogoURL(t *testing.T) {
 	tests := []struct {

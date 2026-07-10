@@ -14,12 +14,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/logging"
 	"github.com/link-fgfgui/mod-downloader-core/minecraft"
 	"github.com/link-fgfgui/mod-downloader-core/models"
 	"github.com/link-fgfgui/mod-downloader-core/providers"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 	mcstructs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
@@ -60,7 +60,7 @@ func ResolveVersions(req appstructs.ModDownloadRequest) []models.ModVersion {
 		}
 	}
 
-	if pin, ok := database.GetPinnedMod(platform, projectID, req.MinecraftVersion, req.ModLoader); ok {
+	if pin, ok := storage.GetPinnedMod(platform, projectID, req.MinecraftVersion, req.ModLoader); ok {
 		if version, found := FindVersionByID(providers.ListMatchingProjectVersions(req.Result, req.MinecraftVersion, req.ModLoader), pin.VersionID); found {
 			return []models.ModVersion{version}
 		}
@@ -468,7 +468,7 @@ func VersionModIDs(version models.ModVersion, modLoader string) []string {
 		return modIDs
 	}
 	if version.ID != "" {
-		if persisted, err := database.GetVersionModIDs(version.ID); err == nil {
+		if persisted, err := storage.GetVersionModIDs(version.ID); err == nil {
 			if modIDs := normalizedModIDs(persisted); len(modIDs) > 0 {
 				return modIDs
 			}
@@ -489,7 +489,7 @@ func VersionModIDs(version models.ModVersion, modLoader string) []string {
 	modIDs := minecraft.PrimaryModIDs(mods)
 
 	if len(modIDs) > 0 && version.ID != "" {
-		if err := database.SetVersionModIDs(version.ID, modIDs); err != nil {
+		if err := storage.SetVersionModIDs(version.ID, modIDs); err != nil {
 			logging.Warn("persist version mod IDs failed", "platformVersionID", version.ID, "error", err)
 		}
 	}
@@ -503,7 +503,7 @@ func PersistVersionModIDs(platformVersionID string, modIDs []string) bool {
 	if platformVersionID == "" || len(modIDs) == 0 {
 		return false
 	}
-	if err := database.SetVersionModIDs(platformVersionID, modIDs); err != nil {
+	if err := storage.SetVersionModIDs(platformVersionID, modIDs); err != nil {
 		logging.Warn("persist version mod IDs failed", "platformVersionID", platformVersionID, "error", err)
 		return false
 	}
@@ -522,7 +522,7 @@ func resolveVersionModIDs(version models.ModVersion) []string {
 	if version.ID == "" {
 		return nil
 	}
-	persisted, err := database.GetVersionModIDs(version.ID)
+	persisted, err := storage.GetVersionModIDs(version.ID)
 	if err != nil {
 		logging.Warn("get version mod IDs from DB failed", "platformVersionID", version.ID, "error", err)
 		return nil
@@ -641,7 +641,7 @@ func PlatformMetadataForSHA1(sha1 string) (models.ModProject, models.ModVersion,
 	var version models.ModVersion
 	var ok bool
 	for _, platform := range []string{"curseforge", "modrinth"} {
-		if version, ok = database.GetVersionBySHA1(platform, sha1); ok {
+		if version, ok = storage.GetVersionBySHA1(platform, sha1); ok {
 			break
 		}
 	}
@@ -649,16 +649,16 @@ func PlatformMetadataForSHA1(sha1 string) (models.ModProject, models.ModVersion,
 		return models.ModProject{}, models.ModVersion{}, false
 	}
 
-	project, found := database.GetModPlatform(version.Platform, version.ProjectID)
+	project, found := storage.GetModPlatform(version.Platform, version.ProjectID)
 	if !found {
 		return models.ModProject{}, version, false
 	}
 	return project, version, true
 }
 
-// ApplyProjectMetadataToModInfo adds online display metadata to local JAR metadata
+// ApplyPlatformMetadataToModInfo adds online display metadata to local JAR metadata
 // without replacing local identity fields used by install/status logic.
-func ApplyProjectMetadataToModInfo(info mcstructs.ModInfo, project models.ModProject) mcstructs.ModInfo {
+func ApplyPlatformMetadataToModInfo(info mcstructs.ModInfo, project models.ModProject, version models.ModVersion) mcstructs.ModInfo {
 	if title := strings.TrimSpace(project.Title); title != "" {
 		info.OnlineName = title
 	}
@@ -674,21 +674,42 @@ func ApplyProjectMetadataToModInfo(info mcstructs.ModInfo, project models.ModPro
 	if slug := strings.TrimSpace(project.Slug); slug != "" {
 		info.OnlineSlug = slug
 	}
+	if onlineVersion := strings.TrimSpace(version.Version); onlineVersion != "" {
+		info.OnlineVersion = onlineVersion
+	}
+	if versionID := strings.TrimSpace(version.ID); versionID != "" {
+		info.OnlineVersionID = versionID
+	} else if versionID := strings.TrimSpace(version.VersionID); versionID != "" {
+		info.OnlineVersionID = versionID
+	}
+	if fileName := strings.TrimSpace(version.FileName); fileName != "" {
+		info.OnlineFileName = fileName
+	}
 	if categories := models.NormalizeCategories(project.Categories); len(categories) > 0 {
 		info.Categories = categories
 	}
 	return info
 }
 
-func ApplyProjectMetadataToModInfos(mods []mcstructs.ModInfo, project models.ModProject) []mcstructs.ModInfo {
+func ApplyPlatformMetadataToModInfos(mods []mcstructs.ModInfo, project models.ModProject, version models.ModVersion) []mcstructs.ModInfo {
 	if len(mods) == 0 {
 		return nil
 	}
 	out := make([]mcstructs.ModInfo, len(mods))
 	for i, mod := range mods {
-		out[i] = ApplyProjectMetadataToModInfo(mod, project)
+		out[i] = ApplyPlatformMetadataToModInfo(mod, project, version)
 	}
 	return out
+}
+
+// ApplyProjectMetadataToModInfo preserves the project-only API for existing core consumers.
+func ApplyProjectMetadataToModInfo(info mcstructs.ModInfo, project models.ModProject) mcstructs.ModInfo {
+	return ApplyPlatformMetadataToModInfo(info, project, models.ModVersion{})
+}
+
+// ApplyProjectMetadataToModInfos preserves the project-only API for existing core consumers.
+func ApplyProjectMetadataToModInfos(mods []mcstructs.ModInfo, project models.ModProject) []mcstructs.ModInfo {
+	return ApplyPlatformMetadataToModInfos(mods, project, models.ModVersion{})
 }
 
 // parseRemoteModJar downloads a JAR via HTTP range requests and parses its mod metadata.

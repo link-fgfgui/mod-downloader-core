@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/logging"
 	"github.com/link-fgfgui/mod-downloader-core/modbridge"
 	"github.com/link-fgfgui/mod-downloader-core/models"
 	"github.com/link-fgfgui/mod-downloader-core/packwiz"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 )
 
@@ -24,7 +24,7 @@ type favoriteExportScope struct {
 }
 
 func (s *Service) FavoriteListPackwizDefaultFilename(listID string) string {
-	if list, ok := database.GetFavoriteList(listID); ok {
+	if list, ok := storage.GetFavoriteList(listID); ok {
 		return packwiz.SafeArchiveName(list.Name)
 	}
 	return packwiz.SafeArchiveName("packwiz-export")
@@ -39,11 +39,15 @@ func (s *Service) ExportFavoriteListPackwizZipForScope(listID, destinationPath, 
 	if listID == "" {
 		return ExportFavoriteListPackwizResult{}, fmt.Errorf("favorite list is required")
 	}
-	list, ok := database.GetFavoriteList(listID)
+	list, ok := storage.GetFavoriteList(listID)
 	if !ok {
 		return ExportFavoriteListPackwizResult{}, fmt.Errorf("favorite list not found")
 	}
-	items := database.ListFavoriteMods(listID)
+	contents := storage.ListFavoriteContents(listID)
+	items := make([]storage.FavoriteMod, 0, len(contents.Mods))
+	for _, entry := range contents.Mods {
+		items = append(items, entry.FavoriteMod)
+	}
 	if len(items) == 0 {
 		return ExportFavoriteListPackwizResult{}, fmt.Errorf("favorite list is empty")
 	}
@@ -82,10 +86,11 @@ func (s *Service) ExportFavoriteListPackwizZipForScope(listID, destinationPath, 
 		return ExportFavoriteListPackwizResult{}, err
 	}
 	logging.Info("favorite list exported as packwiz zip", "listID", listID, "path", destinationPath, "modCount", len(mods))
+	_ = storage.IncrementUsageStat(storage.UsageStatPackwizExports, 1)
 	return ExportFavoriteListPackwizResult{Path: destinationPath}, nil
 }
 
-func favoritePackwizItemsForScope(items []database.FavoriteMod, minecraftVersion, modLoader string) []database.FavoriteMod {
+func favoritePackwizItemsForScope(items []storage.FavoriteMod, minecraftVersion, modLoader string) []storage.FavoriteMod {
 	minecraftVersion = strings.TrimSpace(minecraftVersion)
 	modLoader = strings.ToLower(strings.TrimSpace(modLoader))
 	if minecraftVersion == "" && modLoader == "" {
@@ -94,7 +99,7 @@ func favoritePackwizItemsForScope(items []database.FavoriteMod, minecraftVersion
 	if minecraftVersion == "" || modLoader == "" {
 		return nil
 	}
-	filtered := make([]database.FavoriteMod, 0, len(items))
+	filtered := make([]storage.FavoriteMod, 0, len(items))
 	for _, item := range items {
 		if strings.TrimSpace(item.MinecraftVersion) == minecraftVersion && strings.ToLower(strings.TrimSpace(item.ModLoader)) == modLoader {
 			filtered = append(filtered, item)
@@ -103,7 +108,7 @@ func favoritePackwizItemsForScope(items []database.FavoriteMod, minecraftVersion
 	return filtered
 }
 
-func favoritePackwizScope(items []database.FavoriteMod) (favoriteExportScope, error) {
+func favoritePackwizScope(items []storage.FavoriteMod) (favoriteExportScope, error) {
 	var scope favoriteExportScope
 	for _, item := range items {
 		mcVersion := strings.TrimSpace(item.MinecraftVersion)
@@ -129,7 +134,7 @@ func favoritePackwizScope(items []database.FavoriteMod) (favoriteExportScope, er
 	return scope, nil
 }
 
-func resolveFavoritePackwizVersion(item database.FavoriteMod, scope favoriteExportScope) (models.ModVersion, bool) {
+func resolveFavoritePackwizVersion(item storage.FavoriteMod, scope favoriteExportScope) (models.ModVersion, bool) {
 	platform := strings.ToLower(strings.TrimSpace(item.Platform))
 	projectID := strings.TrimSpace(item.ModID)
 	ref := models.ProjectKey(platform, projectID)
@@ -152,7 +157,7 @@ func resolveFavoritePackwizVersion(item database.FavoriteMod, scope favoriteExpo
 	})
 }
 
-func packwizModFromFavorite(item database.FavoriteMod, version models.ModVersion) (packwiz.Mod, error) {
+func packwizModFromFavorite(item storage.FavoriteMod, version models.ModVersion) (packwiz.Mod, error) {
 	name := favoriteDisplayName(item)
 	version.FileName = strings.TrimSpace(version.FileName)
 	version.DownloadURL = strings.TrimSpace(version.DownloadURL)
@@ -235,7 +240,7 @@ func ensureZipPath(value string) string {
 	return value + ".zip"
 }
 
-func favoriteDisplayName(item database.FavoriteMod) string {
+func favoriteDisplayName(item storage.FavoriteMod) string {
 	return firstNonEmptyString(item.Title, item.Slug, item.ModID, item.ID, "favorite mod")
 }
 

@@ -5,12 +5,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/link-fgfgui/mod-downloader-core/downloader/filetransfer"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/logging"
 	"github.com/link-fgfgui/mod-downloader-core/minecraft"
@@ -18,13 +23,12 @@ import (
 	"github.com/link-fgfgui/mod-downloader-core/models"
 	"github.com/link-fgfgui/mod-downloader-core/providers"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
-
-	"github.com/cavaliergopher/grab/v3"
 )
 
 type Events struct {
-	OnQueueState     func(appstructs.DownloadQueueState)
-	OnDownloadFailed func(appstructs.DownloadFailedEvent)
+	OnQueueState        func(appstructs.DownloadQueueState)
+	OnDownloadFailed    func(appstructs.DownloadFailedEvent)
+	OnDownloadCompleted func()
 }
 
 type downloadJob struct {
@@ -37,11 +41,18 @@ type downloadJob struct {
 	MinecraftVersion  string
 	ModLoader         string
 	CurseForgeAPIKey  string
+	UserAgent         string
 	AutoAttempt       int
 	IncompatiblePaths []global.LocalModFilePath
 	visited           map[string]bool
 	dependenciesDone  bool
+	blockedBy         []string
 	cancel            context.CancelFunc
+}
+
+type Config struct {
+	FileConcurrency     int
+	ConcurrentDownloads int
 }
 
 type retryableDownloadJob struct {
@@ -67,6 +78,8 @@ var (
 	downloadProgressPollInterval   = time.Second
 	refreshMatchingProjectVersions = providers.RefreshMatchingProjectVersions
 	installStatusPrecise           = modbridge.InstallStatusPrecise
+	newFileTransferBackend         = func() filetransfer.Backend { return filetransfer.NewStdlibBackend(nil) }
+	downloadFileConcurrency        atomic.Int64
 )
 
 var downloadQueue = struct {
@@ -79,16 +92,44 @@ var downloadQueue = struct {
 	cancelRequested   map[string]struct{}
 	finalizedCancel   map[string]struct{}
 	restartRequested  map[string]struct{}
-	running           bool
-	current           *downloadJob
+	workers           int
+	maxConcurrent     int
+	current           map[string]downloadJob
 }{}
 
-func QueueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, curseForgeAPIKey string, events ...Events) appstructs.ModDownloadResult {
-	return queueModDownload(ctx, req, curseForgeAPIKey, make(map[string]bool), firstEvents(events))
+func Configure(config Config) {
+	fileConcurrency := config.FileConcurrency
+	if fileConcurrency <= 0 {
+		fileConcurrency = filetransfer.DefaultConcurrency
+	}
+	concurrentDownloads := config.ConcurrentDownloads
+	if concurrentDownloads <= 0 {
+		concurrentDownloads = 1
+	}
+	downloadFileConcurrency.Store(int64(fileConcurrency))
+	downloadQueue.Lock()
+	downloadQueue.maxConcurrent = concurrentDownloads
+	downloadQueue.Unlock()
 }
 
-func queueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, curseForgeAPIKey string, visited map[string]bool, events Events) appstructs.ModDownloadResult {
-	job, result, ok := buildDownloadJob(req, curseForgeAPIKey, visited)
+func configuredFileConcurrency() int {
+	value := int(downloadFileConcurrency.Load())
+	if value <= 0 {
+		return filetransfer.DefaultConcurrency
+	}
+	return value
+}
+
+func QueueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, curseForgeAPIKey string, events ...Events) appstructs.ModDownloadResult {
+	return QueueModDownloadWithUserAgent(ctx, req, curseForgeAPIKey, "", events...)
+}
+
+func QueueModDownloadWithUserAgent(ctx context.Context, req appstructs.ModDownloadRequest, curseForgeAPIKey string, userAgent string, events ...Events) appstructs.ModDownloadResult {
+	return queueModDownload(ctx, req, curseForgeAPIKey, userAgent, make(map[string]bool), firstEvents(events))
+}
+
+func queueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, curseForgeAPIKey string, userAgent string, visited map[string]bool, events Events) appstructs.ModDownloadResult {
+	job, result, ok := buildDownloadJob(req, curseForgeAPIKey, userAgent, visited)
 	if !ok {
 		return result
 	}
@@ -96,7 +137,7 @@ func queueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, cu
 	return result
 }
 
-func buildDownloadJob(req appstructs.ModDownloadRequest, curseForgeAPIKey string, visited map[string]bool) (downloadJob, appstructs.ModDownloadResult, bool) {
+func buildDownloadJob(req appstructs.ModDownloadRequest, curseForgeAPIKey string, userAgent string, visited map[string]bool) (downloadJob, appstructs.ModDownloadResult, bool) {
 	req.MinecraftVersion = strings.TrimSpace(req.MinecraftVersion)
 	req.ModLoader = strings.ToLower(strings.TrimSpace(req.ModLoader))
 	req.ProjectID = strings.TrimSpace(req.ProjectID)
@@ -138,6 +179,7 @@ func buildDownloadJob(req appstructs.ModDownloadRequest, curseForgeAPIKey string
 			MinecraftVersion: req.MinecraftVersion,
 			ModLoader:        req.ModLoader,
 			CurseForgeAPIKey: curseForgeAPIKey,
+			UserAgent:        normalizedUserAgent(userAgent),
 			visited:          visited,
 		}, appstructs.ModDownloadResult{
 			Queued:    true,
@@ -170,12 +212,11 @@ func CancelDownload(ctx context.Context, id string, events ...Events) bool {
 	}
 
 	var cancel context.CancelFunc
-	if downloadQueue.current != nil && downloadQueue.current.ID == id {
-		job := *downloadQueue.current
+	if job, ok := downloadQueue.current[id]; ok {
 		cancel = job.cancel
 		if cancel != nil {
 			appendRetryableDownloadLocked(job, "canceled", "canceled")
-			downloadQueue.current = nil
+			delete(downloadQueue.current, id)
 			if downloadQueue.finalizedCancel == nil {
 				downloadQueue.finalizedCancel = make(map[string]struct{})
 			}
@@ -222,8 +263,8 @@ func RetryDownload(ctx context.Context, id string, events ...Events) bool {
 	}
 
 	var cancel context.CancelFunc
-	if downloadQueue.current != nil && downloadQueue.current.ID == id {
-		cancel = downloadQueue.current.cancel
+	if job, ok := downloadQueue.current[id]; ok {
+		cancel = job.cancel
 		if cancel != nil {
 			if downloadQueue.restartRequested == nil {
 				downloadQueue.restartRequested = make(map[string]struct{})
@@ -279,6 +320,10 @@ func ClearOptionalDependencyReminders(events ...Events) bool {
 }
 
 func InstallOptionalDependencies(ctx context.Context, id string, curseForgeAPIKey string, events ...Events) []appstructs.ModDownloadResult {
+	return InstallOptionalDependenciesWithUserAgent(ctx, id, curseForgeAPIKey, "", events...)
+}
+
+func InstallOptionalDependenciesWithUserAgent(ctx context.Context, id string, curseForgeAPIKey string, userAgent string, events ...Events) []appstructs.ModDownloadResult {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil
@@ -307,7 +352,7 @@ func InstallOptionalDependencies(ctx context.Context, id string, curseForgeAPIKe
 	results := make([]appstructs.ModDownloadResult, 0, len(requests))
 	visited := make(map[string]bool)
 	for _, req := range requests {
-		result := queueModDownload(ctx, req, curseForgeAPIKey, visited, eventSink)
+		result := queueModDownload(ctx, req, curseForgeAPIKey, userAgent, visited, eventSink)
 		results = append(results, result)
 	}
 	return results
@@ -333,9 +378,9 @@ func GetDownloadStates(req appstructs.DownloadStatesRequest, onBackfillComplete 
 func queuedProjectKeys() map[string]bool {
 	downloadQueue.Lock()
 	defer downloadQueue.Unlock()
-	keys := make(map[string]bool, len(downloadQueue.pending)+1)
-	if downloadQueue.current != nil {
-		if k := providers.ProjectReferenceFromSearchResult(downloadQueue.current.Result); k != "" {
+	keys := make(map[string]bool, len(downloadQueue.pending)+len(downloadQueue.current))
+	for _, job := range downloadQueue.current {
+		if k := providers.ProjectReferenceFromSearchResult(job.Result); k != "" {
 			keys[k] = true
 		}
 	}
@@ -370,16 +415,26 @@ func enqueueDownload(ctx context.Context, job downloadJob, events Events) {
 	downloadQueue.Lock()
 	assignDownloadIDLocked(&job)
 	downloadQueue.pending = append(downloadQueue.pending, job)
-	shouldStart := !downloadQueue.running
-	if shouldStart {
-		downloadQueue.running = true
-	}
+	workersToStart := reserveDownloadWorkersLocked()
 	downloadQueue.Unlock()
 
 	emitDownloadQueueState(events)
-	if shouldStart {
+	for range workersToStart {
 		go runDownloadQueue(ctx, events)
 	}
+}
+
+func reserveDownloadWorkersLocked() int {
+	limit := downloadQueue.maxConcurrent
+	if limit <= 0 {
+		limit = 1
+	}
+	count := min(limit-downloadQueue.workers, len(downloadQueue.pending))
+	if count <= 0 {
+		return 0
+	}
+	downloadQueue.workers += count
+	return count
 }
 
 func prependPendingDownloads(jobs []downloadJob, events Events) {
@@ -411,22 +466,26 @@ func runDownloadQueue(ctx context.Context, events Events) {
 	}
 	for {
 		downloadQueue.Lock()
-		if len(downloadQueue.pending) == 0 {
-			downloadQueue.running = false
+		job, ok := takeNextDownloadLocked()
+		if !ok {
+			downloadQueue.workers--
 			downloadQueue.Unlock()
 			emitDownloadQueueState(events)
 			return
 		}
-		job := downloadQueue.pending[0]
-		downloadQueue.pending = downloadQueue.pending[1:]
 		jobCtx, cancel := context.WithCancel(parentCtx)
 		job.cancel = cancel
-		runningJob := job
-		downloadQueue.current = &runningJob
+		if downloadQueue.current == nil {
+			downloadQueue.current = make(map[string]downloadJob)
+		}
+		downloadQueue.current[job.ID] = job
 		downloadQueue.Unlock()
 		emitDownloadQueueState(events)
 
-		err := downloadModJob(jobCtx, job, events)
+		installed, err := downloadModJob(jobCtx, job, events)
+		if installed && events.OnDownloadCompleted != nil {
+			events.OnDownloadCompleted()
+		}
 		if consumeFinalizedDownloadCancel(job.ID) {
 			cancel()
 			emitDownloadQueueState(events)
@@ -453,42 +512,73 @@ func runDownloadQueue(ctx context.Context, events Events) {
 		}
 		cancel()
 		downloadQueue.Lock()
-		if downloadQueue.current != nil && downloadQueue.current.ID == job.ID {
-			downloadQueue.current = nil
-		}
+		delete(downloadQueue.current, job.ID)
 		downloadQueue.Unlock()
 		emitDownloadQueueState(events)
 	}
 }
 
-func downloadModJob(ctx context.Context, job downloadJob, events Events) error {
+func takeNextDownloadLocked() (downloadJob, bool) {
+	for index, job := range downloadQueue.pending {
+		if downloadJobBlockedLocked(job) {
+			continue
+		}
+		downloadQueue.pending = append(downloadQueue.pending[:index], downloadQueue.pending[index+1:]...)
+		return job, true
+	}
+	return downloadJob{}, false
+}
+
+func downloadJobBlockedLocked(job downloadJob) bool {
+	for _, key := range job.blockedBy {
+		for _, current := range downloadQueue.current {
+			if projectVersionJobKey(current.Version) == key {
+				return true
+			}
+		}
+		for _, pending := range downloadQueue.pending {
+			if pending.ID != job.ID && projectVersionJobKey(pending.Version) == key {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func downloadModJob(ctx context.Context, job downloadJob, events Events) (bool, error) {
 	if err := os.MkdirAll(job.TargetDir, 0o755); err != nil {
-		return err
+		return false, err
 	}
 	if !job.dependenciesDone {
 		dependencies, preparedJob, err := prepareDownloadDependencies(ctx, job, events)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if err := ctxErr(ctx); err != nil {
-			return err
+			return false, err
 		}
 		if len(dependencies) > 0 {
+			preparedJob.blockedBy = make([]string, 0, len(dependencies))
+			for _, dependency := range dependencies {
+				if key := projectVersionJobKey(dependency.Version); key != "" {
+					preparedJob.blockedBy = append(preparedJob.blockedBy, key)
+				}
+			}
 			prependPendingDownloads(append(dependencies, preparedJob), events)
-			return errDownloadRequeued
+			return false, errDownloadRequeued
 		}
 		job = preparedJob
 	}
 	archiveIncompatibleModJars(job.IncompatiblePaths)
-	if tryHardlinkInstall(job) {
-		return nil
+	if handled, installed := tryHardlinkInstall(job); handled {
+		return installed, nil
 	}
 	// Try to get mod IDs from platform version (persisted or lazy-parsed via modbridge)
 	modIDs := modbridge.VersionModIDs(job.Version, job.ModLoader)
 	if len(modIDs) > 0 {
 		existing := modbridge.LocalModPathsForModIDs(modIDs, job.InstanceID)
 		if alreadyInstalled(existing, job.Version.SHA1) {
-			return nil
+			return false, nil
 		}
 		return downloadModToTarget(ctx, job, existing)
 	}
@@ -503,10 +593,10 @@ func downloadModJob(ctx context.Context, job downloadJob, events Events) error {
 // SHA1 is always available before download, so this works whether or not mod IDs
 // are resolvable: with mod IDs it links straight to the final path; without them it
 // links to a temp dir, parses locally, then moves to the final path.
-func tryHardlinkInstall(job downloadJob) bool {
+func tryHardlinkInstall(job downloadJob) (bool, bool) {
 	srcPath, ok := global.HardlinkIndexLookup(job.Version.SHA1)
 	if !ok {
-		return false
+		return false, false
 	}
 	finalPath := filepath.Join(job.TargetDir, filepath.Base(srcPath))
 	if job.Version.FileName != "" {
@@ -518,51 +608,51 @@ func tryHardlinkInstall(job downloadJob) bool {
 	if len(modIDs) > 0 {
 		existing = modbridge.LocalModPathsForModIDs(modIDs, job.InstanceID)
 		if alreadyInstalled(existing, job.Version.SHA1) {
-			return true
+			return true, false
 		}
 	}
 
 	if downloadTargetExists(finalPath) && !pathInLocalModPaths(finalPath, existing) {
 		logging.Info("hardlink skipped because target file already exists", "path", finalPath, "versionID", job.Version.ID)
-		return true
+		return true, false
 	}
 	archiveSupersededModJars(existing)
 	if downloadTargetExists(finalPath) {
 		logging.Info("hardlink skipped because target file already exists after archiving", "path", finalPath, "versionID", job.Version.ID)
-		return true
+		return true, false
 	}
 
 	if len(modIDs) > 0 {
 		if err := minecraft.CreateHardLinkOrCopy(srcPath, finalPath); err != nil {
 			logging.Warn("hardlink creation failed, falling back to download", "src", srcPath, "dst", finalPath, "error", err)
-			return false
+			return false, false
 		}
 		logging.Info("mod installed via hardlink/copy", "src", srcPath, "dst", finalPath, "versionID", job.Version.ID)
-		go DiscardFetchFromNetwork(job.Version.DownloadURL, job.CurseForgeAPIKey)
+		go DiscardFetchFromNetwork(job.Version.DownloadURL, job.CurseForgeAPIKey, job.UserAgent)
 		upsertDownloadedMod(finalPath, job)
-		return true
+		return true, true
 	}
 
 	tempDir := filepath.Join(filepath.Dir(job.TargetDir), ".mod-downloader-tmp")
 	if err := os.MkdirAll(tempDir, 0o755); err != nil {
 		logging.Warn("hardlink temp dir creation failed", "error", err)
-		return false
+		return false, false
 	}
 	tempPath := filepath.Join(tempDir, filepath.Base(finalPath))
 	if err := os.Remove(tempPath); err != nil && !os.IsNotExist(err) {
 		logging.Warn("hardlink temp cleanup failed", "path", tempPath, "error", err)
-		return false
+		return false, false
 	}
 	if err := minecraft.CreateHardLinkOrCopy(srcPath, tempPath); err != nil {
 		logging.Warn("hardlink to temp failed, falling back to download", "src", srcPath, "dst", tempPath, "error", err)
-		return false
+		return false, false
 	}
 	sha1 := minecraft.FileSHA1(tempPath)
 	parsedMods := minecraft.ParseModJarWithSHA1(tempPath, sha1, job.ModLoader)
 	if len(parsedMods) == 0 {
 		_ = os.Remove(tempPath)
 		logging.Warn("hardlink source jar has no parseable metadata, falling back to download", "src", srcPath)
-		return false
+		return false, false
 	}
 	// Extract primary (strong-reference) mod IDs only. Mirrors downloadModWithLocalParse.
 	parsedModIDs := minecraft.PrimaryModIDs(parsedMods)
@@ -572,22 +662,22 @@ func tryHardlinkInstall(job downloadJob) bool {
 	parsedExisting := modbridge.LocalModPathsForModIDs(parsedModIDs, job.InstanceID)
 	if alreadyInstalled(parsedExisting, sha1) {
 		_ = os.Remove(tempPath)
-		return true
+		return true, false
 	}
 	archiveSupersededModJars(parsedExisting)
 	if downloadTargetExists(finalPath) {
 		logging.Info("hardlink skipped because target file already exists", "path", finalPath, "versionID", job.Version.ID)
 		_ = os.Remove(tempPath)
-		return true
+		return true, false
 	}
 	if err := os.Rename(tempPath, finalPath); err != nil {
 		_ = os.Remove(tempPath)
-		return false
+		return false, false
 	}
 	logging.Info("mod installed via hardlink (local parse path)", "src", srcPath, "dst", finalPath, "versionID", job.Version.ID)
-	go DiscardFetchFromNetwork(job.Version.DownloadURL, job.CurseForgeAPIKey)
+	go DiscardFetchFromNetwork(job.Version.DownloadURL, job.CurseForgeAPIKey, job.UserAgent)
 	upsertDownloadedMod(finalPath, job)
-	return true
+	return true, true
 }
 
 // alreadyInstalled checks whether any existing file with the same modId already has the target SHA1.
@@ -662,7 +752,7 @@ func prepareDownloadDependencies(ctx context.Context, job downloadJob, events Ev
 		return nil, job, err
 	}
 	job.dependenciesDone = true
-	dependencies, err := missingRequiredDependencyJobs(ctx, req, version, job.CurseForgeAPIKey, job.visited)
+	dependencies, err := missingRequiredDependencyJobs(ctx, req, version, job.CurseForgeAPIKey, job.UserAgent, job.visited)
 	if err != nil {
 		return nil, job, err
 	}
@@ -681,7 +771,7 @@ func downloadRequestFromJob(job downloadJob) appstructs.ModDownloadRequest {
 	}
 }
 
-func missingRequiredDependencyJobs(ctx context.Context, req appstructs.ModDownloadRequest, version models.ModVersion, curseForgeAPIKey string, visited map[string]bool) ([]downloadJob, error) {
+func missingRequiredDependencyJobs(ctx context.Context, req appstructs.ModDownloadRequest, version models.ModVersion, curseForgeAPIKey string, userAgent string, visited map[string]bool) ([]downloadJob, error) {
 	dependencies := make([]downloadJob, 0)
 	for _, dep := range version.Dependencies {
 		if err := ctxErr(ctx); err != nil {
@@ -706,7 +796,7 @@ func missingRequiredDependencyJobs(ctx context.Context, req appstructs.ModDownlo
 		if err := ctxErr(ctx); err != nil {
 			return nil, err
 		}
-		job, result, ok := buildDownloadJob(depReq, curseForgeAPIKey, visited)
+		job, result, ok := buildDownloadJob(depReq, curseForgeAPIKey, userAgent, visited)
 		if err := ctxErr(ctx); err != nil {
 			return nil, err
 		}
@@ -878,80 +968,42 @@ func isIncompatibleDependency(dep models.ModDependency) bool {
 	return modbridge.IsDependencyType(dep, "incompatible")
 }
 
-func downloadModToTarget(ctx context.Context, job downloadJob, existing []global.LocalModFilePath) error {
-	tempDir := filepath.Join(filepath.Dir(job.TargetDir), ".mod-downloader-tmp")
-	if err := os.MkdirAll(tempDir, 0o755); err != nil {
-		return err
-	}
-
-	client := grab.NewClient()
-	req, err := grab.NewRequest(tempDir, job.Version.DownloadURL)
+func downloadModToTarget(ctx context.Context, job downloadJob, existing []global.LocalModFilePath) (bool, error) {
+	tempPath, err := downloadFileToTemp(ctx, job)
 	if err != nil {
-		return err
-	}
-	if job.Version.FileName != "" {
-		req.Filename = filepath.Join(tempDir, job.Version.FileName)
-	}
-	req = req.WithContext(ctx)
-	setCurseForgeAPIKeyHeader(req, job)
-
-	resp, err := doDownloadWithStallTimeout(ctx, client, req)
-	if err != nil {
-		return err
-	}
-	if resp.Filename == "" {
-		return nil
+		return false, err
 	}
 
-	finalPath := filepath.Join(job.TargetDir, filepath.Base(resp.Filename))
+	finalPath := filepath.Join(job.TargetDir, filepath.Base(tempPath))
 	if downloadTargetExists(finalPath) && !pathInLocalModPaths(finalPath, existing) {
 		logging.Info("download skipped because target file already exists", "path", finalPath, "versionID", job.Version.ID)
-		_ = os.Remove(resp.Filename)
-		return nil
+		_ = os.Remove(tempPath)
+		return false, nil
 	}
 	archiveSupersededModJars(existing)
 	if downloadTargetExists(finalPath) {
 		logging.Info("download skipped because target file already exists after archiving superseded jars", "path", finalPath, "versionID", job.Version.ID)
-		_ = os.Remove(resp.Filename)
-		return nil
+		_ = os.Remove(tempPath)
+		return false, nil
 	}
-	if err := os.Rename(resp.Filename, finalPath); err != nil {
-		return err
+	if err := os.Rename(tempPath, finalPath); err != nil {
+		return false, err
 	}
 	upsertDownloadedMod(finalPath, job)
-	return nil
+	return true, nil
 }
 
-func downloadModWithLocalParse(ctx context.Context, job downloadJob) error {
-	tempDir := filepath.Join(filepath.Dir(job.TargetDir), ".mod-downloader-tmp")
-	if err := os.MkdirAll(tempDir, 0o755); err != nil {
-		return err
-	}
-
-	client := grab.NewClient()
-	req, err := grab.NewRequest(tempDir, job.Version.DownloadURL)
+func downloadModWithLocalParse(ctx context.Context, job downloadJob) (bool, error) {
+	tempPath, err := downloadFileToTemp(ctx, job)
 	if err != nil {
-		return err
-	}
-	if job.Version.FileName != "" {
-		req.Filename = filepath.Join(tempDir, job.Version.FileName)
-	}
-	req = req.WithContext(ctx)
-	setCurseForgeAPIKeyHeader(req, job)
-
-	resp, err := doDownloadWithStallTimeout(ctx, client, req)
-	if err != nil {
-		return err
-	}
-	if resp.Filename == "" {
-		return nil
+		return false, err
 	}
 
-	sha1 := minecraft.FileSHA1(resp.Filename)
-	mods := minecraft.ParseModJarWithSHA1(resp.Filename, sha1, job.ModLoader)
+	sha1 := minecraft.FileSHA1(tempPath)
+	mods := minecraft.ParseModJarWithSHA1(tempPath, sha1, job.ModLoader)
 	if len(mods) == 0 {
-		_ = os.Remove(resp.Filename)
-		return fmt.Errorf("downloaded jar has no parseable mod metadata: %s", filepath.Base(resp.Filename))
+		_ = os.Remove(tempPath)
+		return false, fmt.Errorf("downloaded jar has no parseable mod metadata: %s", filepath.Base(tempPath))
 	}
 
 	// Extract primary (strong-reference) mod IDs only. JIJ / nested-jar entries
@@ -964,22 +1016,22 @@ func downloadModWithLocalParse(ctx context.Context, job downloadJob) error {
 
 	existing := modbridge.LocalModPathsForModIDs(modIDs, job.InstanceID)
 	if alreadyInstalled(existing, sha1) {
-		_ = os.Remove(resp.Filename)
-		return nil
+		_ = os.Remove(tempPath)
+		return false, nil
 	}
 	archiveSupersededModJars(existing)
 
-	finalPath := filepath.Join(job.TargetDir, filepath.Base(resp.Filename))
+	finalPath := filepath.Join(job.TargetDir, filepath.Base(tempPath))
 	if downloadTargetExists(finalPath) {
 		logging.Info("download skipped because target file already exists", "path", finalPath, "versionID", job.Version.ID)
-		_ = os.Remove(resp.Filename)
-		return nil
+		_ = os.Remove(tempPath)
+		return false, nil
 	}
-	if err := os.Rename(resp.Filename, finalPath); err != nil {
-		return err
+	if err := os.Rename(tempPath, finalPath); err != nil {
+		return false, err
 	}
 	upsertDownloadedMod(finalPath, job)
-	return nil
+	return true, nil
 }
 
 func downloadTargetExists(path string) bool {
@@ -999,10 +1051,65 @@ func isCurseForgeCDNURL(url string) bool {
 	return strings.HasPrefix(url, "https://edge.forgecdn.net/files/")
 }
 
-func setCurseForgeAPIKeyHeader(req *grab.Request, job downloadJob) {
+func downloadHeaders(job downloadJob) map[string]string {
+	headers := map[string]string{"User-Agent": normalizedUserAgent(job.UserAgent)}
 	if job.CurseForgeAPIKey != "" && isCurseForgeCDNURL(job.Version.DownloadURL) {
-		req.HTTPRequest.Header.Set("x-api-key", job.CurseForgeAPIKey)
+		headers["x-api-key"] = job.CurseForgeAPIKey
 	}
+	return headers
+}
+
+func downloadFileToTemp(ctx context.Context, job downloadJob) (string, error) {
+	tempDir := filepath.Join(filepath.Dir(job.TargetDir), ".mod-downloader-tmp")
+	if err := os.MkdirAll(tempDir, 0o755); err != nil {
+		return "", err
+	}
+	tempPath := filepath.Join(tempDir, downloadFileName(job))
+	request := filetransfer.Request{
+		URL:               job.Version.DownloadURL,
+		Destination:       tempPath,
+		Headers:           downloadHeaders(job),
+		TempDir:           tempDir,
+		Concurrency:       configuredFileConcurrency(),
+		OverwriteExisting: true,
+	}
+	if _, err := doDownloadWithStallTimeout(ctx, newFileTransferBackend(), request); err != nil {
+		return "", err
+	}
+	return tempPath, nil
+}
+
+func downloadFileName(job downloadJob) string {
+	if name := filepath.Base(strings.TrimSpace(job.Version.FileName)); name != "" && name != "." {
+		return name
+	}
+	parsed, err := url.Parse(strings.TrimSpace(job.Version.DownloadURL))
+	if err == nil {
+		name := pathpkg.Base(parsed.Path)
+		if unescaped, unescapeErr := url.PathUnescape(name); unescapeErr == nil {
+			name = unescaped
+		}
+		name = filepath.Base(strings.TrimSpace(name))
+		if name != "" && name != "." && name != string(filepath.Separator) {
+			return name
+		}
+	}
+	return "download.jar"
+}
+
+func normalizedUserAgent(userAgent string) string {
+	userAgent = strings.TrimSpace(userAgent)
+	if userAgent == "" {
+		return "mod-downloader/dev"
+	}
+	return userAgent
+}
+
+func firstString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
 }
 
 func pathInLocalModPaths(path string, paths []global.LocalModFilePath) bool {
@@ -1022,7 +1129,7 @@ func pathInLocalModPaths(path string, paths []global.LocalModFilePath) bool {
 
 func upsertDownloadedMod(path string, job downloadJob) {
 	fileName := minecraft.StripJarSuffix(filepath.Base(path))
-	sha1 := minecraft.FileSHA1(path)
+	sha1, fingerprint := minecraft.FileHashes(path)
 	// Parse the downloaded JAR for mod metadata (pure local, no platform merging)
 	r, err := zip.OpenReader(path)
 	if err != nil {
@@ -1042,7 +1149,7 @@ func upsertDownloadedMod(path string, job downloadJob) {
 			logging.Warn("store downloaded mod project metadata failed", "platform", job.Result.Platform, "projectID", job.Result.ProjectID, "error", err)
 		}
 	}
-	mods = modbridge.ApplyProjectMetadataToModInfos(mods, job.Result)
+	mods = modbridge.ApplyPlatformMetadataToModInfos(mods, job.Result, job.Version)
 	global.SetJarMetadata(sha1, mods)
 
 	relPath := path
@@ -1062,6 +1169,7 @@ func upsertDownloadedMod(path string, job downloadJob) {
 		mods[i].FileName = fileName
 		mods[i].Path = relPath
 		mods[i].SHA1 = sha1
+		mods[i].CfFingerprint = fingerprint
 		mods[i].Enabled = true
 		global.UpsertLocalMod(mods[i], job.InstanceID, job.MinecraftVersion, job.ModLoader)
 	}
@@ -1070,13 +1178,15 @@ func upsertDownloadedMod(path string, job downloadJob) {
 func currentDownloadQueueState() appstructs.DownloadQueueState {
 	downloadQueue.Lock()
 	defer downloadQueue.Unlock()
-	running := 0
-	if downloadQueue.current != nil {
-		running = 1
-	}
+	running := len(downloadQueue.current)
 	items := make([]appstructs.DownloadQueueItem, 0, running+len(downloadQueue.pending)+len(downloadQueue.retryable))
-	if downloadQueue.current != nil {
-		item := downloadQueueItemFromJob(*downloadQueue.current, "running", true)
+	currentIDs := make([]string, 0, len(downloadQueue.current))
+	for id := range downloadQueue.current {
+		currentIDs = append(currentIDs, id)
+	}
+	sort.Strings(currentIDs)
+	for _, id := range currentIDs {
+		item := downloadQueueItemFromJob(downloadQueue.current[id], "running", true)
 		item.Retryable = true
 		items = append(items, item)
 	}
@@ -1189,48 +1299,59 @@ func retryStalledDownload(ctx context.Context, job downloadJob, events Events) b
 	return true
 }
 
-func doDownloadWithStallTimeout(ctx context.Context, client *grab.Client, req *grab.Request) (*grab.Response, error) {
+type transferOutcome struct {
+	result filetransfer.Result
+	err    error
+}
+
+func doDownloadWithStallTimeout(ctx context.Context, backend filetransfer.Backend, req filetransfer.Request) (filetransfer.Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	attemptCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	req = req.WithContext(attemptCtx)
-	resp := client.Do(req)
-	if err := waitForDownloadWithStallTimeout(resp, cancel, downloadStallTimeout, downloadProgressPollInterval); err != nil {
-		return resp, err
+	tracker := filetransfer.NewProgressTracker(nil)
+	done := make(chan transferOutcome, 1)
+	go func() {
+		result, err := backend.Download(attemptCtx, req, tracker)
+		done <- transferOutcome{result: result, err: err}
+	}()
+	if downloadStallTimeout <= 0 {
+		outcome := <-done
+		return outcome.result, outcome.err
 	}
-	return resp, nil
-}
-
-func waitForDownloadWithStallTimeout(resp *grab.Response, cancel context.CancelFunc, stallTimeout time.Duration, pollInterval time.Duration) error {
-	if stallTimeout <= 0 {
-		return resp.Err()
-	}
+	pollInterval := downloadProgressPollInterval
 	if pollInterval <= 0 {
 		pollInterval = time.Second
 	}
-
-	lastBytes := resp.BytesComplete()
+	lastBytes := tracker.Snapshot().BytesComplete
 	lastProgress := time.Now()
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
-		case <-resp.Done:
-			return resp.Err()
+		case outcome := <-done:
+			return outcome.result, outcome.err
+		case <-ctx.Done():
+			cancel()
+			<-done
+			return filetransfer.Result{}, ctx.Err()
 		case <-ticker.C:
-			currentBytes := resp.BytesComplete()
+			currentBytes := tracker.Snapshot().BytesComplete
 			if currentBytes > lastBytes {
 				lastBytes = currentBytes
 				lastProgress = time.Now()
 				continue
 			}
-			if time.Since(lastProgress) >= stallTimeout {
+			if time.Since(lastProgress) >= downloadStallTimeout {
+				select {
+				case outcome := <-done:
+					return outcome.result, outcome.err
+				default:
+				}
 				cancel()
-				_ = resp.Err()
-				return errDownloadStalled
+				<-done
+				return filetransfer.Result{}, errDownloadStalled
 			}
 		}
 	}

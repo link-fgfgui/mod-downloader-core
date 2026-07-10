@@ -1,4 +1,4 @@
-package database
+package storage
 
 import (
 	"database/sql"
@@ -94,6 +94,11 @@ func (s *userStore) ensureSchema() error {
 			updated_at INTEGER NOT NULL,
 			UNIQUE(list_id, platform, mod_id, minecraft_version, mod_loader)
 		)`,
+		`CREATE TABLE IF NOT EXISTS usage_stats (
+			key TEXT PRIMARY KEY,
+			value INTEGER NOT NULL DEFAULT 0 CHECK(value >= 0),
+			updated_at INTEGER NOT NULL
+		)`,
 		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, unixepoch())`,
 	}
 	for _, statement := range statements {
@@ -182,116 +187,6 @@ func (s *userStore) columnExists(table, column string) (bool, error) {
 		}
 	}
 	return false, rows.Err()
-}
-
-func (s *userStore) migrateLegacyUserData(state *cacheState) error {
-	if state == nil || (len(state.PinnedMods) == 0 && len(state.FavoriteLists) == 0 && len(state.FavoriteMods) == 0) {
-		return nil
-	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
-	for _, pin := range state.PinnedMods {
-		pin = normalizePinnedMod(pin)
-		if pin.Platform == "" || pin.ModID == "" || pin.VersionID == "" || pin.MinecraftVersion == "" || pin.ModLoader == "" {
-			continue
-		}
-		if pin.ID == "" {
-			pin.ID = NewID()
-		}
-		if _, err := tx.Exec(
-			`INSERT OR IGNORE INTO pinned_mods(id, platform, mod_id, version_id, minecraft_version, mod_loader)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			pin.ID, pin.Platform, pin.ModID, pin.VersionID, pin.MinecraftVersion, pin.ModLoader,
-		); err != nil {
-			return err
-		}
-	}
-
-	for _, list := range state.FavoriteLists {
-		list = normalizeFavoriteList(list)
-		if list.ID == "" || list.Name == "" {
-			continue
-		}
-		if list.CreatedAt == 0 {
-			list.CreatedAt = time.Now().Unix()
-		}
-		if list.UpdatedAt == 0 {
-			list.UpdatedAt = list.CreatedAt
-		}
-		if _, err := tx.Exec(
-			`INSERT OR IGNORE INTO favorite_lists(id, name, created_at, updated_at, sort_order, system)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			list.ID, list.Name, list.CreatedAt, list.UpdatedAt, list.SortOrder, boolToInt(list.System),
-		); err != nil {
-			return err
-		}
-	}
-
-	for _, mod := range state.FavoriteMods {
-		mod = normalizeFavoriteMod(mod)
-		if mod.ListID == "" || mod.Platform == "" || mod.ModID == "" {
-			continue
-		}
-		listExists, err := txFavoriteListExists(tx, mod.ListID)
-		if err != nil {
-			return err
-		}
-		if !listExists {
-			continue
-		}
-		if mod.ID == "" {
-			mod.ID = NewID()
-		}
-		if mod.CreatedAt == 0 {
-			mod.CreatedAt = time.Now().Unix()
-		}
-		if mod.UpdatedAt == 0 {
-			mod.UpdatedAt = mod.CreatedAt
-		}
-		categoriesJSON, err := favoriteCategoriesJSON(mod.Categories)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			`INSERT OR IGNORE INTO favorite_mods(
-				id, list_id, platform, mod_id, version_id, minecraft_version, mod_loader,
-				title, slug, icon_url, description, categories_json, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			mod.ID, mod.ListID, mod.Platform, mod.ModID, mod.VersionID, mod.MinecraftVersion, mod.ModLoader,
-			mod.Title, mod.Slug, mod.IconURL, mod.Description, categoriesJSON, mod.CreatedAt, mod.UpdatedAt,
-		); err != nil {
-			return err
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	state.clearLegacyUserData()
-	return nil
-}
-
-func txFavoriteListExists(tx *sql.Tx, id string) (bool, error) {
-	var value int
-	err := tx.QueryRow(`SELECT 1 FROM favorite_lists WHERE id = ?`, id).Scan(&value)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 func (s *userStore) upsertPinnedMod(p PinnedMod) error {
@@ -1157,6 +1052,36 @@ func favoriteCategoriesJSON(categories []string) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+func (s *userStore) incrementUsageStat(key UsageStatKey, delta int64) error {
+	_, err := s.db.Exec(
+		`INSERT INTO usage_stats(key, value, updated_at) VALUES (?, ?, ?)
+		 ON CONFLICT(key) DO UPDATE SET
+			value = usage_stats.value + excluded.value,
+			updated_at = excluded.updated_at`,
+		string(key), delta, time.Now().Unix(),
+	)
+	return err
+}
+
+func (s *userStore) usageStatValues() (map[UsageStatKey]int64, error) {
+	rows, err := s.db.Query(`SELECT key, value FROM usage_stats`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	values := make(map[UsageStatKey]int64)
+	for rows.Next() {
+		var key UsageStatKey
+		var value int64
+		if err := rows.Scan(&key, &value); err != nil {
+			return nil, err
+		}
+		values[key] = value
+	}
+	return values, rows.Err()
 }
 
 func boolToInt(value bool) int {

@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/logging"
 	"github.com/link-fgfgui/mod-downloader-core/models"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 
 	modrinth "codeberg.org/jmansfield/go-modrinth/modrinth"
@@ -347,6 +347,66 @@ type hashResolveResult struct {
 	versions map[string]models.ModVersion // sha1 → ModVersion
 }
 
+type fingerprintResolveResult struct {
+	projects map[uint32]models.ModProject
+	versions map[uint32]models.ModVersion
+}
+
+func (p curseForgeProvider) resolveProjectsByFingerprints(fingerprints []uint32) (fingerprintResolveResult, error) {
+	client := global.GetCurseForgeClient()
+	if client == nil || len(fingerprints) == 0 {
+		return fingerprintResolveResult{}, nil
+	}
+	values := make([]cfSchema.Fingerprint, 0, len(fingerprints))
+	for _, fingerprint := range fingerprints {
+		if fingerprint != 0 {
+			values = append(values, cfSchema.Fingerprint(fingerprint))
+		}
+	}
+	if len(values) == 0 {
+		return fingerprintResolveResult{}, nil
+	}
+	response, err := client.FingerprintMatchesByGame(cfEnum.MinecraftGameID, values)
+	if err != nil {
+		return fingerprintResolveResult{}, err
+	}
+	modIDSet := make(map[cfSchema.ModID]struct{})
+	for _, match := range response.Data.ExactMatches {
+		if match.File.ModID != 0 {
+			modIDSet[match.File.ModID] = struct{}{}
+		}
+	}
+	modIDs := make([]cfSchema.ModID, 0, len(modIDSet))
+	for modID := range modIDSet {
+		modIDs = append(modIDs, modID)
+	}
+	if len(modIDs) == 0 {
+		return fingerprintResolveResult{}, nil
+	}
+	modsResponse, err := client.Mods(modIDs)
+	if err != nil {
+		return fingerprintResolveResult{}, err
+	}
+	projectsByID := make(map[cfSchema.ModID]models.ModProject, len(modsResponse.Data))
+	for _, mod := range modsResponse.Data {
+		projectsByID[mod.ID] = p.modToModProject(mod)
+	}
+	result := fingerprintResolveResult{
+		projects: make(map[uint32]models.ModProject),
+		versions: make(map[uint32]models.ModVersion),
+	}
+	for _, match := range response.Data.ExactMatches {
+		fingerprint := uint32(match.File.FileFingerprint)
+		project, ok := projectsByID[match.File.ModID]
+		if fingerprint == 0 || !ok {
+			continue
+		}
+		result.projects[fingerprint] = project
+		result.versions[fingerprint] = p.fileToModVersion(match.File)
+	}
+	return result, nil
+}
+
 func (p modrinthProvider) resolveProjectsByHashes(hashes []string) (hashResolveResult, error) {
 	client := global.GetModrinthClient()
 	if client == nil {
@@ -611,19 +671,19 @@ func isFilteredProjectVersionRequest(filter projectVersionFilter) bool {
 	return filter.MinecraftVersion != "" || filter.ModLoader != ""
 }
 
-func projectVersionSnapshotScope(filter projectVersionFilter) database.ModPlatformVersionScope {
+func projectVersionSnapshotScope(filter projectVersionFilter) storage.ModPlatformVersionScope {
 	filter = normalizeProjectVersionFilter(filter)
-	return database.ModPlatformVersionScope{
+	return storage.ModPlatformVersionScope{
 		MinecraftVersion: filter.MinecraftVersion,
 		ModLoader:        filter.ModLoader,
 	}
 }
 
-func projectVersionSnapshotScopes(filter projectVersionFilter) []database.ModPlatformVersionScope {
+func projectVersionSnapshotScopes(filter projectVersionFilter) []storage.ModPlatformVersionScope {
 	if !isFilteredProjectVersionRequest(filter) {
 		return nil
 	}
-	return []database.ModPlatformVersionScope{projectVersionSnapshotScope(filter)}
+	return []storage.ModPlatformVersionScope{projectVersionSnapshotScope(filter)}
 }
 
 func filterProjectVersionsForFilter(versions []models.ModVersion, filter projectVersionFilter) []models.ModVersion {
@@ -677,7 +737,7 @@ func refreshProjectMetadataIfStale(provider modProvider, platform, projectIDOrSl
 		return
 	}
 	for _, r := range results {
-		if err := database.UpsertModPlatform(r); err != nil {
+		if err := storage.UpsertModPlatform(r); err != nil {
 			logging.Error("refresh project metadata failed", "platform", platform, "projectID", projectIDOrSlug, "error", err)
 		}
 	}
@@ -736,14 +796,14 @@ func associateEquivalentPlatformProject(platform, projectID string, versions []m
 
 	switch strings.ToLower(strings.TrimSpace(platform)) {
 	case "curseforge":
-		if match, ok := database.GetLatestProjectBySHA1("Modrinth", latestSHA1); ok && match.ProjectID != "" {
-			if err := database.UpsertPlatformAssociationByProjects(projectID, match.ProjectID); err != nil {
+		if match, ok := storage.GetLatestProjectBySHA1("Modrinth", latestSHA1); ok && match.ProjectID != "" {
+			if err := storage.UpsertPlatformAssociationByProjects(projectID, match.ProjectID); err != nil {
 				logging.Error("associate equivalent platform projects failed", "curseforgeProjectID", projectID, "modrinthProjectID", match.ProjectID, "sha1", latestSHA1, "error", err)
 			}
 		}
 	case "modrinth":
-		if match, ok := database.GetLatestProjectBySHA1("CurseForge", latestSHA1); ok && match.ProjectID != "" {
-			if err := database.UpsertPlatformAssociationByProjects(match.ProjectID, projectID); err != nil {
+		if match, ok := storage.GetLatestProjectBySHA1("CurseForge", latestSHA1); ok && match.ProjectID != "" {
+			if err := storage.UpsertPlatformAssociationByProjects(match.ProjectID, projectID); err != nil {
 				logging.Error("associate equivalent platform projects failed", "curseforgeProjectID", match.ProjectID, "modrinthProjectID", projectID, "sha1", latestSHA1, "error", err)
 			}
 		}
@@ -768,7 +828,7 @@ func getFreshProjectVersionsSnapshot(platform, projectID string, filter projectV
 	if isFilteredProjectVersionRequest(filter) {
 		if updatedAt > 0 && time.Since(time.Unix(updatedAt, 0)) <= projectVersionsSnapshotTTL {
 			updatedAt = record.UpdatedAt
-		} else if ts, ok := database.GetPlatformVersionScopeUpdatedAt(platform, record.ProjectID, projectVersionSnapshotScope(filter)); ok {
+		} else if ts, ok := storage.GetPlatformVersionScopeUpdatedAt(platform, record.ProjectID, projectVersionSnapshotScope(filter)); ok {
 			updatedAt = ts
 		} else {
 			return nil, false
@@ -778,7 +838,7 @@ func getFreshProjectVersionsSnapshot(platform, projectID string, filter projectV
 		return nil, false
 	}
 
-	versions, err := database.GetPlatformVersions(platform, record.ProjectID)
+	versions, err := storage.GetPlatformVersions(platform, record.ProjectID)
 	if err != nil || len(versions) == 0 {
 		if err != nil {
 			logging.Error("read fresh project versions snapshot failed", "platform", platform, "projectID", record.ProjectID, "error", err)
@@ -793,7 +853,7 @@ func getProjectVersionsSnapshot(platform, projectID string, filter projectVersio
 	if !ok {
 		return nil, false
 	}
-	versions, err := database.GetPlatformVersions(platform, record.ProjectID)
+	versions, err := storage.GetPlatformVersions(platform, record.ProjectID)
 	if err != nil || len(versions) == 0 {
 		if err != nil {
 			logging.Error("read stale project versions snapshot failed", "platform", platform, "projectID", record.ProjectID, "error", err)
@@ -808,10 +868,10 @@ func getProjectSnapshotPlatform(platform, projectIDOrSlug string) (models.ModPro
 	if projectIDOrSlug == "" {
 		return models.ModProject{}, false
 	}
-	if record, ok := database.GetModPlatform(platform, projectIDOrSlug); ok {
+	if record, ok := storage.GetModPlatform(platform, projectIDOrSlug); ok {
 		return record, true
 	}
-	return database.GetModPlatformBySlug(platform, projectIDOrSlug)
+	return storage.GetModPlatformBySlug(platform, projectIDOrSlug)
 }
 
 func saveProjectVersionsSnapshot(platform, requestedProject string, projectID string, versions []models.ModVersion, filter projectVersionFilter) error {
@@ -827,10 +887,10 @@ func saveProjectVersionsSnapshot(platform, requestedProject string, projectID st
 	if requestedProject != "" && !strings.EqualFold(requestedProject, projectID) {
 		meta.Slug = requestedProject
 	}
-	if err := database.UpsertModPlatform(meta); err != nil {
+	if err := storage.UpsertModPlatform(meta); err != nil {
 		return err
 	}
-	return database.SetPlatformVersionSnapshot(platform, projectID, versions, time.Now().Unix(), projectVersionSnapshotScopes(filter))
+	return storage.SetPlatformVersionSnapshot(platform, projectID, versions, time.Now().Unix(), projectVersionSnapshotScopes(filter))
 }
 
 func projectIDFromVersions(versions []models.ModVersion, fallback string) string {

@@ -2,6 +2,7 @@ package appcore
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,11 +11,170 @@ import (
 	"time"
 
 	"github.com/link-fgfgui/mod-downloader-core/configs"
-	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/global"
+	"github.com/link-fgfgui/mod-downloader-core/logging"
 	"github.com/link-fgfgui/mod-downloader-core/minecraft"
 	"github.com/link-fgfgui/mod-downloader-core/models"
+	"github.com/link-fgfgui/mod-downloader-core/providers"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
 )
+
+func TestLoadMinecraftReleaseVersionsUsesFreshCache(t *testing.T) {
+	t.Cleanup(func() { global.SetMinecraftReleaseVersions(nil) })
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(storage.Close)
+	if err := storage.SetMinecraftReleaseVersions([]string{"1.21.1"}, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	previousFetch := fetchMinecraftReleaseVersions
+	requests := 0
+	fetchMinecraftReleaseVersions = func() ([]string, error) {
+		requests++
+		return []string{"future"}, nil
+	}
+	t.Cleanup(func() { fetchMinecraftReleaseVersions = previousFetch })
+
+	if err := loadMinecraftReleaseVersions(); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 0 {
+		t.Fatalf("manifest requests = %d, want 0", requests)
+	}
+	if got := global.GetMinecraftReleaseVersions(); len(got) != 1 || got[0] != "1.21.1" {
+		t.Fatalf("global releases = %#v", got)
+	}
+}
+
+func TestDownloadCompletionEventAndUsageStat(t *testing.T) {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(storage.Close)
+	events := make(chan Event, 1)
+	svc := New(Options{OnEvent: func(event Event) { events <- event }})
+	svc.downloadEvents().OnDownloadCompleted()
+	if got := svc.GetUsageStats().DownloadsCompleted; got != 1 {
+		t.Fatalf("downloads completed = %d, want 1", got)
+	}
+	select {
+	case event := <-events:
+		if event.Kind != EventDownloadCompleted || event.Payload != nil {
+			t.Fatalf("completion event = %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("download completion event not emitted")
+	}
+}
+
+func TestStartupBootstrapsForcedFileLogging(t *testing.T) {
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		logging.Close()
+		storage.Close()
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := os.WriteFile(filepath.Join(dir, "mod-downloader.toml"), []byte(`
+[logging]
+force_file = true
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := New(Options{Runtime: RuntimeOptions{WorkDir: dir, CachePath: filepath.Join(dir, storage.CacheFileName)}})
+	if err := svc.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	logging.Info("bootstrap file marker")
+	svc.Close()
+	data, err := os.ReadFile(filepath.Join(dir, logging.DefaultFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "load config started") || !strings.Contains(string(data), "bootstrap file marker") {
+		t.Fatalf("bootstrap log = %q", data)
+	}
+}
+
+func TestStartupBootstrapsDisabledLoggingWithoutCreatingFile(t *testing.T) {
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		logging.Close()
+		storage.Close()
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := os.WriteFile(filepath.Join(dir, "mod-downloader.toml"), []byte(`
+[logging]
+disabled = true
+force_file = true
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := New(Options{Runtime: RuntimeOptions{WorkDir: dir, CachePath: filepath.Join(dir, storage.CacheFileName)}})
+	if err := svc.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	logging.Error("hidden bootstrap marker")
+	svc.Close()
+	if _, err := os.Stat(filepath.Join(dir, logging.DefaultFileName)); !os.IsNotExist(err) {
+		t.Fatalf("disabled bootstrap log stat error = %v, want not exist", err)
+	}
+}
+
+func TestLoadMinecraftReleaseVersionsRefreshesExpiredCacheAndFallsBackOnError(t *testing.T) {
+	t.Cleanup(func() { global.SetMinecraftReleaseVersions(nil) })
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(storage.Close)
+	expiredAt := time.Now().Add(-minecraftReleaseCacheTTL - time.Minute).Unix()
+	if err := storage.SetMinecraftReleaseVersions([]string{"stale"}, expiredAt); err != nil {
+		t.Fatal(err)
+	}
+	previousFetch := fetchMinecraftReleaseVersions
+	t.Cleanup(func() { fetchMinecraftReleaseVersions = previousFetch })
+
+	fetchMinecraftReleaseVersions = func() ([]string, error) {
+		return nil, errors.New("temporary manifest failure")
+	}
+	if err := loadMinecraftReleaseVersions(); err != nil {
+		t.Fatalf("stale fallback returned error: %v", err)
+	}
+	if got := global.GetMinecraftReleaseVersions(); len(got) != 1 || got[0] != "stale" {
+		t.Fatalf("stale global releases = %#v", got)
+	}
+
+	fetchMinecraftReleaseVersions = func() ([]string, error) {
+		return []string{"1.22", "1.21.1"}, nil
+	}
+	if err := loadMinecraftReleaseVersions(); err != nil {
+		t.Fatal(err)
+	}
+	got, updatedAt := storage.GetMinecraftReleaseVersions()
+	if len(got) != 2 || got[0] != "1.22" || updatedAt <= expiredAt {
+		t.Fatalf("refreshed release cache = %#v, %d", got, updatedAt)
+	}
+}
 
 func TestCoreDoesNotDependOnWailsRuntime(t *testing.T) {
 	packages := []string{
@@ -43,7 +203,7 @@ func TestStartupNoConfigFileUsesEnvironmentOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		database.Close()
+		storage.Close()
 		global.SetMinecraftDir("")
 		if err := os.Chdir(oldwd); err != nil {
 			t.Fatal(err)
@@ -60,7 +220,7 @@ minecraft_dir = "/from-file"
 	}
 	t.Setenv("KEYS_CF_API_KEY", "from-env")
 
-	cachePath := filepath.Join(t.TempDir(), "cache", database.CacheFileName)
+	cachePath := filepath.Join(t.TempDir(), "cache", storage.CacheFileName)
 	svc := New(Options{Runtime: RuntimeOptions{
 		NoConfigFile: true,
 		CachePath:    cachePath,
@@ -81,10 +241,10 @@ minecraft_dir = "/from-file"
 }
 
 func TestFavoriteServiceWorkflow(t *testing.T) {
-	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(database.Close)
+	t.Cleanup(storage.Close)
 
 	svc := New(Options{})
 	list := svc.CreateFavoriteList("Performance")
@@ -97,7 +257,7 @@ func TestFavoriteServiceWorkflow(t *testing.T) {
 		t.Fatalf("renamed list = %#v", renamed)
 	}
 
-	mod := svc.AddFavoriteMod(database.FavoriteMod{
+	mod := svc.AddFavoriteMod(storage.FavoriteMod{
 		ListID:           list.ID,
 		Platform:         "Modrinth",
 		ModID:            "Sodium",
@@ -127,15 +287,15 @@ func TestFavoriteServiceWorkflow(t *testing.T) {
 }
 
 func TestFavoriteBulkAddCopiesSelectedMods(t *testing.T) {
-	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(database.Close)
+	t.Cleanup(storage.Close)
 
 	svc := New(Options{})
 	source := svc.CreateFavoriteList("Source")
 	target := svc.CreateFavoriteList("Target")
-	mod := svc.AddFavoriteMod(database.FavoriteMod{
+	mod := svc.AddFavoriteMod(storage.FavoriteMod{
 		ListID:           source.ID,
 		Platform:         "Modrinth",
 		ModID:            "Sodium",
@@ -149,7 +309,7 @@ func TestFavoriteBulkAddCopiesSelectedMods(t *testing.T) {
 
 	result := svc.AddFavoriteModsToLists(FavoriteBulkAddRequest{
 		TargetListIDs: []string{target.ID, "missing", target.ID},
-		Mods:          []database.FavoriteMod{mod},
+		Mods:          []storage.FavoriteMod{mod},
 	})
 	if result.Added != 1 || result.Updated != 0 || result.Skipped != 1 || len(result.Errors) != 1 {
 		t.Fatalf("bulk add result = %#v", result)
@@ -162,7 +322,7 @@ func TestFavoriteBulkAddCopiesSelectedMods(t *testing.T) {
 	mod.Title = "Sodium Updated"
 	result = svc.AddFavoriteModsToLists(FavoriteBulkAddRequest{
 		TargetListIDs: []string{target.ID},
-		Mods:          []database.FavoriteMod{mod},
+		Mods:          []storage.FavoriteMod{mod},
 	})
 	if result.Added != 0 || result.Updated != 1 || result.Skipped != 0 {
 		t.Fatalf("bulk update result = %#v", result)
@@ -171,20 +331,23 @@ func TestFavoriteBulkAddCopiesSelectedMods(t *testing.T) {
 	if len(targetMods) != 1 || targetMods[0].Title != "Sodium Updated" {
 		t.Fatalf("target mods after update = %#v", targetMods)
 	}
+	if stats := svc.GetUsageStats(); stats.FavoritesAdded != 2 {
+		t.Fatalf("favorite usage stats = %#v, want 2 additions", stats)
+	}
 }
 
 func TestFavoriteListCopyUsesResolvedReferences(t *testing.T) {
-	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(database.Close)
+	t.Cleanup(storage.Close)
 
 	svc := New(Options{})
 	source := svc.CreateFavoriteList("Source")
 	child := svc.CreateFavoriteList("Child")
 	target := svc.CreateFavoriteList("Target")
-	svc.AddFavoriteMod(database.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "sodium", Title: "Sodium"})
-	svc.AddFavoriteMod(database.FavoriteMod{ListID: child.ID, Platform: "curseforge", ModID: "jei", Title: "JEI"})
+	svc.AddFavoriteMod(storage.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "sodium", Title: "Sodium"})
+	svc.AddFavoriteMod(storage.FavoriteMod{ListID: child.ID, Platform: "curseforge", ModID: "jei", Title: "JEI"})
 	ref := svc.AddFavoriteListReference(source.ID, child.ID)
 	if ref.ID == "" {
 		t.Fatal("AddFavoriteListReference returned empty ref")
@@ -206,10 +369,10 @@ func TestFavoriteListCopyUsesResolvedReferences(t *testing.T) {
 }
 
 func TestFavoriteListReferenceServiceMethods(t *testing.T) {
-	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(database.Close)
+	t.Cleanup(storage.Close)
 
 	svc := New(Options{})
 	parent := svc.CreateFavoriteList("Parent")
@@ -235,10 +398,10 @@ func TestFavoriteListReferenceServiceMethods(t *testing.T) {
 }
 
 func TestFavoriteGroupMetadataAndReorderServiceMethods(t *testing.T) {
-	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(database.Close)
+	t.Cleanup(storage.Close)
 
 	svc := New(Options{})
 	first := svc.CreateFavoriteGroup("Utilities")
@@ -259,7 +422,7 @@ func TestFavoriteGroupMetadataAndReorderServiceMethods(t *testing.T) {
 
 	listA := svc.CreateFavoriteList("A")
 	listB := svc.CreateFavoriteList("B")
-	updated := svc.UpdateFavoriteListMetadata(database.FavoriteList{
+	updated := svc.UpdateFavoriteListMetadata(storage.FavoriteList{
 		ID:        listA.ID,
 		GroupID:   second.ID,
 		IconKind:  "mdi",
@@ -295,7 +458,7 @@ func TestFavoriteMigrationPreviewAndApplyAllMatch(t *testing.T) {
 
 	source := svc.CreateFavoriteList("Source")
 	target := svc.CreateFavoriteList("Target")
-	sourceMod := svc.AddFavoriteMod(database.FavoriteMod{
+	sourceMod := svc.AddFavoriteMod(storage.FavoriteMod{
 		ListID:           source.ID,
 		Platform:         "modrinth",
 		ModID:            "sodium",
@@ -348,8 +511,8 @@ func TestFavoriteMigrationPartialConflictRequiresIgnore(t *testing.T) {
 
 	source := svc.CreateFavoriteList("Source")
 	target := svc.CreateFavoriteList("Target")
-	svc.AddFavoriteMod(database.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "sodium", Slug: "sodium", Title: "Sodium"})
-	svc.AddFavoriteMod(database.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "lithium", Slug: "lithium", Title: "Lithium"})
+	svc.AddFavoriteMod(storage.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "sodium", Slug: "sodium", Title: "Sodium"})
+	svc.AddFavoriteMod(storage.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "lithium", Slug: "lithium", Title: "Lithium"})
 
 	req := FavoriteMigrationRequest{
 		SourceListID:     source.ID,
@@ -389,7 +552,7 @@ func TestFavoriteMigrationAllConflictWritesNothing(t *testing.T) {
 
 	source := svc.CreateFavoriteList("Source")
 	target := svc.CreateFavoriteList("Target")
-	svc.AddFavoriteMod(database.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "lithium", Slug: "lithium", Title: "Lithium"})
+	svc.AddFavoriteMod(storage.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "lithium", Slug: "lithium", Title: "Lithium"})
 
 	applied := svc.ApplyFavoriteListMigration(FavoriteMigrationRequest{
 		SourceListID:     source.ID,
@@ -411,7 +574,7 @@ func TestFavoriteMigrationMissingProjectLookupConflict(t *testing.T) {
 	stubFavoriteMigrationProjectLookup(t)
 	source := svc.CreateFavoriteList("Source")
 	target := svc.CreateFavoriteList("Target")
-	svc.AddFavoriteMod(database.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "missing-project", Title: "Missing"})
+	svc.AddFavoriteMod(storage.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "missing-project", Title: "Missing"})
 
 	preview := svc.PreviewFavoriteListMigration(FavoriteMigrationRequest{
 		SourceListID:     source.ID,
@@ -433,7 +596,7 @@ func TestFavoriteMigrationUsesReferencedListContents(t *testing.T) {
 	source := svc.CreateFavoriteList("Source")
 	child := svc.CreateFavoriteList("Child")
 	target := svc.CreateFavoriteList("Target")
-	svc.AddFavoriteMod(database.FavoriteMod{ListID: child.ID, Platform: "curseforge", ModID: "238222", Slug: "jei", Title: "JEI"})
+	svc.AddFavoriteMod(storage.FavoriteMod{ListID: child.ID, Platform: "curseforge", ModID: "238222", Slug: "jei", Title: "JEI"})
 	if ref := svc.AddFavoriteListReference(source.ID, child.ID); ref.ID == "" {
 		t.Fatal("AddFavoriteListReference returned empty ref")
 	}
@@ -454,16 +617,21 @@ func TestFavoriteMigrationUsesReferencedListContents(t *testing.T) {
 
 func openFavoriteMigrationService(t *testing.T) *Service {
 	t.Helper()
-	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+	providers.StartBackgroundTasks()
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(database.Close)
+	t.Cleanup(func() {
+		providers.StopBackgroundTasks()
+		storage.Close()
+		providers.StartBackgroundTasks()
+	})
 	return New(Options{})
 }
 
 func storeFavoriteMigrationProject(t *testing.T, platform, projectID, slug string, versions []models.ModVersion) {
 	t.Helper()
-	if err := database.UpsertModPlatform(models.ModProject{
+	if err := storage.UpsertModPlatform(models.ModProject{
 		ID:        models.ProjectKey(platform, projectID),
 		Platform:  platform,
 		ProjectID: projectID,
@@ -472,11 +640,11 @@ func storeFavoriteMigrationProject(t *testing.T, platform, projectID, slug strin
 	}); err != nil {
 		t.Fatal(err)
 	}
-	scopes := []database.ModPlatformVersionScope{
+	scopes := []storage.ModPlatformVersionScope{
 		{MinecraftVersion: "1.21.1", ModLoader: "fabric"},
 		{MinecraftVersion: "1.21.1", ModLoader: "neoforge"},
 	}
-	if err := database.SetPlatformVersionSnapshot(platform, projectID, versions, time.Now().Unix(), scopes); err != nil {
+	if err := storage.SetPlatformVersionSnapshot(platform, projectID, versions, time.Now().Unix(), scopes); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -520,7 +688,7 @@ func TestSaveCacheDirPreferencePersistsAndReopensDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		database.Close()
+		storage.Close()
 		if err := os.Chdir(oldwd); err != nil {
 			t.Fatal(err)
 		}
@@ -539,11 +707,11 @@ func TestSaveCacheDirPreferencePersistsAndReopensDatabase(t *testing.T) {
 	if got := minecraft.ExpandPathWithEnv(svc.Config().Runtime.CacheDir); got != nextDir {
 		t.Fatalf("config cache dir = %q, want %q", got, nextDir)
 	}
-	wantCachePath := filepath.Join(nextDir, database.CacheFileName)
+	wantCachePath := filepath.Join(nextDir, storage.CacheFileName)
 	if got := minecraft.ExpandPathWithEnv(view.CachePath); got != wantCachePath {
 		t.Fatalf("settings cache path = %q, want %q", got, wantCachePath)
 	}
-	if _, err := os.Stat(database.UserDataPathForCachePath(wantCachePath)); err != nil {
+	if _, err := os.Stat(storage.UserDataPathForCachePath(wantCachePath)); err != nil {
 		t.Fatalf("user database at custom cache dir: %v", err)
 	}
 
@@ -591,5 +759,53 @@ func TestSaveUnusedDependencyCleanupSettingsPersists(t *testing.T) {
 	}
 	if loaded.Prefers.AutoScanUnusedDependenciesValue() {
 		t.Fatal("persisted auto scan unused dependencies = true, want false")
+	}
+}
+
+func TestSaveMCIMSettingsPersistsAndReconfiguresProviders(t *testing.T) {
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	appDir := t.TempDir()
+	if err := os.Chdir(appDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		global.SetModrinthClient(nil)
+		global.SetCurseForgeClient(nil)
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	svc := New(Options{Config: &configs.Config{}})
+	if svc.GetSettings().MCIMEnabled {
+		t.Fatal("default MCIM enabled = true, want false")
+	}
+	view := svc.SaveMCIMSettings(SaveMCIMSettingsRequest{MCIMEnabled: true})
+	if !view.MCIMEnabled || global.GetCurseForgeClient() == nil {
+		t.Fatalf("MCIM settings view = %#v", view)
+	}
+	client := global.GetModrinthClient()
+	if client == nil || client.BaseURL == nil || client.BaseURL.String() != mcimModrinthBaseURL {
+		t.Fatalf("Modrinth MCIM client = %#v", client)
+	}
+
+	loaded, err := configs.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Prefers.MCIMEnabledValue() {
+		t.Fatal("persisted MCIM enabled = false, want true")
+	}
+
+	view = svc.SaveMCIMSettings(SaveMCIMSettingsRequest{MCIMEnabled: false})
+	if view.MCIMEnabled || global.GetCurseForgeClient() != nil {
+		t.Fatalf("disabled MCIM settings view = %#v", view)
+	}
+	client = global.GetModrinthClient()
+	if client == nil || client.BaseURL == nil || client.BaseURL.String() == mcimModrinthBaseURL {
+		t.Fatalf("Modrinth official client = %#v", client)
 	}
 }

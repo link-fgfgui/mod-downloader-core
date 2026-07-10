@@ -7,12 +7,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/models"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
 )
 
 func TestFavoritePackwizScopeRejectsMixedOrMissingScope(t *testing.T) {
-	_, err := favoritePackwizScope([]database.FavoriteMod{{
+	_, err := favoritePackwizScope([]storage.FavoriteMod{{
 		Title:            "Sodium",
 		MinecraftVersion: "1.21.1",
 		ModLoader:        "fabric",
@@ -25,7 +25,7 @@ func TestFavoritePackwizScopeRejectsMixedOrMissingScope(t *testing.T) {
 		t.Fatalf("mixed minecraft error = %v", err)
 	}
 
-	_, err = favoritePackwizScope([]database.FavoriteMod{{
+	_, err = favoritePackwizScope([]storage.FavoriteMod{{
 		Title:            "Sodium",
 		MinecraftVersion: "1.21.1",
 	}})
@@ -35,10 +35,10 @@ func TestFavoritePackwizScopeRejectsMixedOrMissingScope(t *testing.T) {
 }
 
 func TestExportFavoriteListPackwizZipRejectsEmptyList(t *testing.T) {
-	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(database.Close)
+	t.Cleanup(storage.Close)
 
 	svc := New(Options{})
 	list := svc.CreateFavoriteList("Empty")
@@ -49,16 +49,16 @@ func TestExportFavoriteListPackwizZipRejectsEmptyList(t *testing.T) {
 }
 
 func TestExportFavoriteListPackwizZipWritesPack(t *testing.T) {
-	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(database.Close)
+	t.Cleanup(storage.Close)
 
 	storeFavoritePackwizVersion(t, "modrinth", "sodium", "version-1", "1.21.1", "fabric", "sodium.jar")
 
 	svc := New(Options{})
 	list := svc.CreateFavoriteList("Performance")
-	saved := svc.AddFavoriteMod(database.FavoriteMod{
+	saved := svc.AddFavoriteMod(storage.FavoriteMod{
 		ListID:           list.ID,
 		Platform:         "modrinth",
 		ModID:            "sodium",
@@ -85,19 +85,23 @@ func TestExportFavoriteListPackwizZipWritesPack(t *testing.T) {
 			t.Fatalf("missing %s from exported zip paths %#v", path, paths)
 		}
 	}
+	stats := svc.GetUsageStats()
+	if stats.FavoritesAdded != 1 || stats.PackwizExports != 1 {
+		t.Fatalf("usage stats after favorite export = %#v", stats)
+	}
 }
 
 func TestExportFavoriteListPackwizZipForScopeFiltersItems(t *testing.T) {
-	if err := database.OpenAt(filepath.Join(t.TempDir(), database.CacheFileName)); err != nil {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(database.Close)
+	t.Cleanup(storage.Close)
 
 	storeFavoritePackwizVersion(t, "modrinth", "sodium", "version-1", "1.21.1", "fabric", "sodium.jar")
 
 	svc := New(Options{})
 	list := svc.CreateFavoriteList("Mixed")
-	svc.AddFavoriteMod(database.FavoriteMod{
+	svc.AddFavoriteMod(storage.FavoriteMod{
 		ListID:           list.ID,
 		Platform:         "modrinth",
 		ModID:            "sodium",
@@ -106,7 +110,7 @@ func TestExportFavoriteListPackwizZipForScopeFiltersItems(t *testing.T) {
 		ModLoader:        "fabric",
 		Title:            "Sodium",
 	})
-	svc.AddFavoriteMod(database.FavoriteMod{
+	svc.AddFavoriteMod(storage.FavoriteMod{
 		ListID:           list.ID,
 		Platform:         "modrinth",
 		ModID:            "lithium",
@@ -129,6 +133,52 @@ func TestExportFavoriteListPackwizZipForScopeFiltersItems(t *testing.T) {
 	}
 }
 
+func TestExportFavoriteListPackwizZipIncludesRecursiveReferences(t *testing.T) {
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(storage.Close)
+
+	for _, modID := range []string{"sodium", "lithium", "ferrite-core"} {
+		storeFavoritePackwizVersion(t, "modrinth", modID, modID+"-version", "1.21.1", "fabric", modID+".jar")
+	}
+
+	svc := New(Options{})
+	root := svc.CreateFavoriteList("Root")
+	child := svc.CreateFavoriteList("Child")
+	grandchild := svc.CreateFavoriteList("Grandchild")
+	for _, entry := range []struct {
+		listID string
+		modID  string
+	}{
+		{listID: root.ID, modID: "sodium"},
+		{listID: child.ID, modID: "lithium"},
+		{listID: grandchild.ID, modID: "ferrite-core"},
+	} {
+		svc.AddFavoriteMod(storage.FavoriteMod{
+			ListID: entry.listID, Platform: "modrinth", ModID: entry.modID,
+			VersionID: entry.modID + "-version", MinecraftVersion: "1.21.1", ModLoader: "fabric", Title: entry.modID,
+		})
+	}
+	if ref := svc.AddFavoriteListReference(root.ID, child.ID); ref.ID == "" {
+		t.Fatal("root to child reference was not created")
+	}
+	if ref := svc.AddFavoriteListReference(child.ID, grandchild.ID); ref.ID == "" {
+		t.Fatal("child to grandchild reference was not created")
+	}
+
+	result, err := svc.ExportFavoriteListPackwizZip(root.ID, filepath.Join(t.TempDir(), "recursive.zip"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := zipPaths(t, result.Path)
+	for _, path := range []string{"mods/sodium.pw.toml", "mods/lithium.pw.toml", "mods/ferrite-core.pw.toml"} {
+		if !paths[path] {
+			t.Fatalf("missing recursively referenced mod %s from %#v", path, paths)
+		}
+	}
+}
+
 func TestEnsureZipPathAppendsExtension(t *testing.T) {
 	if got := ensureZipPath("/tmp/pack"); got != "/tmp/pack.zip" {
 		t.Fatalf("ensureZipPath without extension = %q", got)
@@ -141,7 +191,7 @@ func TestEnsureZipPathAppendsExtension(t *testing.T) {
 func storeFavoritePackwizVersion(t *testing.T, platform, projectID, versionID, minecraftVersion, modLoader, fileName string) {
 	t.Helper()
 	now := time.Now().Unix()
-	if err := database.UpsertModPlatform(models.ModProject{
+	if err := storage.UpsertModPlatform(models.ModProject{
 		ID:        models.ProjectKey(platform, projectID),
 		Platform:  platform,
 		ProjectID: projectID,
@@ -151,7 +201,7 @@ func storeFavoritePackwizVersion(t *testing.T, platform, projectID, versionID, m
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.SetPlatformVersionSnapshot(platform, projectID, []models.ModVersion{{
+	if err := storage.SetPlatformVersionSnapshot(platform, projectID, []models.ModVersion{{
 		ID:           versionID,
 		Platform:     platform,
 		ProjectID:    projectID,
@@ -162,7 +212,7 @@ func storeFavoritePackwizVersion(t *testing.T, platform, projectID, versionID, m
 		SHA1:         "abc123",
 		GameVersions: []string{minecraftVersion},
 		Loaders:      []string{modLoader},
-	}}, now, []database.ModPlatformVersionScope{{
+	}}, now, []storage.ModPlatformVersionScope{{
 		MinecraftVersion: minecraftVersion,
 		ModLoader:        modLoader,
 	}}); err != nil {

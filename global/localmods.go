@@ -45,6 +45,7 @@ func UpsertLocalMod(info structs.ModInfo, instanceID, mcVersion, modLoader strin
 	file := LocalModFile{
 		SHA1:           sha1,
 		FileName:       info.FileName,
+		CfFingerprint:  int64(info.CfFingerprint),
 		ModID:          info.ID,
 		ModName:        info.Name,
 		ModVersion:     info.Version,

@@ -8,11 +8,12 @@ import (
 	"time"
 
 	"github.com/link-fgfgui/mod-downloader-core/logging"
+	"github.com/link-fgfgui/mod-downloader-core/networking"
 )
 
 const discardBufferSize = 32 * 1024
 
-func DiscardFetchFromNetwork(downloadURL string, curseForgeAPIKey string) {
+func DiscardFetchFromNetwork(downloadURL string, curseForgeAPIKey string, userAgent ...string) {
 	downloadURL = strings.TrimSpace(downloadURL)
 	if downloadURL == "" {
 		return
@@ -26,15 +27,13 @@ func DiscardFetchFromNetwork(downloadURL string, curseForgeAPIKey string) {
 		logging.Debug("discard fetch request creation failed", "url", downloadURL, "error", err)
 		return
 	}
-	req.Header.Set("User-Agent", "mod-downloader")
+	req.Header.Set("User-Agent", normalizedUserAgent(firstString(userAgent)))
 
 	if curseForgeAPIKey != "" && isCurseForgeCDNURL(downloadURL) {
 		req.Header.Set("x-api-key", curseForgeAPIKey)
 	}
 
-	client := &http.Client{
-		Timeout: 60 * time.Second,
-	}
+	client := networking.NewClient(60 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		logging.Debug("discard fetch request failed (ignored)", "url", downloadURL, "error", err)

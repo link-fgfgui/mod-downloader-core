@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -360,6 +362,97 @@ func FileSHA1(path string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// FileHashes calculates the SHA1 used by Modrinth and the normalized
+// MurmurHash2 fingerprint used by CurseForge.
+func FileHashes(path string) (string, uint32) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", 0
+	}
+	defer f.Close()
+	h := sha1.New()
+	var normalizedLength uint32
+	buffer := make([]byte, 32*1024)
+	for {
+		n, readErr := f.Read(buffer)
+		if n > 0 {
+			_, _ = h.Write(buffer[:n])
+			for _, value := range buffer[:n] {
+				if !curseForgeWhitespace(value) {
+					normalizedLength++
+				}
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return "", 0
+		}
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", 0
+	}
+	return hex.EncodeToString(h.Sum(nil)), curseForgeFingerprint(f, normalizedLength)
+}
+
+func curseForgeWhitespace(value byte) bool {
+	switch value {
+	case ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
+}
+
+func curseForgeFingerprint(reader io.Reader, normalizedLength uint32) uint32 {
+	const multiplier uint32 = 0x5bd1e995
+	hash := uint32(1) ^ normalizedLength
+	buffer := make([]byte, 32*1024)
+	var block [4]byte
+	blockSize := 0
+	for {
+		n, err := reader.Read(buffer)
+		for _, value := range buffer[:n] {
+			if curseForgeWhitespace(value) {
+				continue
+			}
+			block[blockSize] = value
+			blockSize++
+			if blockSize == len(block) {
+				word := binary.LittleEndian.Uint32(block[:])
+				word *= multiplier
+				word ^= word >> 24
+				word *= multiplier
+				hash *= multiplier
+				hash ^= word
+				blockSize = 0
+			}
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				return 0
+			}
+			break
+		}
+	}
+	switch blockSize {
+	case 3:
+		hash ^= uint32(block[2]) << 16
+		fallthrough
+	case 2:
+		hash ^= uint32(block[1]) << 8
+		fallthrough
+	case 1:
+		hash ^= uint32(block[0])
+		hash *= multiplier
+	}
+	hash ^= hash >> 13
+	hash *= multiplier
+	hash ^= hash >> 15
+	return hash
+}
+
 func ScanVersionMods(versionDir string, instanceID string, minecraftVersion string, modLoader string, minecraftDir string) []structs.ModInfo {
 	modsDir := filepath.Join(versionDir, "mods")
 	return ScanModsDir(modsDir, instanceID, minecraftVersion, modLoader, minecraftDir)
@@ -387,7 +480,7 @@ func ScanModsDir(modsDir string, instanceID string, minecraftVersion string, mod
 		}
 
 		jarPath := filepath.Join(modsDir, entry.Name())
-		hash := FileSHA1(jarPath)
+		hash, fingerprint := FileHashes(jarPath)
 		global.HardlinkIndexAdd(hash, jarPath)
 		mods := ParseModJarWithSHA1(jarPath, hash, modLoader)
 		enabled := isJarEnabled(entry.Name())
@@ -407,6 +500,7 @@ func ScanModsDir(modsDir string, instanceID string, minecraftVersion string, mod
 			mods[i].FileName = baseName
 			mods[i].Path = pathValue
 			mods[i].SHA1 = hash
+			mods[i].CfFingerprint = fingerprint
 			mods[i].Enabled = enabled
 			global.UpsertLocalMod(mods[i], instanceID, minecraftVersion, modLoader)
 		}

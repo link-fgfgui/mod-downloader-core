@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/link-fgfgui/mod-downloader-core/networking"
 )
 
 type httpRangeReaderAt struct {
@@ -40,7 +42,7 @@ func newHTTPRangeReaderAt(url string, timeout time.Duration) (*httpRangeReaderAt
 		}
 	}
 
-	client := &http.Client{Timeout: clientTimeout}
+	client := networking.NewClient(clientTimeout)
 	resolvedURL, err := resolveHTTPDownloadURL(client, url, deadline)
 	if err != nil {
 		resolvedURL = url

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,16 +13,18 @@ import (
 
 	modrinth "codeberg.org/jmansfield/go-modrinth/modrinth"
 	"github.com/sjet47/go-curseforge"
+	curseforgeapi "github.com/sjet47/go-curseforge/api"
 
 	"github.com/link-fgfgui/mod-downloader-core/configs"
-	"github.com/link-fgfgui/mod-downloader-core/database"
 	"github.com/link-fgfgui/mod-downloader-core/downloader"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/logging"
 	"github.com/link-fgfgui/mod-downloader-core/minecraft"
 	"github.com/link-fgfgui/mod-downloader-core/modbridge"
 	"github.com/link-fgfgui/mod-downloader-core/models"
+	"github.com/link-fgfgui/mod-downloader-core/networking"
 	"github.com/link-fgfgui/mod-downloader-core/providers"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 	structs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
@@ -33,9 +36,14 @@ const (
 	EventDownloadStatesUpdated  EventKind = "downloadStatesUpdated"
 	EventDownloadQueueUpdated   EventKind = "downloadQueueUpdated"
 	EventDownloadFailed         EventKind = "downloadFailed"
+	EventDownloadCompleted      EventKind = "downloadCompleted"
 	EventMinecraftDirChanged    EventKind = "minecraftDirChanged"
 	EventSelectedVersionChanged EventKind = "selectedVersionChanged"
 )
+
+const minecraftReleaseCacheTTL = 24 * time.Hour
+
+var fetchMinecraftReleaseVersions = minecraft.FetchMinecraftReleaseVersions
 
 const APIKeyKeepSentinel = "<keep>"
 
@@ -48,6 +56,7 @@ type Options struct {
 	Config                *configs.Config
 	ConfigOverrides       ConfigOverrides
 	Runtime               RuntimeOptions
+	Version               string
 	LoadMinecraftReleases bool
 	OnEvent               func(Event)
 }
@@ -91,6 +100,7 @@ type SettingsView struct {
 	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
 	AutoScanUnusedDependencies  bool    `json:"autoScanUnusedDependencies"`
+	MCIMEnabled                 bool    `json:"mcimEnabled"`
 	MinecraftDir                string  `json:"minecraftDir"`
 	CacheDir                    string  `json:"cacheDir"`
 	CachePath                   string  `json:"cachePath"`
@@ -115,9 +125,13 @@ type SaveUnusedDependencyCleanupSettingsRequest struct {
 	AutoScanUnusedDependencies bool `json:"autoScanUnusedDependencies"`
 }
 
+type SaveMCIMSettingsRequest struct {
+	MCIMEnabled bool `json:"mcimEnabled"`
+}
+
 type FavoriteBulkAddRequest struct {
-	TargetListIDs []string               `json:"targetListIds"`
-	Mods          []database.FavoriteMod `json:"mods"`
+	TargetListIDs []string              `json:"targetListIds"`
+	Mods          []storage.FavoriteMod `json:"mods"`
 }
 
 type FavoriteListCopyRequest struct {
@@ -149,15 +163,15 @@ type FavoriteMigrationPreview struct {
 }
 
 type FavoriteMigrationMatch struct {
-	Source  database.FavoriteModEntry `json:"source"`
-	Target  database.FavoriteMod      `json:"target"`
-	Project models.ModProject         `json:"project"`
-	Version models.ModVersion         `json:"version"`
+	Source  storage.FavoriteModEntry `json:"source"`
+	Target  storage.FavoriteMod      `json:"target"`
+	Project models.ModProject        `json:"project"`
+	Version models.ModVersion        `json:"version"`
 }
 
 type FavoriteMigrationConflict struct {
-	Source database.FavoriteModEntry `json:"source"`
-	Reason string                    `json:"reason"`
+	Source storage.FavoriteModEntry `json:"source"`
+	Reason string                   `json:"reason"`
 }
 
 type FavoriteMigrationApplyResult struct {
@@ -197,8 +211,18 @@ func New(options Options) *Service {
 	return &Service{config: options.Config, options: options}
 }
 
+func (s *Service) UserAgent() string {
+	return userAgentForVersion(s.options.Version)
+}
+
 func (s *Service) Startup(ctx context.Context) error {
 	s.ctx = ctx
+	providers.StartBackgroundTasks()
+	if s.config != nil {
+		s.configureLoggingConfig(s.config.Logging)
+	} else if bootstrapLogging, err := configs.LoadLogging(); err == nil {
+		s.configureLoggingConfig(bootstrapLogging)
+	}
 	if s.config == nil {
 		cfg, err := s.loadConfig()
 		if err != nil {
@@ -208,6 +232,11 @@ func (s *Service) Startup(ctx context.Context) error {
 		s.config = cfg
 	}
 	s.applyConfigOverrides()
+	s.configureLogging()
+	downloader.Configure(downloader.Config{
+		FileConcurrency:     s.config.Downloads.FileConcurrencyValue(),
+		ConcurrentDownloads: s.config.Downloads.ConcurrentDownloadsValue(),
+	})
 	if minecraftDir := minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir); strings.TrimSpace(minecraftDir) != "" {
 		s.config.Prefers.MinecraftDir = minecraftDir
 		global.SetMinecraftDir(minecraftDir)
@@ -216,18 +245,39 @@ func (s *Service) Startup(ctx context.Context) error {
 	cachePath, err := s.cachePath()
 	if err != nil {
 		logging.Error("resolve database cache path failed", "error", err)
-	} else if err := database.OpenAt(cachePath); err != nil {
+	} else if err := storage.OpenAt(cachePath); err != nil {
 		logging.Error("open database failed", "error", err)
 	}
 	s.configureProviderClients()
 
 	if s.options.LoadMinecraftReleases {
-		releaseVersions, err := minecraft.FetchMinecraftReleaseVersions()
-		if err != nil {
-			logging.Error("fetch minecraft release versions failed", "error", err)
+		if err := loadMinecraftReleaseVersions(); err != nil {
 			return err
 		}
-		global.SetMinecraftReleaseVersions(releaseVersions)
+	}
+	return nil
+}
+
+func loadMinecraftReleaseVersions() error {
+	cached, updatedAt := storage.GetMinecraftReleaseVersions()
+	if len(cached) > 0 && updatedAt >= time.Now().Add(-minecraftReleaseCacheTTL).Unix() {
+		global.SetMinecraftReleaseVersions(cached)
+		return nil
+	}
+
+	releaseVersions, err := fetchMinecraftReleaseVersions()
+	if err != nil {
+		if len(cached) > 0 {
+			logging.Warn("refresh minecraft release versions failed, using stale cache", "versionCount", len(cached), "updatedAt", updatedAt, "error", err)
+			global.SetMinecraftReleaseVersions(cached)
+			return nil
+		}
+		logging.Error("fetch minecraft release versions failed", "error", err)
+		return err
+	}
+	global.SetMinecraftReleaseVersions(releaseVersions)
+	if err := storage.SetMinecraftReleaseVersions(releaseVersions, time.Now().Unix()); err != nil {
+		logging.Warn("cache minecraft release versions failed", "versionCount", len(releaseVersions), "error", err)
 	}
 	return nil
 }
@@ -240,11 +290,15 @@ func (s *Service) Shutdown() {
 	if err := configs.Save(s.config); err != nil {
 		logging.Error("save config failed", "error", err)
 	}
-	database.Close()
+	providers.StopBackgroundTasks()
+	storage.Close()
+	logging.Close()
 }
 
 func (s *Service) Close() {
-	database.Close()
+	providers.StopBackgroundTasks()
+	storage.Close()
+	logging.Close()
 }
 
 func (s *Service) Config() *configs.Config {
@@ -292,12 +346,12 @@ func (s *Service) LookupProjectByID(platform, projectID, mcVersion, modLoader st
 	return providers.LookupProjectByPlatformID(platform, projectID, mcVersion, modLoader)
 }
 
-func (s *Service) GetPinnedModVersion(platform string, modID string, minecraftVersion string, modLoader string) database.PinnedMod {
-	pin, _ := database.GetPinnedMod(platform, modID, minecraftVersion, modLoader)
+func (s *Service) GetPinnedModVersion(platform string, modID string, minecraftVersion string, modLoader string) storage.PinnedMod {
+	pin, _ := storage.GetPinnedMod(platform, modID, minecraftVersion, modLoader)
 	return pin
 }
 
-func (s *Service) PinModVersion(req appstructs.ModVersionPinRequest) database.PinnedMod {
+func (s *Service) PinModVersion(req appstructs.ModVersionPinRequest) storage.PinnedMod {
 	platform := strings.ToLower(strings.TrimSpace(req.Platform))
 	modID := strings.ToLower(strings.TrimSpace(req.ModID))
 	versionID := strings.TrimSpace(req.VersionID)
@@ -305,32 +359,32 @@ func (s *Service) PinModVersion(req appstructs.ModVersionPinRequest) database.Pi
 	modLoader := strings.ToLower(strings.TrimSpace(req.ModLoader))
 
 	if platform == "" || modID == "" || versionID == "" || mcVersion == "" || modLoader == "" {
-		return database.PinnedMod{}
+		return storage.PinnedMod{}
 	}
 
-	existing, found := database.GetPinnedMod(platform, modID, mcVersion, modLoader)
+	existing, found := storage.GetPinnedMod(platform, modID, mcVersion, modLoader)
 	if found && strings.EqualFold(existing.VersionID, versionID) {
-		_ = database.DeletePinnedMod(platform, modID, mcVersion, modLoader)
-		return database.PinnedMod{}
+		_ = storage.DeletePinnedMod(platform, modID, mcVersion, modLoader)
+		return storage.PinnedMod{}
 	}
 
-	pin := database.PinnedMod{
+	pin := storage.PinnedMod{
 		Platform:         platform,
 		ModID:            modID,
 		VersionID:        versionID,
 		MinecraftVersion: mcVersion,
 		ModLoader:        modLoader,
 	}
-	if err := database.UpsertPinnedMod(pin); err != nil {
+	if err := storage.UpsertPinnedMod(pin); err != nil {
 		logging.Error("upsert pinned mod failed", "platform", platform, "modID", modID, "versionID", versionID, "minecraftVersion", mcVersion, "modLoader", modLoader, "error", err)
-		return database.PinnedMod{}
+		return storage.PinnedMod{}
 	}
-	pin, _ = database.GetPinnedMod(platform, modID, mcVersion, modLoader)
+	pin, _ = storage.GetPinnedMod(platform, modID, mcVersion, modLoader)
 	return pin
 }
 
-func (s *Service) ListPinnedMods() []database.PinnedMod {
-	return database.ListPinnedMods()
+func (s *Service) ListPinnedMods() []storage.PinnedMod {
+	return storage.ListPinnedMods()
 }
 
 func (s *Service) UnpinMod(platform, modID, mcVersion, modLoader string) bool {
@@ -341,43 +395,43 @@ func (s *Service) UnpinMod(platform, modID, mcVersion, modLoader string) bool {
 	if platform == "" || modID == "" || mcVersion == "" || modLoader == "" {
 		return false
 	}
-	if _, found := database.GetPinnedMod(platform, modID, mcVersion, modLoader); !found {
+	if _, found := storage.GetPinnedMod(platform, modID, mcVersion, modLoader); !found {
 		return false
 	}
-	if err := database.DeletePinnedMod(platform, modID, mcVersion, modLoader); err != nil {
+	if err := storage.DeletePinnedMod(platform, modID, mcVersion, modLoader); err != nil {
 		logging.Error("unpin mod failed", "platform", platform, "modID", modID, "minecraftVersion", mcVersion, "modLoader", modLoader, "error", err)
 		return false
 	}
 	return true
 }
 
-func (s *Service) ListFavoriteLists() []database.FavoriteList {
-	return database.ListFavoriteLists()
+func (s *Service) ListFavoriteLists() []storage.FavoriteList {
+	return storage.ListFavoriteLists()
 }
 
-func (s *Service) CreateFavoriteList(name string) database.FavoriteList {
-	list, err := database.CreateFavoriteList(name)
+func (s *Service) CreateFavoriteList(name string) storage.FavoriteList {
+	list, err := storage.CreateFavoriteList(name)
 	if err != nil {
 		logging.Error("create favorite list failed", "name", name, "error", err)
-		return database.FavoriteList{}
+		return storage.FavoriteList{}
 	}
 	return list
 }
 
-func (s *Service) RenameFavoriteList(id, name string) database.FavoriteList {
-	list, ok, err := database.UpdateFavoriteListName(id, name)
+func (s *Service) RenameFavoriteList(id, name string) storage.FavoriteList {
+	list, ok, err := storage.UpdateFavoriteListName(id, name)
 	if err != nil {
 		logging.Error("rename favorite list failed", "id", id, "name", name, "error", err)
-		return database.FavoriteList{}
+		return storage.FavoriteList{}
 	}
 	if !ok {
-		return database.FavoriteList{}
+		return storage.FavoriteList{}
 	}
 	return list
 }
 
 func (s *Service) DeleteFavoriteList(id string) bool {
-	deleted, err := database.DeleteFavoriteList(id)
+	deleted, err := storage.DeleteFavoriteList(id)
 	if err != nil {
 		logging.Error("delete favorite list failed", "id", id, "error", err)
 		return false
@@ -385,53 +439,53 @@ func (s *Service) DeleteFavoriteList(id string) bool {
 	return deleted
 }
 
-func (s *Service) UpdateFavoriteListMetadata(list database.FavoriteList) database.FavoriteList {
-	updated, ok, err := database.UpdateFavoriteListMetadata(list)
+func (s *Service) UpdateFavoriteListMetadata(list storage.FavoriteList) storage.FavoriteList {
+	updated, ok, err := storage.UpdateFavoriteListMetadata(list)
 	if err != nil {
 		logging.Error("update favorite list metadata failed", "id", list.ID, "error", err)
-		return database.FavoriteList{}
+		return storage.FavoriteList{}
 	}
 	if !ok {
-		return database.FavoriteList{}
+		return storage.FavoriteList{}
 	}
 	return updated
 }
 
 func (s *Service) ReorderFavoriteLists(ids []string) bool {
-	if err := database.ReorderFavoriteLists(ids); err != nil {
+	if err := storage.ReorderFavoriteLists(ids); err != nil {
 		logging.Error("reorder favorite lists failed", "error", err)
 		return false
 	}
 	return true
 }
 
-func (s *Service) ListFavoriteGroups() []database.FavoriteGroup {
-	return database.ListFavoriteGroups()
+func (s *Service) ListFavoriteGroups() []storage.FavoriteGroup {
+	return storage.ListFavoriteGroups()
 }
 
-func (s *Service) CreateFavoriteGroup(name string) database.FavoriteGroup {
-	group, err := database.CreateFavoriteGroup(name)
+func (s *Service) CreateFavoriteGroup(name string) storage.FavoriteGroup {
+	group, err := storage.CreateFavoriteGroup(name)
 	if err != nil {
 		logging.Error("create favorite group failed", "name", name, "error", err)
-		return database.FavoriteGroup{}
+		return storage.FavoriteGroup{}
 	}
 	return group
 }
 
-func (s *Service) RenameFavoriteGroup(id, name string) database.FavoriteGroup {
-	group, ok, err := database.UpdateFavoriteGroupName(id, name)
+func (s *Service) RenameFavoriteGroup(id, name string) storage.FavoriteGroup {
+	group, ok, err := storage.UpdateFavoriteGroupName(id, name)
 	if err != nil {
 		logging.Error("rename favorite group failed", "id", id, "name", name, "error", err)
-		return database.FavoriteGroup{}
+		return storage.FavoriteGroup{}
 	}
 	if !ok {
-		return database.FavoriteGroup{}
+		return storage.FavoriteGroup{}
 	}
 	return group
 }
 
 func (s *Service) DeleteFavoriteGroup(id string) bool {
-	deleted, err := database.DeleteFavoriteGroup(id)
+	deleted, err := storage.DeleteFavoriteGroup(id)
 	if err != nil {
 		logging.Error("delete favorite group failed", "id", id, "error", err)
 		return false
@@ -440,29 +494,33 @@ func (s *Service) DeleteFavoriteGroup(id string) bool {
 }
 
 func (s *Service) ReorderFavoriteGroups(ids []string) bool {
-	if err := database.ReorderFavoriteGroups(ids); err != nil {
+	if err := storage.ReorderFavoriteGroups(ids); err != nil {
 		logging.Error("reorder favorite groups failed", "error", err)
 		return false
 	}
 	return true
 }
 
-func (s *Service) ListFavoriteMods(listID string) []database.FavoriteMod {
-	return database.ListFavoriteMods(listID)
+func (s *Service) ListFavoriteMods(listID string) []storage.FavoriteMod {
+	return storage.ListFavoriteMods(listID)
 }
 
-func (s *Service) ListFavoriteContents(listID string) database.FavoriteListContents {
-	return database.ListFavoriteContents(listID)
+func (s *Service) ListFavoriteContents(listID string) storage.FavoriteListContents {
+	return storage.ListFavoriteContents(listID)
 }
 
-func (s *Service) AddFavoriteMod(mod database.FavoriteMod) database.FavoriteMod {
-	saved, ok, err := database.UpsertFavoriteMod(mod)
+func (s *Service) AddFavoriteMod(mod storage.FavoriteMod) storage.FavoriteMod {
+	_, existed := favoriteModKeySet(storage.ListFavoriteMods(mod.ListID))[favoriteModIdentityKey(mod)]
+	saved, ok, err := storage.UpsertFavoriteMod(mod)
 	if err != nil {
 		logging.Error("add favorite mod failed", "listID", mod.ListID, "platform", mod.Platform, "modID", mod.ModID, "error", err)
-		return database.FavoriteMod{}
+		return storage.FavoriteMod{}
 	}
 	if !ok {
-		return database.FavoriteMod{}
+		return storage.FavoriteMod{}
+	}
+	if !existed {
+		_ = storage.IncrementUsageStat(storage.UsageStatFavoritesAdded, 1)
 	}
 	return saved
 }
@@ -482,7 +540,7 @@ func (s *Service) AddFavoriteModsToLists(req FavoriteBulkAddRequest) FavoriteBul
 			continue
 		}
 
-		existing := favoriteModKeySet(database.ListFavoriteMods(targetListID))
+		existing := favoriteModKeySet(storage.ListFavoriteMods(targetListID))
 		for _, mod := range req.Mods {
 			copied := favoriteModForTargetList(mod, targetListID)
 			if copied.Platform == "" || copied.ModID == "" {
@@ -491,7 +549,7 @@ func (s *Service) AddFavoriteModsToLists(req FavoriteBulkAddRequest) FavoriteBul
 			}
 			key := favoriteModIdentityKey(copied)
 			_, wasExisting := existing[key]
-			if _, ok, err := database.UpsertFavoriteMod(copied); err != nil {
+			if _, ok, err := storage.UpsertFavoriteMod(copied); err != nil {
 				logging.Error("bulk add favorite mod failed", "targetListID", targetListID, "platform", copied.Platform, "modID", copied.ModID, "error", err)
 				result.Skipped++
 				result.Errors = append(result.Errors, err.Error())
@@ -505,6 +563,9 @@ func (s *Service) AddFavoriteModsToLists(req FavoriteBulkAddRequest) FavoriteBul
 			}
 		}
 	}
+	if result.Added > 0 {
+		_ = storage.IncrementUsageStat(storage.UsageStatFavoritesAdded, int64(result.Added))
+	}
 	return result
 }
 
@@ -515,14 +576,14 @@ func (s *Service) CopyFavoriteListToList(req FavoriteListCopyRequest) FavoriteBu
 		return FavoriteBulkOperationResult{}
 	}
 	if sourceListID == targetListID {
-		contents := database.ListFavoriteContents(sourceListID)
+		contents := storage.ListFavoriteContents(sourceListID)
 		return FavoriteBulkOperationResult{
 			Skipped: len(contents.Mods),
 			Errors:  []string{"source and target lists are the same"},
 		}
 	}
-	contents := database.ListFavoriteContents(sourceListID)
-	mods := make([]database.FavoriteMod, 0, len(contents.Mods))
+	contents := storage.ListFavoriteContents(sourceListID)
+	mods := make([]storage.FavoriteMod, 0, len(contents.Mods))
 	for _, entry := range contents.Mods {
 		mods = append(mods, entry.FavoriteMod)
 	}
@@ -550,7 +611,7 @@ func (s *Service) PreviewFavoriteListMigration(req FavoriteMigrationRequest) Fav
 		return preview
 	}
 
-	contents := database.ListFavoriteContents(sourceListID)
+	contents := storage.ListFavoriteContents(sourceListID)
 	for _, entry := range contents.Mods {
 		project, ok := s.favoriteMigrationProject(entry.FavoriteMod, minecraftVersion, modLoader)
 		if !ok {
@@ -603,7 +664,7 @@ func (s *Service) ApplyFavoriteListMigration(req FavoriteMigrationRequest) Favor
 		result.Result.Errors = append(result.Result.Errors, "migration conflicts must be ignored or resolved before applying")
 		return result
 	}
-	mods := make([]database.FavoriteMod, 0, len(preview.Matched))
+	mods := make([]storage.FavoriteMod, 0, len(preview.Matched))
 	for _, match := range preview.Matched {
 		mods = append(mods, match.Target)
 	}
@@ -616,7 +677,7 @@ func (s *Service) ApplyFavoriteListMigration(req FavoriteMigrationRequest) Favor
 	return result
 }
 
-func (s *Service) favoriteMigrationProject(mod database.FavoriteMod, minecraftVersion, modLoader string) (models.ModProject, bool) {
+func (s *Service) favoriteMigrationProject(mod storage.FavoriteMod, minecraftVersion, modLoader string) (models.ModProject, bool) {
 	platform := strings.TrimSpace(mod.Platform)
 	modID := strings.TrimSpace(mod.ModID)
 	slug := strings.TrimSpace(mod.Slug)
@@ -624,18 +685,18 @@ func (s *Service) favoriteMigrationProject(mod database.FavoriteMod, minecraftVe
 		return models.ModProject{}, false
 	}
 	if modID != "" {
-		if project, ok := database.GetModPlatform(platform, modID); ok {
+		if project, ok := storage.GetModPlatform(platform, modID); ok {
 			return favoriteMigrationProjectWithID(project), true
 		}
-		if project, ok := database.GetModPlatformBySlug(platform, modID); ok {
+		if project, ok := storage.GetModPlatformBySlug(platform, modID); ok {
 			return favoriteMigrationProjectWithID(project), true
 		}
 	}
 	if slug != "" {
-		if project, ok := database.GetModPlatformBySlug(platform, slug); ok {
+		if project, ok := storage.GetModPlatformBySlug(platform, slug); ok {
 			return favoriteMigrationProjectWithID(project), true
 		}
-		if project, ok := database.GetModPlatform(platform, slug); ok {
+		if project, ok := storage.GetModPlatform(platform, slug); ok {
 			return favoriteMigrationProjectWithID(project), true
 		}
 	}
@@ -666,20 +727,20 @@ func favoriteMigrationVersionID(version models.ModVersion) string {
 	return strings.TrimSpace(version.ID)
 }
 
-func (s *Service) AddFavoriteListReference(parentListID, childListID string) database.FavoriteListRef {
-	ref, ok, err := database.CreateFavoriteListRef(parentListID, childListID)
+func (s *Service) AddFavoriteListReference(parentListID, childListID string) storage.FavoriteListRef {
+	ref, ok, err := storage.CreateFavoriteListRef(parentListID, childListID)
 	if err != nil {
 		logging.Error("add favorite list reference failed", "parentListID", parentListID, "childListID", childListID, "error", err)
-		return database.FavoriteListRef{}
+		return storage.FavoriteListRef{}
 	}
 	if !ok {
-		return database.FavoriteListRef{}
+		return storage.FavoriteListRef{}
 	}
 	return ref
 }
 
 func (s *Service) RemoveFavoriteListReference(parentListID, childListID string) bool {
-	deleted, err := database.DeleteFavoriteListRef(parentListID, childListID)
+	deleted, err := storage.DeleteFavoriteListRef(parentListID, childListID)
 	if err != nil {
 		logging.Error("remove favorite list reference failed", "parentListID", parentListID, "childListID", childListID, "error", err)
 		return false
@@ -687,12 +748,12 @@ func (s *Service) RemoveFavoriteListReference(parentListID, childListID string) 
 	return deleted
 }
 
-func (s *Service) ListFavoriteListRefs(parentListID string) []database.FavoriteListRef {
-	return database.ListFavoriteListRefs(parentListID)
+func (s *Service) ListFavoriteListRefs(parentListID string) []storage.FavoriteListRef {
+	return storage.ListFavoriteListRefs(parentListID)
 }
 
 func (s *Service) RemoveFavoriteMod(listID, platform, modID, mcVersion, modLoader string) bool {
-	deleted, err := database.DeleteFavoriteMod(listID, platform, modID, mcVersion, modLoader)
+	deleted, err := storage.DeleteFavoriteMod(listID, platform, modID, mcVersion, modLoader)
 	if err != nil {
 		logging.Error("remove favorite mod failed", "listID", listID, "platform", platform, "modID", modID, "error", err)
 		return false
@@ -718,7 +779,7 @@ func uniqueNonEmpty(values []string) []string {
 }
 
 func favoriteListIDSet() map[string]struct{} {
-	lists := database.ListFavoriteLists()
+	lists := storage.ListFavoriteLists()
 	out := make(map[string]struct{}, len(lists))
 	for _, list := range lists {
 		if id := strings.TrimSpace(list.ID); id != "" {
@@ -728,7 +789,7 @@ func favoriteListIDSet() map[string]struct{} {
 	return out
 }
 
-func favoriteModKeySet(mods []database.FavoriteMod) map[string]struct{} {
+func favoriteModKeySet(mods []storage.FavoriteMod) map[string]struct{} {
 	out := make(map[string]struct{}, len(mods))
 	for _, mod := range mods {
 		if key := favoriteModIdentityKey(mod); key != "" {
@@ -738,7 +799,7 @@ func favoriteModKeySet(mods []database.FavoriteMod) map[string]struct{} {
 	return out
 }
 
-func favoriteModForTargetList(mod database.FavoriteMod, targetListID string) database.FavoriteMod {
+func favoriteModForTargetList(mod storage.FavoriteMod, targetListID string) storage.FavoriteMod {
 	mod.ID = ""
 	mod.ListID = strings.TrimSpace(targetListID)
 	mod.CreatedAt = 0
@@ -746,7 +807,7 @@ func favoriteModForTargetList(mod database.FavoriteMod, targetListID string) dat
 	return mod
 }
 
-func favoriteModIdentityKey(mod database.FavoriteMod) string {
+func favoriteModIdentityKey(mod storage.FavoriteMod) string {
 	platform := strings.ToLower(strings.TrimSpace(mod.Platform))
 	modID := strings.ToLower(strings.TrimSpace(mod.ModID))
 	mcVersion := strings.TrimSpace(mod.MinecraftVersion)
@@ -794,6 +855,7 @@ func (s *Service) GetSettings() SettingsView {
 		sv.AnimationEnabled = animationMode != configs.AnimationModeOff
 		sv.AnimationDurationMultiplier = s.config.Prefers.NormalizedAnimationDurationMultiplier()
 		sv.AutoScanUnusedDependencies = s.config.Prefers.AutoScanUnusedDependenciesValue()
+		sv.MCIMEnabled = s.config.Prefers.MCIMEnabledValue()
 		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir))
 		sv.CacheDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Runtime.CacheDir))
 		sv.HasCurseforgeKey = strings.TrimSpace(s.config.Keys.CurseforgeApiKey) != ""
@@ -860,6 +922,22 @@ func (s *Service) SaveUnusedDependencyCleanupSettings(req SaveUnusedDependencyCl
 	return s.GetSettings()
 }
 
+func (s *Service) SaveMCIMSettings(req SaveMCIMSettingsRequest) SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	s.config.Prefers.MCIMEnabled = req.MCIMEnabled
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save MCIM settings failed", "mcimEnabled", req.MCIMEnabled, "error", err)
+	}
+	s.configureProviderClients()
+	downloader.Configure(downloader.Config{
+		FileConcurrency:     s.config.Downloads.FileConcurrencyValue(),
+		ConcurrentDownloads: s.config.Downloads.ConcurrentDownloadsValue(),
+	})
+	return s.GetSettings()
+}
+
 func (s *Service) SaveMinecraftDirPreference(dir string) string {
 	if s.config == nil {
 		s.config = &configs.Config{}
@@ -886,7 +964,7 @@ func (s *Service) SaveCacheDirPreference(dir string) SettingsView {
 	}
 	if cachePath, err := s.cachePath(); err != nil {
 		logging.Error("resolve database cache path after cache dir save failed", "cacheDir", dir, "error", err)
-	} else if err := database.OpenAt(cachePath); err != nil {
+	} else if err := storage.OpenAt(cachePath); err != nil {
 		logging.Error("reopen database after cache dir save failed", "cachePath", cachePath, "error", err)
 	}
 	return s.GetSettings()
@@ -911,7 +989,7 @@ func (s *Service) SaveApiKeys(req SaveApiKeysRequest) SettingsView {
 
 func (s *Service) QueueModDownload(req appstructs.ModDownloadRequest) appstructs.ModDownloadResult {
 	req = s.applyRuntimeDownloadRequest(req)
-	return downloader.QueueModDownload(s.ctx, req, s.Config().Keys.CurseforgeApiKey, s.downloadEvents())
+	return downloader.QueueModDownloadWithUserAgent(s.ctx, req, s.Config().Keys.CurseforgeApiKey, s.UserAgent(), s.downloadEvents())
 }
 
 func (s *Service) InstallModAndWait(ctx context.Context, req appstructs.ModDownloadRequest) InstallWaitResult {
@@ -926,7 +1004,7 @@ func (s *Service) InstallModAndWait(ctx context.Context, req appstructs.ModDownl
 		}
 	}
 
-	result := downloader.QueueModDownload(ctx, req, s.Config().Keys.CurseforgeApiKey, events)
+	result := downloader.QueueModDownloadWithUserAgent(ctx, req, s.Config().Keys.CurseforgeApiKey, s.UserAgent(), events)
 	if !result.Queued {
 		return InstallWaitResult{Result: result, State: downloader.GetDownloadQueueState()}
 	}
@@ -965,6 +1043,10 @@ func (s *Service) GetDownloadQueueState() appstructs.DownloadQueueState {
 	return downloader.GetDownloadQueueState()
 }
 
+func (s *Service) GetUsageStats() storage.UsageStats {
+	return storage.GetUsageStats()
+}
+
 func (s *Service) CancelDownload(id string) bool {
 	return downloader.CancelDownload(s.ctx, id, s.downloadEvents())
 }
@@ -982,7 +1064,7 @@ func (s *Service) ClearOptionalDependencyReminders() bool {
 }
 
 func (s *Service) InstallOptionalDependencies(id string) []appstructs.ModDownloadResult {
-	return downloader.InstallOptionalDependencies(s.ctx, id, s.Config().Keys.CurseforgeApiKey, s.downloadEvents())
+	return downloader.InstallOptionalDependenciesWithUserAgent(s.ctx, id, s.Config().Keys.CurseforgeApiKey, s.UserAgent(), s.downloadEvents())
 }
 
 func (s *Service) AnalyzeBatchIncompatibleConflicts(req appstructs.BatchDownloadRequest) appstructs.BatchIncompatibleAnalysis {
@@ -1141,7 +1223,25 @@ func (s *Service) ApplyLocalModBatchOperation(req appstructs.LocalModBatchOperat
 	if err := applyLocalModFileOperations(ops); err != nil {
 		return s.RefreshSelectedVersionMods(), err
 	}
+	recordLocalModUsage(ops)
 	return s.RefreshSelectedVersionMods(), nil
+}
+
+func recordLocalModUsage(ops []localModFileOperation) {
+	counts := make(map[storage.UsageStatKey]int64)
+	for _, op := range ops {
+		switch op.action {
+		case LocalModBatchActionEnable:
+			counts[storage.UsageStatModsEnabled]++
+		case LocalModBatchActionDisable:
+			counts[storage.UsageStatModsDisabled]++
+		case LocalModBatchActionDelete:
+			counts[storage.UsageStatModsDeleted]++
+		}
+	}
+	for key, count := range counts {
+		_ = storage.IncrementUsageStat(key, count)
+	}
 }
 
 type localModFileOperation struct {
@@ -1376,12 +1476,12 @@ func (s *Service) cachePath() (string, error) {
 	}
 	cacheDir := firstNonEmpty(s.options.Runtime.CacheDir, s.Config().Runtime.CacheDir)
 	if cacheDir != "" {
-		return filepath.Join(s.resolveRuntimePath(cacheDir), database.CacheFileName), nil
+		return filepath.Join(s.resolveRuntimePath(cacheDir), storage.CacheFileName), nil
 	}
 	if cacheDir := s.resolveRuntimePath(s.options.Runtime.DefaultCacheDir); cacheDir != "" {
-		return filepath.Join(cacheDir, database.CacheFileName), nil
+		return filepath.Join(cacheDir, storage.CacheFileName), nil
 	}
-	return database.DefaultCachePath()
+	return storage.DefaultCachePath()
 }
 
 func (s *Service) applyRuntimeDownloadRequest(req appstructs.ModDownloadRequest) appstructs.ModDownloadRequest {
@@ -1451,14 +1551,48 @@ func firstNonEmpty(values ...string) string {
 }
 
 func (s *Service) configureProviderClients() {
-	if strings.TrimSpace(s.Config().Keys.CurseforgeApiKey) != "" {
-		global.SetCurseForgeClient(curseforge.NewClient(s.config.Keys.CurseforgeApiKey))
+	limiter := newRequestRateLimiter(s.Config().API.RequestsPerSecondValue())
+	limitedTransport := rateLimitedTransport{limiter: limiter, base: networking.NewTransport()}
+	useMCIM := s.Config().Prefers.MCIMEnabledValue()
+	curseForgeAPIKey := strings.TrimSpace(s.Config().Keys.CurseforgeApiKey)
+	if curseForgeAPIKey != "" || useMCIM {
+		apiBaseURL := ""
+		if useMCIM {
+			apiBaseURL = mcimCurseForgeBaseURL
+		}
+		global.SetCurseForgeClient(&curseforge.Client{API: curseforgeapi.New(curseForgeTransport{
+			apiKey:     curseForgeAPIKey,
+			userAgent:  s.UserAgent(),
+			apiBaseURL: apiBaseURL,
+			base:       limitedTransport,
+		})})
 	} else {
 		global.SetCurseForgeClient(nil)
 	}
-	modrinthClient := modrinth.NewClient(&http.Client{Timeout: 10 * time.Second})
-	modrinthClient.UserAgent = "mod-downloader"
+	modrinthClient := modrinth.NewClient(&http.Client{Timeout: 10 * time.Second, Transport: limitedTransport})
+	modrinthClient.UserAgent = s.UserAgent()
+	if useMCIM {
+		modrinthClient.BaseURL, _ = url.Parse(mcimModrinthBaseURL)
+	}
 	global.SetModrinthClient(modrinthClient)
+}
+
+func (s *Service) configureLogging() {
+	s.configureLoggingConfig(s.Config().Logging)
+}
+
+func (s *Service) configureLoggingConfig(config configs.LoggingConfig) {
+	path := logging.DefaultFileName
+	if workDir := strings.TrimSpace(s.options.Runtime.WorkDir); workDir != "" {
+		path = filepath.Join(workDir, logging.DefaultFileName)
+	}
+	if err := logging.Configure(logging.Options{
+		Disabled:  config.Disabled,
+		ForceFile: config.ForceFile,
+		FilePath:  path,
+	}); err != nil {
+		logging.Error("configure logging failed", "path", path, "error", err)
+	}
 }
 
 func (s *Service) downloadEvents() downloader.Events {
@@ -1468,6 +1602,10 @@ func (s *Service) downloadEvents() downloader.Events {
 		},
 		OnDownloadFailed: func(event appstructs.DownloadFailedEvent) {
 			s.emit(EventDownloadFailed, event)
+		},
+		OnDownloadCompleted: func() {
+			_ = storage.IncrementUsageStat(storage.UsageStatDownloadsCompleted, 1)
+			s.emit(EventDownloadCompleted, nil)
 		},
 	}
 }
@@ -1568,43 +1706,26 @@ func ScanVersionMods(version structs.VersionInfo, mcDir string) structs.VersionI
 
 func (s *Service) refreshAndSelectVersionMods(version structs.VersionInfo, mcDir string) structs.VersionInfo {
 	refreshed := s.refreshVersionMods(version, mcDir)
-	enriched, missedSHA1s := enrichModMetadata(refreshed.Mods)
+	enriched, missingFiles := enrichModMetadata(refreshed.Mods)
+	setOnlineMetadataLoading(enriched, missingFiles, true)
 	refreshed.Mods = enriched
 	global.SetSelectedVersion(refreshed)
 	s.emit(EventSelectedVersionChanged, refreshed)
-	s.resolveMissingModMetadata(refreshed, missedSHA1s)
+	s.resolveMissingModMetadata(refreshed, missingFiles)
 	return refreshed
 }
 
-func (s *Service) resolveMissingModMetadata(refreshed structs.VersionInfo, missedSHA1s []string) {
-	if len(missedSHA1s) == 0 {
+func (s *Service) resolveMissingModMetadata(refreshed structs.VersionInfo, missingFiles map[string]uint32) {
+	if len(missingFiles) == 0 {
 		return
 	}
 	go func() {
-		resolved := providers.ResolveProjectsByHashes(missedSHA1s)
-		if len(resolved) == 0 {
-			return
-		}
+		projects, versions := providers.ResolveMetadataByLocalFiles(missingFiles)
 		updated := global.GetSelectedVersion()
 		if updated.ID != refreshed.ID || updated.Name != refreshed.Name {
 			return
 		}
-		mods := make([]structs.ModInfo, len(updated.Mods))
-		copy(mods, updated.Mods)
-		changed := false
-		for i := range mods {
-			if strings.TrimSpace(mods[i].SHA1) == "" {
-				continue
-			}
-			sha1 := strings.ToLower(strings.TrimSpace(mods[i].SHA1))
-			if project, ok := resolved[sha1]; ok {
-				enrichedMod := modbridge.ApplyProjectMetadataToModInfo(mods[i], project)
-				if modInfoDisplayMetadataChanged(mods[i], enrichedMod) {
-					mods[i] = enrichedMod
-					changed = true
-				}
-			}
-		}
+		mods, changed := applyResolvedModMetadata(updated.Mods, missingFiles, projects, versions)
 		if !changed {
 			return
 		}
@@ -1614,23 +1735,56 @@ func (s *Service) resolveMissingModMetadata(refreshed structs.VersionInfo, misse
 	}()
 }
 
-func enrichModMetadata(mods []structs.ModInfo) ([]structs.ModInfo, []string) {
+func applyResolvedModMetadata(mods []structs.ModInfo, missingFiles map[string]uint32, projects map[string]models.ModProject, versions map[string]models.ModVersion) ([]structs.ModInfo, bool) {
+	updated := make([]structs.ModInfo, len(mods))
+	copy(updated, mods)
+	changed := false
+	for i := range updated {
+		sha1 := strings.ToLower(strings.TrimSpace(updated[i].SHA1))
+		if _, pending := missingFiles[sha1]; !pending {
+			continue
+		}
+		if project, ok := projects[sha1]; ok {
+			enrichedMod := modbridge.ApplyPlatformMetadataToModInfo(updated[i], project, versions[sha1])
+			if modInfoDisplayMetadataChanged(updated[i], enrichedMod) {
+				updated[i] = enrichedMod
+				changed = true
+			}
+		}
+		if updated[i].OnlineMetadataLoading {
+			updated[i].OnlineMetadataLoading = false
+			changed = true
+		}
+	}
+	return updated, changed
+}
+
+func setOnlineMetadataLoading(mods []structs.ModInfo, files map[string]uint32, loading bool) {
+	for i := range mods {
+		sha1 := strings.ToLower(strings.TrimSpace(mods[i].SHA1))
+		if _, ok := files[sha1]; ok {
+			mods[i].OnlineMetadataLoading = loading
+		}
+	}
+}
+
+func enrichModMetadata(mods []structs.ModInfo) ([]structs.ModInfo, map[string]uint32) {
 	enriched := make([]structs.ModInfo, len(mods))
 	copy(enriched, mods)
-	var missedSHA1s []string
+	missingFiles := make(map[string]uint32)
 	for i := range enriched {
 		sha1 := strings.ToLower(strings.TrimSpace(enriched[i].SHA1))
 		if sha1 == "" {
 			continue
 		}
-		project, _, ok := modbridge.PlatformMetadataForSHA1(sha1)
+		project, version, ok := modbridge.PlatformMetadataForSHA1(sha1)
 		if ok && hasProjectDisplayMetadata(project) {
-			enriched[i] = modbridge.ApplyProjectMetadataToModInfo(enriched[i], project)
+			enriched[i] = modbridge.ApplyPlatformMetadataToModInfo(enriched[i], project, version)
 		} else {
-			missedSHA1s = append(missedSHA1s, sha1)
+			missingFiles[sha1] = enriched[i].CfFingerprint
 		}
 	}
-	return enriched, missedSHA1s
+	return enriched, missingFiles
 }
 
 func hasProjectDisplayMetadata(project models.ModProject) bool {
@@ -1644,6 +1798,10 @@ func modInfoDisplayMetadataChanged(left, right structs.ModInfo) bool {
 		left.OnlinePlatform != right.OnlinePlatform ||
 		left.OnlineProjectID != right.OnlineProjectID ||
 		left.OnlineSlug != right.OnlineSlug ||
+		left.OnlineVersion != right.OnlineVersion ||
+		left.OnlineVersionID != right.OnlineVersionID ||
+		left.OnlineFileName != right.OnlineFileName ||
+		left.OnlineMetadataLoading != right.OnlineMetadataLoading ||
 		left.IconURL != right.IconURL ||
 		len(left.Categories) != len(right.Categories) {
 		return true
