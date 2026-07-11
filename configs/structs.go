@@ -179,19 +179,24 @@ type RuntimeConfig struct {
 }
 
 const (
-	DefaultFileConcurrency     = 4
-	DefaultConcurrentDownloads = 1
-	MinFileConcurrency         = 1
-	MaxFileConcurrency         = 32
-	MinConcurrentDownloads     = 1
-	MaxConcurrentDownloads     = 16
-	MinRequestsPerSecond       = 0
-	MaxRequestsPerSecond       = 100
+	DefaultFileConcurrency       = 4
+	DefaultConcurrentDownloads   = 1
+	MinFileConcurrency           = 1
+	MaxFileConcurrency           = 32
+	MinConcurrentDownloads       = 1
+	MaxConcurrentDownloads       = 16
+	MinRequestsPerSecond         = 0
+	MaxRequestsPerSecond         = 100
+	DefaultTargetDownloadRateMiB = 1.0
+	MinTargetDownloadRateMiB     = 0.1
+	MaxTargetDownloadRateMiB     = 5.0
 )
 
 type DownloadConfig struct {
-	FileConcurrency     int `toml:"file_concurrency" json:"fileConcurrency" env:"FILE_CONCURRENCY"`
-	ConcurrentDownloads int `toml:"concurrent_downloads" json:"concurrentDownloads" env:"CONCURRENT_DOWNLOADS"`
+	FileConcurrency         int     `toml:"file_concurrency" json:"fileConcurrency" env:"FILE_CONCURRENCY"`
+	ConcurrentDownloads     int     `toml:"concurrent_downloads" json:"concurrentDownloads" env:"CONCURRENT_DOWNLOADS"`
+	AdaptiveFileConcurrency bool    `toml:"adaptive_file_concurrency" json:"adaptiveFileConcurrency" env:"ADAPTIVE_FILE_CONCURRENCY"`
+	TargetDownloadRateMiB   float64 `toml:"target_download_rate_mib" json:"targetDownloadRateMiB" env:"TARGET_DOWNLOAD_RATE_MIB"`
 }
 
 func (c DownloadConfig) FileConcurrencyValue() int {
@@ -212,6 +217,19 @@ func (c DownloadConfig) ConcurrentDownloadsValue() int {
 		return MaxConcurrentDownloads
 	}
 	return c.ConcurrentDownloads
+}
+
+func (c DownloadConfig) TargetDownloadRateMiBValue() float64 {
+	if math.IsNaN(c.TargetDownloadRateMiB) || math.IsInf(c.TargetDownloadRateMiB, 0) || c.TargetDownloadRateMiB <= 0 {
+		return DefaultTargetDownloadRateMiB
+	}
+	if c.TargetDownloadRateMiB < MinTargetDownloadRateMiB {
+		return MinTargetDownloadRateMiB
+	}
+	if c.TargetDownloadRateMiB > MaxTargetDownloadRateMiB {
+		return MaxTargetDownloadRateMiB
+	}
+	return c.TargetDownloadRateMiB
 }
 
 type APIConfig struct {

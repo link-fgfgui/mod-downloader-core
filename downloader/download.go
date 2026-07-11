@@ -51,8 +51,10 @@ type downloadJob struct {
 }
 
 type Config struct {
-	FileConcurrency     int
-	ConcurrentDownloads int
+	FileConcurrency         int
+	ConcurrentDownloads     int
+	AdaptiveFileConcurrency bool
+	TargetDownloadRateMiB   float64
 }
 
 type retryableDownloadJob struct {
@@ -72,14 +74,16 @@ const (
 )
 
 var (
-	errDownloadStalled             = errors.New("download stalled: no byte progress")
-	errDownloadRequeued            = errors.New("download requeued after dependency analysis")
-	downloadStallTimeout           = 30 * time.Second
-	downloadProgressPollInterval   = time.Second
-	refreshMatchingProjectVersions = providers.RefreshMatchingProjectVersions
-	installStatusPrecise           = modbridge.InstallStatusPrecise
-	newFileTransferBackend         = func() filetransfer.Backend { return filetransfer.NewStdlibBackend(nil) }
-	downloadFileConcurrency        atomic.Int64
+	errDownloadStalled               = errors.New("download stalled: no byte progress")
+	errDownloadRequeued              = errors.New("download requeued after dependency analysis")
+	downloadStallTimeout             = 30 * time.Second
+	downloadProgressPollInterval     = time.Second
+	refreshMatchingProjectVersions   = providers.RefreshMatchingProjectVersions
+	installStatusPrecise             = modbridge.InstallStatusPrecise
+	newFileTransferBackend           = func() filetransfer.Backend { return filetransfer.NewStdlibBackend(nil) }
+	downloadFileConcurrency          atomic.Int64
+	downloadAdaptiveFileConcurrency  atomic.Bool
+	downloadTargetRateBytesPerSecond atomic.Int64
 )
 
 var downloadQueue = struct {
@@ -107,9 +111,19 @@ func Configure(config Config) {
 		concurrentDownloads = 1
 	}
 	downloadFileConcurrency.Store(int64(fileConcurrency))
+	downloadAdaptiveFileConcurrency.Store(config.AdaptiveFileConcurrency)
+	targetRateBytesPerSecond := int64(config.TargetDownloadRateMiB * 1024 * 1024)
+	if targetRateBytesPerSecond <= 0 {
+		targetRateBytesPerSecond = int64(1024 * 1024)
+	}
+	downloadTargetRateBytesPerSecond.Store(targetRateBytesPerSecond)
 	downloadQueue.Lock()
 	downloadQueue.maxConcurrent = concurrentDownloads
 	downloadQueue.Unlock()
+}
+
+func configuredAdaptiveFileConcurrency() (bool, int64) {
+	return downloadAdaptiveFileConcurrency.Load(), downloadTargetRateBytesPerSecond.Load()
 }
 
 func configuredFileConcurrency() int {
@@ -1065,13 +1079,16 @@ func downloadFileToTemp(ctx context.Context, job downloadJob) (string, error) {
 		return "", err
 	}
 	tempPath := filepath.Join(tempDir, downloadFileName(job))
+	adaptiveConcurrency, targetRateBytesPerSecond := configuredAdaptiveFileConcurrency()
 	request := filetransfer.Request{
-		URL:               job.Version.DownloadURL,
-		Destination:       tempPath,
-		Headers:           downloadHeaders(job),
-		TempDir:           tempDir,
-		Concurrency:       configuredFileConcurrency(),
-		OverwriteExisting: true,
+		URL:                  job.Version.DownloadURL,
+		Destination:          tempPath,
+		Headers:              downloadHeaders(job),
+		TempDir:              tempDir,
+		Concurrency:          configuredFileConcurrency(),
+		AdaptiveConcurrency:  adaptiveConcurrency,
+		TargetBytesPerSecond: targetRateBytesPerSecond,
+		OverwriteExisting:    true,
 	}
 	if _, err := doDownloadWithStallTimeout(ctx, newFileTransferBackend(), request); err != nil {
 		return "", err

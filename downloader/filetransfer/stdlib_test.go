@@ -10,7 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestStdlibBackendDownloadsRangesToMemory(t *testing.T) {
@@ -52,6 +54,53 @@ func TestStdlibBackendDownloadsRangesToMemory(t *testing.T) {
 	}
 	if got := rangesSnapshot(ranges); len(got) < 2 {
 		t.Fatalf("range requests = %#v", got)
+	}
+}
+
+func TestStdlibBackendAddsRangeWorkersWhenAdaptiveTargetIsMissed(t *testing.T) {
+	data := bytes.Repeat([]byte("0123456789abcdef"), 32)
+	var active atomic.Int64
+	var peak atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		start, end, ok := parseTestRange(req.Header.Get("Range"), int64(len(data)))
+		if !ok {
+			http.Error(w, "range required", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		current := active.Add(1)
+		defer active.Add(-1)
+		for {
+			previous := peak.Load()
+			if current <= previous || peak.CompareAndSwap(previous, current) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[start : end+1])
+	}))
+	defer server.Close()
+
+	previousInterval := adaptiveRampInterval
+	adaptiveRampInterval = 5 * time.Millisecond
+	t.Cleanup(func() { adaptiveRampInterval = previousInterval })
+	destination := filepath.Join(t.TempDir(), "adaptive.jar")
+	_, err := NewStdlibBackend(server.Client()).Download(t.Context(), Request{
+		URL:                  server.URL,
+		Destination:          destination,
+		Concurrency:          1,
+		ChunkSize:            32,
+		MemoryLimit:          int64(len(data)),
+		AdaptiveConcurrency:  true,
+		TargetBytesPerSecond: 1 << 30,
+	}, NewProgressTracker(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertDownloadedFile(t, destination, data)
+	if peak.Load() < 2 {
+		t.Fatalf("adaptive peak range workers = %d, want at least 2", peak.Load())
 	}
 }
 

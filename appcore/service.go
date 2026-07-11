@@ -111,6 +111,8 @@ type SettingsView struct {
 	ModrinthKeyMask             string  `json:"modrinthKeyMask"`
 	FileConcurrency             int     `json:"fileConcurrency"`
 	ConcurrentDownloads         int     `json:"concurrentDownloads"`
+	AdaptiveFileConcurrency     bool    `json:"adaptiveFileConcurrency"`
+	TargetDownloadRateMiB       float64 `json:"targetDownloadRateMiB"`
 	RequestsPerSecond           int     `json:"requestsPerSecond"`
 }
 
@@ -134,9 +136,11 @@ type SaveMCIMSettingsRequest struct {
 }
 
 type SaveNetworkSettingsRequest struct {
-	FileConcurrency     int `json:"fileConcurrency"`
-	ConcurrentDownloads int `json:"concurrentDownloads"`
-	RequestsPerSecond   int `json:"requestsPerSecond"`
+	FileConcurrency         int     `json:"fileConcurrency"`
+	ConcurrentDownloads     int     `json:"concurrentDownloads"`
+	AdaptiveFileConcurrency bool    `json:"adaptiveFileConcurrency"`
+	TargetDownloadRateMiB   float64 `json:"targetDownloadRateMiB"`
+	RequestsPerSecond       int     `json:"requestsPerSecond"`
 }
 
 type FavoriteBulkAddRequest struct {
@@ -244,8 +248,10 @@ func (s *Service) Startup(ctx context.Context) error {
 	s.applyConfigOverrides()
 	s.configureLogging()
 	downloader.Configure(downloader.Config{
-		FileConcurrency:     s.config.Downloads.FileConcurrencyValue(),
-		ConcurrentDownloads: s.config.Downloads.ConcurrentDownloadsValue(),
+		FileConcurrency:         s.config.Downloads.FileConcurrencyValue(),
+		ConcurrentDownloads:     s.config.Downloads.ConcurrentDownloadsValue(),
+		AdaptiveFileConcurrency: s.config.Downloads.AdaptiveFileConcurrency,
+		TargetDownloadRateMiB:   s.config.Downloads.TargetDownloadRateMiBValue(),
 	})
 	if minecraftDir := minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir); strings.TrimSpace(minecraftDir) != "" {
 		s.config.Prefers.MinecraftDir = minecraftDir
@@ -821,6 +827,7 @@ func (s *Service) GetSettings() SettingsView {
 		AutoScanUnusedDependencies:  configs.DefaultAutoScanUnusedDependencies,
 		FileConcurrency:             configs.DefaultFileConcurrency,
 		ConcurrentDownloads:         configs.DefaultConcurrentDownloads,
+		TargetDownloadRateMiB:       configs.DefaultTargetDownloadRateMiB,
 	}
 	if s.config != nil {
 		animationMode := s.config.Prefers.AnimationModeValue()
@@ -832,6 +839,8 @@ func (s *Service) GetSettings() SettingsView {
 		sv.MCIMEnabled = s.config.Prefers.MCIMEnabledValue()
 		sv.FileConcurrency = s.config.Downloads.FileConcurrencyValue()
 		sv.ConcurrentDownloads = s.config.Downloads.ConcurrentDownloadsValue()
+		sv.AdaptiveFileConcurrency = s.config.Downloads.AdaptiveFileConcurrency
+		sv.TargetDownloadRateMiB = s.config.Downloads.TargetDownloadRateMiBValue()
 		sv.RequestsPerSecond = s.config.API.RequestsPerSecondValue()
 		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir))
 		sv.CacheDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Runtime.CacheDir))
@@ -909,8 +918,10 @@ func (s *Service) SaveMCIMSettings(req SaveMCIMSettingsRequest) SettingsView {
 	}
 	s.configureProviderClients()
 	downloader.Configure(downloader.Config{
-		FileConcurrency:     s.config.Downloads.FileConcurrencyValue(),
-		ConcurrentDownloads: s.config.Downloads.ConcurrentDownloadsValue(),
+		FileConcurrency:         s.config.Downloads.FileConcurrencyValue(),
+		ConcurrentDownloads:     s.config.Downloads.ConcurrentDownloadsValue(),
+		AdaptiveFileConcurrency: s.config.Downloads.AdaptiveFileConcurrency,
+		TargetDownloadRateMiB:   s.config.Downloads.TargetDownloadRateMiBValue(),
 	})
 	return s.GetSettings()
 }
@@ -921,13 +932,17 @@ func (s *Service) SaveNetworkSettings(req SaveNetworkSettingsRequest) SettingsVi
 	}
 	s.config.Downloads.FileConcurrency = configs.DownloadConfig{FileConcurrency: req.FileConcurrency}.FileConcurrencyValue()
 	s.config.Downloads.ConcurrentDownloads = configs.DownloadConfig{ConcurrentDownloads: req.ConcurrentDownloads}.ConcurrentDownloadsValue()
+	s.config.Downloads.AdaptiveFileConcurrency = req.AdaptiveFileConcurrency
+	s.config.Downloads.TargetDownloadRateMiB = configs.DownloadConfig{TargetDownloadRateMiB: req.TargetDownloadRateMiB}.TargetDownloadRateMiBValue()
 	s.config.API.RequestsPerSecond = configs.APIConfig{RequestsPerSecond: req.RequestsPerSecond}.RequestsPerSecondValue()
 	if err := configs.Save(s.config); err != nil {
 		logging.Error("save network settings failed", "error", err)
 	}
 	downloader.Configure(downloader.Config{
-		FileConcurrency:     s.config.Downloads.FileConcurrency,
-		ConcurrentDownloads: s.config.Downloads.ConcurrentDownloads,
+		FileConcurrency:         s.config.Downloads.FileConcurrency,
+		ConcurrentDownloads:     s.config.Downloads.ConcurrentDownloads,
+		AdaptiveFileConcurrency: s.config.Downloads.AdaptiveFileConcurrency,
+		TargetDownloadRateMiB:   s.config.Downloads.TargetDownloadRateMiB,
 	})
 	s.configureProviderClients()
 	return s.GetSettings()

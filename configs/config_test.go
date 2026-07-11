@@ -245,6 +245,9 @@ func TestNetworkConfigDefaultsAndTOML(t *testing.T) {
 	if got := defaults.Downloads.ConcurrentDownloadsValue(); got != DefaultConcurrentDownloads {
 		t.Fatalf("default concurrent downloads = %d, want %d", got, DefaultConcurrentDownloads)
 	}
+	if got := defaults.Downloads.TargetDownloadRateMiBValue(); got != DefaultTargetDownloadRateMiB {
+		t.Fatalf("default target download rate = %v, want %v", got, DefaultTargetDownloadRateMiB)
+	}
 	if got := defaults.API.RequestsPerSecondValue(); got != 0 {
 		t.Fatalf("default API rate = %d, want unlimited", got)
 	}
@@ -254,16 +257,27 @@ func TestNetworkConfigDefaultsAndTOML(t *testing.T) {
 [downloads]
 file_concurrency = 8
 concurrent_downloads = 3
+adaptive_file_concurrency = true
+target_download_rate_mib = 2.5
 [api]
 requests_per_second = 12
 `, &cfg); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Downloads.FileConcurrencyValue() != 8 || cfg.Downloads.ConcurrentDownloadsValue() != 3 {
+	if cfg.Downloads.FileConcurrencyValue() != 8 || cfg.Downloads.ConcurrentDownloadsValue() != 3 || !cfg.Downloads.AdaptiveFileConcurrency || cfg.Downloads.TargetDownloadRateMiBValue() != 2.5 {
 		t.Fatalf("downloads = %#v", cfg.Downloads)
 	}
 	if cfg.API.RequestsPerSecondValue() != 12 {
 		t.Fatalf("API = %#v", cfg.API)
+	}
+}
+
+func TestTargetDownloadRateClampsOutOfRangeValues(t *testing.T) {
+	if got := (DownloadConfig{TargetDownloadRateMiB: 0.01}).TargetDownloadRateMiBValue(); got != MinTargetDownloadRateMiB {
+		t.Fatalf("low target download rate = %v, want %v", got, MinTargetDownloadRateMiB)
+	}
+	if got := (DownloadConfig{TargetDownloadRateMiB: 10}).TargetDownloadRateMiBValue(); got != MaxTargetDownloadRateMiB {
+		t.Fatalf("high target download rate = %v, want %v", got, MaxTargetDownloadRateMiB)
 	}
 }
 

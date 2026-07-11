@@ -110,6 +110,9 @@ func TestCurseForgeTransportRewritesMCIMURLWithoutAPIKey(t *testing.T) {
 			if got := req.URL.String(); got != "https://mod.mcimirror.top/curseforge/v1/mods/1?test=true" {
 				t.Fatalf("request URL = %q", got)
 			}
+			if got := req.Header.Get("User-Agent"); got != "mod-downloader/v1.2.3" {
+				t.Fatalf("User-Agent = %q", got)
+			}
 			if got := req.Header.Get("x-api-key"); got != "" {
 				t.Fatalf("x-api-key = %q, want empty", got)
 			}
@@ -150,7 +153,7 @@ func TestConfigureProviderClientsUsesVersionedUserAgent(t *testing.T) {
 }
 
 func TestConfigureProviderClientsUsesMCIMWithoutCurseForgeKey(t *testing.T) {
-	svc := New(Options{Config: &configs.Config{Prefers: configs.Preferences{MCIMEnabled: true}}})
+	svc := New(Options{Config: &configs.Config{Prefers: configs.Preferences{MCIMEnabled: true}}, Version: "v1.2.3"})
 	svc.configureProviderClients()
 	t.Cleanup(func() {
 		global.SetModrinthClient(nil)
@@ -163,5 +166,8 @@ func TestConfigureProviderClientsUsesMCIMWithoutCurseForgeKey(t *testing.T) {
 	client := global.GetModrinthClient()
 	if client == nil || client.BaseURL == nil || client.BaseURL.String() != mcimModrinthBaseURL {
 		t.Fatalf("Modrinth MCIM client = %#v", client)
+	}
+	if client.UserAgent != "mod-downloader/v1.2.3" {
+		t.Fatalf("Modrinth MCIM User-Agent = %q", client.UserAgent)
 	}
 }

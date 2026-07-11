@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/link-fgfgui/mod-downloader-core/networking"
 )
@@ -91,7 +93,7 @@ func rangesForSize(size, chunkSize int64) []byteRange {
 func (b *StdlibBackend) downloadRangesToMemory(ctx context.Context, req Request, size int64, tracker *ProgressTracker) error {
 	ranges := rangesForSize(size, req.ChunkSize)
 	chunks := make([][]byte, len(ranges))
-	err := runRanges(ctx, ranges, req.Concurrency, func(ctx context.Context, part byteRange) error {
+	err := runRequestRanges(ctx, ranges, req, tracker, func(ctx context.Context, part byteRange) error {
 		var buffer bytes.Buffer
 		if err := b.fetchRange(ctx, req, part.start, part.end, &trackingWriter{writer: &buffer, tracker: tracker}); err != nil {
 			return err
@@ -118,7 +120,7 @@ func (b *StdlibBackend) downloadRangesToTemp(ctx context.Context, req Request, s
 	if err := os.MkdirAll(tempDir, 0o755); err != nil {
 		return err
 	}
-	err := runRanges(ctx, ranges, req.Concurrency, func(ctx context.Context, part byteRange) error {
+	err := runRequestRanges(ctx, ranges, req, tracker, func(ctx context.Context, part byteRange) error {
 		path := filepath.Join(tempDir, fmt.Sprintf("%06d.part", part.index))
 		expected := part.end - part.start + 1
 		existing := existingPartSize(path, expected)
@@ -170,6 +172,96 @@ func (b *StdlibBackend) downloadRangesToTemp(ctx context.Context, req Request, s
 		return err
 	}
 	return os.RemoveAll(tempDir)
+}
+
+func runRequestRanges(ctx context.Context, ranges []byteRange, req Request, tracker *ProgressTracker, download func(context.Context, byteRange) error) error {
+	if !req.AdaptiveConcurrency || req.TargetBytesPerSecond <= 0 {
+		return runRanges(ctx, ranges, req.Concurrency, download)
+	}
+	return runAdaptiveRanges(ctx, ranges, req.Concurrency, req.TargetBytesPerSecond, tracker, download)
+}
+
+var adaptiveRampInterval = time.Second
+
+func runAdaptiveRanges(parent context.Context, ranges []byteRange, initialConcurrency int, targetBytesPerSecond int64, tracker *ProgressTracker, download func(context.Context, byteRange) error) error {
+	if len(ranges) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	if initialConcurrency < 1 {
+		initialConcurrency = 1
+	}
+	if initialConcurrency > len(ranges) {
+		initialConcurrency = len(ranges)
+	}
+
+	jobs := make(chan byteRange)
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	var completed atomic.Int64
+	var doneOnce sync.Once
+	var workers sync.WaitGroup
+	startWorker := func() {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for part := range jobs {
+				if err := download(ctx, part); err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					cancel()
+					return
+				}
+				if completed.Add(1) == int64(len(ranges)) {
+					doneOnce.Do(func() { close(done) })
+				}
+			}
+		}()
+	}
+	for range initialConcurrency {
+		startWorker()
+	}
+	go func() {
+		defer close(jobs)
+		for _, part := range ranges {
+			select {
+			case jobs <- part:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	workerCount := initialConcurrency
+	ticker := time.NewTicker(adaptiveRampInterval)
+	defer ticker.Stop()
+	lastProgress := tracker.Snapshot().BytesComplete
+	lastSample := time.Now()
+	for {
+		select {
+		case err := <-errCh:
+			workers.Wait()
+			return err
+		case <-parent.Done():
+			workers.Wait()
+			return parent.Err()
+		case <-done:
+			workers.Wait()
+			return nil
+		case now := <-ticker.C:
+			progress := tracker.Snapshot().BytesComplete
+			elapsed := now.Sub(lastSample).Seconds()
+			if elapsed > 0 && float64(progress-lastProgress)/elapsed < float64(targetBytesPerSecond) && workerCount < len(ranges) {
+				startWorker()
+				workerCount++
+			}
+			lastProgress = progress
+			lastSample = now
+		}
+	}
 }
 
 func (b *StdlibBackend) downloadDirect(ctx context.Context, req Request, size int64, tracker *ProgressTracker) error {

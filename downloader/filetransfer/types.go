@@ -21,14 +21,16 @@ const (
 )
 
 type Request struct {
-	URL               string
-	Destination       string
-	Headers           map[string]string
-	TempDir           string
-	Concurrency       int
-	ChunkSize         int64
-	MemoryLimit       int64
-	OverwriteExisting bool
+	URL                  string
+	Destination          string
+	Headers              map[string]string
+	TempDir              string
+	Concurrency          int
+	ChunkSize            int64
+	MemoryLimit          int64
+	AdaptiveConcurrency  bool
+	TargetBytesPerSecond int64
+	OverwriteExisting    bool
 }
 
 type Progress struct {
