@@ -679,6 +679,23 @@ func TestFavoriteListReferencesAndResolvedContents(t *testing.T) {
 	}
 }
 
+func TestFavoriteListScopeRoundTrip(t *testing.T) {
+	openTestDB(t)
+
+	created, err := CreateFavoriteListForScope("Scoped", "1.21.1", "Fabric")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.MinecraftVersion != "1.21.1" || created.ModLoader != "fabric" {
+		t.Fatalf("created scope = %#v", created)
+	}
+
+	lists := ListFavoriteLists()
+	if len(lists) != 1 || lists[0].ID != created.ID || lists[0].MinecraftVersion != "1.21.1" || lists[0].ModLoader != "fabric" {
+		t.Fatalf("listed scope = %#v", lists)
+	}
+}
+
 func TestCacheVersionModIDs(t *testing.T) {
 	path := openTestDB(t)
 

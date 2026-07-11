@@ -137,10 +137,11 @@ type DownloadStatesRequest struct {
 }
 
 type ModDownloadButtonState struct {
-	Key      string `json:"key"`
-	Status   string `json:"status"`
-	Disabled bool   `json:"disabled"`
-	Loading  bool   `json:"loading"`
-	Icon     string `json:"icon"`
-	Color    string `json:"color"`
+	Key              string `json:"key"`
+	Status           string `json:"status"`
+	ConflictFileName string `json:"conflictFileName,omitempty"`
+	Disabled         bool   `json:"disabled"`
+	Loading          bool   `json:"loading"`
+	Icon             string `json:"icon"`
+	Color            string `json:"color"`
 }

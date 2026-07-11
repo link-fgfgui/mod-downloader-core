@@ -27,17 +27,19 @@ type PinnedMod struct {
 }
 
 type FavoriteList struct {
-	ID        string `json:"id"`
-	GroupID   string `json:"groupId,omitempty"`
-	Name      string `json:"name"`
-	IconKind  string `json:"iconKind,omitempty"`
-	IconValue string `json:"iconValue,omitempty"`
-	IconURL   string `json:"iconUrl,omitempty"`
-	Pinned    bool   `json:"pinned,omitempty"`
-	CreatedAt int64  `json:"createdAt"`
-	UpdatedAt int64  `json:"updatedAt"`
-	SortOrder int    `json:"sortOrder"`
-	System    bool   `json:"system,omitempty"`
+	ID               string `json:"id"`
+	GroupID          string `json:"groupId,omitempty"`
+	Name             string `json:"name"`
+	MinecraftVersion string `json:"minecraftVersion,omitempty"`
+	ModLoader        string `json:"modLoader,omitempty"`
+	IconKind         string `json:"iconKind,omitempty"`
+	IconValue        string `json:"iconValue,omitempty"`
+	IconURL          string `json:"iconUrl,omitempty"`
+	Pinned           bool   `json:"pinned,omitempty"`
+	CreatedAt        int64  `json:"createdAt"`
+	UpdatedAt        int64  `json:"updatedAt"`
+	SortOrder        int    `json:"sortOrder"`
+	System           bool   `json:"system,omitempty"`
 }
 
 type FavoriteGroup struct {
@@ -138,6 +140,8 @@ func normalizeFavoriteList(list FavoriteList) FavoriteList {
 	list.ID = strings.TrimSpace(list.ID)
 	list.GroupID = strings.TrimSpace(list.GroupID)
 	list.Name = strings.TrimSpace(list.Name)
+	list.MinecraftVersion = strings.TrimSpace(list.MinecraftVersion)
+	list.ModLoader = strings.ToLower(strings.TrimSpace(list.ModLoader))
 	list.IconKind = strings.ToLower(strings.TrimSpace(list.IconKind))
 	list.IconValue = strings.TrimSpace(list.IconValue)
 	list.IconURL = strings.TrimSpace(list.IconURL)
@@ -963,6 +967,10 @@ func ListPinnedMods() []PinnedMod {
 // --- favorite lists ---
 
 func CreateFavoriteList(name string) (FavoriteList, error) {
+	return CreateFavoriteListForScope(name, "", "")
+}
+
+func CreateFavoriteListForScope(name, minecraftVersion, modLoader string) (FavoriteList, error) {
 	d, err := readyUserDB()
 	if err != nil {
 		return FavoriteList{}, err
@@ -972,7 +980,7 @@ func CreateFavoriteList(name string) (FavoriteList, error) {
 		return FavoriteList{}, nil
 	}
 
-	list, err := d.createFavoriteList(name)
+	list, err := d.createFavoriteList(name, minecraftVersion, modLoader)
 	if err != nil {
 		logging.Error("create favorite list failed", "name", name, "error", err)
 		return FavoriteList{}, err

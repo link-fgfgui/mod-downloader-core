@@ -430,15 +430,19 @@ func DownloadStates(req appstructs.DownloadStatesRequest, onBackfillComplete fun
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			status := InstallStatus(appstructs.ModDownloadRequest{
+			downloadReq := appstructs.ModDownloadRequest{
 				ProjectID:        states[idx].Key,
 				Result:           result,
 				MinecraftVersion: req.MinecraftVersion,
 				ModLoader:        req.ModLoader,
 				TargetDir:        targetDir,
 				InstanceID:       instanceID,
-			})
+			}
+			status := InstallStatus(downloadReq)
 			applyButtonStatus(&states[idx], status)
+			if status == BtnStatusConflict {
+				states[idx].ConflictFileName = conflictingLocalFileName(downloadReq, instanceID)
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -456,6 +460,20 @@ func DownloadStates(req appstructs.DownloadStatesRequest, onBackfillComplete fun
 		}()
 	}
 	return states
+}
+
+func conflictingLocalFileName(req appstructs.ModDownloadRequest, instanceID string) string {
+	versions := ResolveVersions(req)
+	if len(versions) == 0 {
+		return ""
+	}
+	latestSHA1 := strings.ToLower(strings.TrimSpace(versions[0].SHA1))
+	for _, path := range LocalModPathsForModIDs(resolveVersionModIDs(versions[0]), instanceID) {
+		if strings.ToLower(strings.TrimSpace(path.FileSHA1)) != latestSHA1 {
+			return filepath.Base(path.Path)
+		}
+	}
+	return ""
 }
 
 // VersionModIDs returns the mod IDs for a platform version.

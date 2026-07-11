@@ -114,11 +114,13 @@ func (s *userStore) ensureSchema() error {
 
 func (s *userStore) ensureSchemaV2() error {
 	columns := map[string]string{
-		"group_id":   "TEXT NOT NULL DEFAULT ''",
-		"icon_kind":  "TEXT NOT NULL DEFAULT ''",
-		"icon_value": "TEXT NOT NULL DEFAULT ''",
-		"icon_url":   "TEXT NOT NULL DEFAULT ''",
-		"pinned":     "INTEGER NOT NULL DEFAULT 0",
+		"group_id":          "TEXT NOT NULL DEFAULT ''",
+		"minecraft_version": "TEXT NOT NULL DEFAULT ''",
+		"mod_loader":        "TEXT NOT NULL DEFAULT ''",
+		"icon_kind":         "TEXT NOT NULL DEFAULT ''",
+		"icon_value":        "TEXT NOT NULL DEFAULT ''",
+		"icon_url":          "TEXT NOT NULL DEFAULT ''",
+		"pinned":            "INTEGER NOT NULL DEFAULT 0",
 	}
 	for name, definition := range columns {
 		ok, err := s.columnExists("favorite_lists", name)
@@ -269,7 +271,7 @@ func (s *userStore) listPinnedMods() ([]PinnedMod, error) {
 	return pins, rows.Err()
 }
 
-func (s *userStore) createFavoriteList(name string) (FavoriteList, error) {
+func (s *userStore) createFavoriteList(name, minecraftVersion, modLoader string) (FavoriteList, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return FavoriteList{}, nil
@@ -280,16 +282,18 @@ func (s *userStore) createFavoriteList(name string) (FavoriteList, error) {
 		return FavoriteList{}, err
 	}
 	list := FavoriteList{
-		ID:        NewID(),
-		Name:      name,
-		CreatedAt: now,
-		UpdatedAt: now,
-		SortOrder: maxSortOrder + 1,
+		ID:               NewID(),
+		Name:             name,
+		MinecraftVersion: strings.TrimSpace(minecraftVersion),
+		ModLoader:        strings.ToLower(strings.TrimSpace(modLoader)),
+		CreatedAt:        now,
+		UpdatedAt:        now,
+		SortOrder:        maxSortOrder + 1,
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO favorite_lists(id, name, created_at, updated_at, sort_order, system)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		list.ID, list.Name, list.CreatedAt, list.UpdatedAt, list.SortOrder, boolToInt(list.System),
+		`INSERT INTO favorite_lists(id, name, minecraft_version, mod_loader, created_at, updated_at, sort_order, system)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		list.ID, list.Name, list.MinecraftVersion, list.ModLoader, list.CreatedAt, list.UpdatedAt, list.SortOrder, boolToInt(list.System),
 	)
 	if err != nil {
 		return FavoriteList{}, err
@@ -325,7 +329,7 @@ func (s *userStore) getFavoriteList(id string) (FavoriteList, bool, error) {
 		return FavoriteList{}, false, nil
 	}
 	list, err := scanFavoriteList(s.db.QueryRow(
-		`SELECT id, group_id, name, icon_kind, icon_value, icon_url, pinned, created_at, updated_at, sort_order, system
+		`SELECT id, group_id, name, minecraft_version, mod_loader, icon_kind, icon_value, icon_url, pinned, created_at, updated_at, sort_order, system
 		 FROM favorite_lists WHERE id = ?`,
 		id,
 	))
@@ -356,7 +360,7 @@ func (s *userStore) deleteFavoriteList(id string) (bool, error) {
 
 func (s *userStore) listFavoriteLists() ([]FavoriteList, error) {
 	rows, err := s.db.Query(
-		`SELECT id, group_id, name, icon_kind, icon_value, icon_url, pinned, created_at, updated_at, sort_order, system
+		`SELECT id, group_id, name, minecraft_version, mod_loader, icon_kind, icon_value, icon_url, pinned, created_at, updated_at, sort_order, system
 		 FROM favorite_lists
 		 ORDER BY pinned DESC, sort_order ASC, created_at ASC, name ASC`,
 	)
@@ -426,6 +430,8 @@ func scanFavoriteList(scanner favoriteListScanner) (FavoriteList, error) {
 		&list.ID,
 		&list.GroupID,
 		&list.Name,
+		&list.MinecraftVersion,
+		&list.ModLoader,
 		&list.IconKind,
 		&list.IconValue,
 		&list.IconURL,

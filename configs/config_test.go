@@ -3,6 +3,7 @@ package configs
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/BurntSushi/toml"
@@ -194,19 +195,19 @@ func TestPreferencesAnimationDefaultsAndNormalization(t *testing.T) {
 
 func TestPreferencesAutoScanUnusedDependenciesDefaultAndTOML(t *testing.T) {
 	defaults := Preferences{}
-	if !defaults.AutoScanUnusedDependenciesValue() {
-		t.Fatal("default auto scan unused dependencies = false, want true")
+	if defaults.AutoScanUnusedDependenciesValue() {
+		t.Fatal("default auto scan unused dependencies = true, want false")
 	}
 
 	var cfg Config
 	if _, err := toml.Decode(`
 [preferences]
-auto_scan_unused_dependencies = false
+auto_scan_unused_dependencies = true
 `, &cfg); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Prefers.AutoScanUnusedDependenciesValue() {
-		t.Fatal("auto scan unused dependencies = true, want false")
+	if !cfg.Prefers.AutoScanUnusedDependenciesValue() {
+		t.Fatal("explicit auto scan unused dependencies = false, want true")
 	}
 }
 
@@ -266,27 +267,121 @@ requests_per_second = 12
 	}
 }
 
+func TestNetworkConfigClampsOutOfRangeValues(t *testing.T) {
+	tests := []struct {
+		name                string
+		config              Config
+		wantFileConcurrency int
+		wantDownloads       int
+		wantRPS             int
+	}{
+		{
+			name:                "below minimum uses defaults",
+			config:              Config{Downloads: DownloadConfig{FileConcurrency: -1, ConcurrentDownloads: -1}, API: APIConfig{RequestsPerSecond: -1}},
+			wantFileConcurrency: DefaultFileConcurrency,
+			wantDownloads:       DefaultConcurrentDownloads,
+			wantRPS:             MinRequestsPerSecond,
+		},
+		{
+			name:                "above maximum clamps",
+			config:              Config{Downloads: DownloadConfig{FileConcurrency: 100, ConcurrentDownloads: 100}, API: APIConfig{RequestsPerSecond: 101}},
+			wantFileConcurrency: MaxFileConcurrency,
+			wantDownloads:       MaxConcurrentDownloads,
+			wantRPS:             MaxRequestsPerSecond,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.config.Downloads.FileConcurrencyValue(); got != tt.wantFileConcurrency {
+				t.Fatalf("file concurrency = %d, want %d", got, tt.wantFileConcurrency)
+			}
+			if got := tt.config.Downloads.ConcurrentDownloadsValue(); got != tt.wantDownloads {
+				t.Fatalf("concurrent downloads = %d, want %d", got, tt.wantDownloads)
+			}
+			if got := tt.config.API.RequestsPerSecondValue(); got != tt.wantRPS {
+				t.Fatalf("requests per second = %d, want %d", got, tt.wantRPS)
+			}
+		})
+	}
+}
+
 func TestLoggingConfigTOMLAndEnvironment(t *testing.T) {
 	var cfg Config
 	if _, err := toml.Decode(`
 [logging]
-disabled = true
+enabled = false
 force_file = true
 `, &cfg); err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Logging.Disabled || !cfg.Logging.ForceFile {
+	if cfg.Logging.EnabledValue() || !cfg.Logging.ForceFile {
 		t.Fatalf("logging TOML = %#v", cfg.Logging)
 	}
 
-	t.Setenv("LOGGING_DISABLED", "true")
+	t.Setenv("LOGGING_ENABLED", "false")
 	t.Setenv("LOGGING_FORCE_FILE", "true")
 	cfg = Config{}
 	if err := readEnv(&cfg); err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Logging.Disabled || !cfg.Logging.ForceFile {
+	if cfg.Logging.EnabledValue() || !cfg.Logging.ForceFile {
 		t.Fatalf("logging env = %#v", cfg.Logging)
+	}
+}
+
+func TestLoggingEnabledTakesPrecedenceOverLegacyDisabled(t *testing.T) {
+	var cfg Config
+	if _, err := toml.Decode(`
+[logging]
+enabled = true
+disabled = true
+`, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Logging.EnabledValue() {
+		t.Fatal("enabled must take precedence over legacy disabled")
+	}
+
+	t.Setenv("LOGGING_ENABLED", "true")
+	t.Setenv("LOGGING_DISABLED", "true")
+	cfg = Config{}
+	if err := readEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Logging.EnabledValue() {
+		t.Fatal("LOGGING_ENABLED must take precedence over legacy LOGGING_DISABLED")
+	}
+}
+
+func TestSaveLoggingUsesCanonicalEnabledKey(t *testing.T) {
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	disabled := true
+	if err := Save(&Config{Logging: LoggingConfig{Disabled: &disabled}}); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(filepath.Join(dir, configFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(contents)
+	if !strings.Contains(text, "enabled = false") {
+		t.Fatalf("saved config does not contain canonical enabled key:\n%s", text)
+	}
+	if strings.Contains(text, "disabled =") {
+		t.Fatalf("saved config contains legacy disabled key:\n%s", text)
 	}
 }
 
@@ -317,7 +412,7 @@ force_file = false
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !loggingConfig.Disabled || !loggingConfig.ForceFile {
+	if loggingConfig.EnabledValue() || !loggingConfig.ForceFile {
 		t.Fatalf("logging bootstrap = %#v", loggingConfig)
 	}
 }

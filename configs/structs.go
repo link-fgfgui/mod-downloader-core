@@ -117,7 +117,7 @@ const (
 	DefaultAnimationDurationMultiplier = 1.0
 	MinAnimationDurationMultiplier     = 0.25
 	MaxAnimationDurationMultiplier     = 3.0
-	DefaultAutoScanUnusedDependencies  = true
+	DefaultAutoScanUnusedDependencies  = false
 )
 
 func BoolPtr(value bool) *bool {
@@ -181,6 +181,12 @@ type RuntimeConfig struct {
 const (
 	DefaultFileConcurrency     = 4
 	DefaultConcurrentDownloads = 1
+	MinFileConcurrency         = 1
+	MaxFileConcurrency         = 32
+	MinConcurrentDownloads     = 1
+	MaxConcurrentDownloads     = 16
+	MinRequestsPerSecond       = 0
+	MaxRequestsPerSecond       = 100
 )
 
 type DownloadConfig struct {
@@ -189,15 +195,21 @@ type DownloadConfig struct {
 }
 
 func (c DownloadConfig) FileConcurrencyValue() int {
-	if c.FileConcurrency <= 0 {
+	if c.FileConcurrency < MinFileConcurrency {
 		return DefaultFileConcurrency
+	}
+	if c.FileConcurrency > MaxFileConcurrency {
+		return MaxFileConcurrency
 	}
 	return c.FileConcurrency
 }
 
 func (c DownloadConfig) ConcurrentDownloadsValue() int {
-	if c.ConcurrentDownloads <= 0 {
+	if c.ConcurrentDownloads < MinConcurrentDownloads {
 		return DefaultConcurrentDownloads
+	}
+	if c.ConcurrentDownloads > MaxConcurrentDownloads {
+		return MaxConcurrentDownloads
 	}
 	return c.ConcurrentDownloads
 }
@@ -207,13 +219,31 @@ type APIConfig struct {
 }
 
 type LoggingConfig struct {
-	Disabled  bool `toml:"disabled" json:"disabled" env:"DISABLED"`
-	ForceFile bool `toml:"force_file" json:"forceFile" env:"FORCE_FILE"`
+	Enabled   *bool `toml:"enabled,omitempty" json:"enabled,omitempty" env:"-"`
+	Disabled  *bool `toml:"disabled,omitempty" json:"-" env:"-"`
+	ForceFile bool  `toml:"force_file" json:"forceFile" env:"FORCE_FILE"`
+}
+
+func (c LoggingConfig) EnabledValue() bool {
+	if c.Enabled != nil {
+		return *c.Enabled
+	}
+	if c.Disabled != nil {
+		return !*c.Disabled
+	}
+	return true
+}
+
+func (c LoggingConfig) Canonical() LoggingConfig {
+	return LoggingConfig{Enabled: BoolPtr(c.EnabledValue()), ForceFile: c.ForceFile}
 }
 
 func (c APIConfig) RequestsPerSecondValue() int {
-	if c.RequestsPerSecond < 0 {
-		return 0
+	if c.RequestsPerSecond < MinRequestsPerSecond {
+		return MinRequestsPerSecond
+	}
+	if c.RequestsPerSecond > MaxRequestsPerSecond {
+		return MaxRequestsPerSecond
 	}
 	return c.RequestsPerSecond
 }

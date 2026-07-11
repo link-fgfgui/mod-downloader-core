@@ -39,6 +39,7 @@ const (
 	EventDownloadCompleted      EventKind = "downloadCompleted"
 	EventMinecraftDirChanged    EventKind = "minecraftDirChanged"
 	EventSelectedVersionChanged EventKind = "selectedVersionChanged"
+	EventUsageStatsUpdated      EventKind = "usageStatsUpdated"
 )
 
 const minecraftReleaseCacheTTL = 24 * time.Hour
@@ -108,6 +109,9 @@ type SettingsView struct {
 	CurseforgeKeyMask           string  `json:"curseforgeKeyMask"`
 	HasModrinthKey              bool    `json:"hasModrinthKey"`
 	ModrinthKeyMask             string  `json:"modrinthKeyMask"`
+	FileConcurrency             int     `json:"fileConcurrency"`
+	ConcurrentDownloads         int     `json:"concurrentDownloads"`
+	RequestsPerSecond           int     `json:"requestsPerSecond"`
 }
 
 type SaveApiKeysRequest struct {
@@ -127,6 +131,12 @@ type SaveUnusedDependencyCleanupSettingsRequest struct {
 
 type SaveMCIMSettingsRequest struct {
 	MCIMEnabled bool `json:"mcimEnabled"`
+}
+
+type SaveNetworkSettingsRequest struct {
+	FileConcurrency     int `json:"fileConcurrency"`
+	ConcurrentDownloads int `json:"concurrentDownloads"`
+	RequestsPerSecond   int `json:"requestsPerSecond"`
 }
 
 type FavoriteBulkAddRequest struct {
@@ -410,7 +420,11 @@ func (s *Service) ListFavoriteLists() []storage.FavoriteList {
 }
 
 func (s *Service) CreateFavoriteList(name string) storage.FavoriteList {
-	list, err := storage.CreateFavoriteList(name)
+	return s.CreateFavoriteListForScope(name, "", "")
+}
+
+func (s *Service) CreateFavoriteListForScope(name, minecraftVersion, modLoader string) storage.FavoriteList {
+	list, err := storage.CreateFavoriteListForScope(name, minecraftVersion, modLoader)
 	if err != nil {
 		logging.Error("create favorite list failed", "name", name, "error", err)
 		return storage.FavoriteList{}
@@ -459,48 +473,6 @@ func (s *Service) ReorderFavoriteLists(ids []string) bool {
 	return true
 }
 
-func (s *Service) ListFavoriteGroups() []storage.FavoriteGroup {
-	return storage.ListFavoriteGroups()
-}
-
-func (s *Service) CreateFavoriteGroup(name string) storage.FavoriteGroup {
-	group, err := storage.CreateFavoriteGroup(name)
-	if err != nil {
-		logging.Error("create favorite group failed", "name", name, "error", err)
-		return storage.FavoriteGroup{}
-	}
-	return group
-}
-
-func (s *Service) RenameFavoriteGroup(id, name string) storage.FavoriteGroup {
-	group, ok, err := storage.UpdateFavoriteGroupName(id, name)
-	if err != nil {
-		logging.Error("rename favorite group failed", "id", id, "name", name, "error", err)
-		return storage.FavoriteGroup{}
-	}
-	if !ok {
-		return storage.FavoriteGroup{}
-	}
-	return group
-}
-
-func (s *Service) DeleteFavoriteGroup(id string) bool {
-	deleted, err := storage.DeleteFavoriteGroup(id)
-	if err != nil {
-		logging.Error("delete favorite group failed", "id", id, "error", err)
-		return false
-	}
-	return deleted
-}
-
-func (s *Service) ReorderFavoriteGroups(ids []string) bool {
-	if err := storage.ReorderFavoriteGroups(ids); err != nil {
-		logging.Error("reorder favorite groups failed", "error", err)
-		return false
-	}
-	return true
-}
-
 func (s *Service) ListFavoriteMods(listID string) []storage.FavoriteMod {
 	return storage.ListFavoriteMods(listID)
 }
@@ -520,7 +492,7 @@ func (s *Service) AddFavoriteMod(mod storage.FavoriteMod) storage.FavoriteMod {
 		return storage.FavoriteMod{}
 	}
 	if !existed {
-		_ = storage.IncrementUsageStat(storage.UsageStatFavoritesAdded, 1)
+		s.incrementUsageStat(storage.UsageStatFavoritesAdded, 1)
 	}
 	return saved
 }
@@ -564,7 +536,7 @@ func (s *Service) AddFavoriteModsToLists(req FavoriteBulkAddRequest) FavoriteBul
 		}
 	}
 	if result.Added > 0 {
-		_ = storage.IncrementUsageStat(storage.UsageStatFavoritesAdded, int64(result.Added))
+		s.incrementUsageStat(storage.UsageStatFavoritesAdded, int64(result.Added))
 	}
 	return result
 }
@@ -847,6 +819,8 @@ func (s *Service) GetSettings() SettingsView {
 		AnimationEnabled:            configs.DefaultAnimationsEnabled,
 		AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
 		AutoScanUnusedDependencies:  configs.DefaultAutoScanUnusedDependencies,
+		FileConcurrency:             configs.DefaultFileConcurrency,
+		ConcurrentDownloads:         configs.DefaultConcurrentDownloads,
 	}
 	if s.config != nil {
 		animationMode := s.config.Prefers.AnimationModeValue()
@@ -856,6 +830,9 @@ func (s *Service) GetSettings() SettingsView {
 		sv.AnimationDurationMultiplier = s.config.Prefers.NormalizedAnimationDurationMultiplier()
 		sv.AutoScanUnusedDependencies = s.config.Prefers.AutoScanUnusedDependenciesValue()
 		sv.MCIMEnabled = s.config.Prefers.MCIMEnabledValue()
+		sv.FileConcurrency = s.config.Downloads.FileConcurrencyValue()
+		sv.ConcurrentDownloads = s.config.Downloads.ConcurrentDownloadsValue()
+		sv.RequestsPerSecond = s.config.API.RequestsPerSecondValue()
 		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir))
 		sv.CacheDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Runtime.CacheDir))
 		sv.HasCurseforgeKey = strings.TrimSpace(s.config.Keys.CurseforgeApiKey) != ""
@@ -935,6 +912,24 @@ func (s *Service) SaveMCIMSettings(req SaveMCIMSettingsRequest) SettingsView {
 		FileConcurrency:     s.config.Downloads.FileConcurrencyValue(),
 		ConcurrentDownloads: s.config.Downloads.ConcurrentDownloadsValue(),
 	})
+	return s.GetSettings()
+}
+
+func (s *Service) SaveNetworkSettings(req SaveNetworkSettingsRequest) SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	s.config.Downloads.FileConcurrency = configs.DownloadConfig{FileConcurrency: req.FileConcurrency}.FileConcurrencyValue()
+	s.config.Downloads.ConcurrentDownloads = configs.DownloadConfig{ConcurrentDownloads: req.ConcurrentDownloads}.ConcurrentDownloadsValue()
+	s.config.API.RequestsPerSecond = configs.APIConfig{RequestsPerSecond: req.RequestsPerSecond}.RequestsPerSecondValue()
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save network settings failed", "error", err)
+	}
+	downloader.Configure(downloader.Config{
+		FileConcurrency:     s.config.Downloads.FileConcurrency,
+		ConcurrentDownloads: s.config.Downloads.ConcurrentDownloads,
+	})
+	s.configureProviderClients()
 	return s.GetSettings()
 }
 
@@ -1223,11 +1218,11 @@ func (s *Service) ApplyLocalModBatchOperation(req appstructs.LocalModBatchOperat
 	if err := applyLocalModFileOperations(ops); err != nil {
 		return s.RefreshSelectedVersionMods(), err
 	}
-	recordLocalModUsage(ops)
+	s.recordLocalModUsage(ops)
 	return s.RefreshSelectedVersionMods(), nil
 }
 
-func recordLocalModUsage(ops []localModFileOperation) {
+func (s *Service) recordLocalModUsage(ops []localModFileOperation) {
 	counts := make(map[storage.UsageStatKey]int64)
 	for _, op := range ops {
 		switch op.action {
@@ -1240,7 +1235,7 @@ func recordLocalModUsage(ops []localModFileOperation) {
 		}
 	}
 	for key, count := range counts {
-		_ = storage.IncrementUsageStat(key, count)
+		s.incrementUsageStat(key, count)
 	}
 }
 
@@ -1587,7 +1582,7 @@ func (s *Service) configureLoggingConfig(config configs.LoggingConfig) {
 		path = filepath.Join(workDir, logging.DefaultFileName)
 	}
 	if err := logging.Configure(logging.Options{
-		Disabled:  config.Disabled,
+		Disabled:  !config.EnabledValue(),
 		ForceFile: config.ForceFile,
 		FilePath:  path,
 	}); err != nil {
@@ -1604,10 +1599,18 @@ func (s *Service) downloadEvents() downloader.Events {
 			s.emit(EventDownloadFailed, event)
 		},
 		OnDownloadCompleted: func() {
-			_ = storage.IncrementUsageStat(storage.UsageStatDownloadsCompleted, 1)
+			s.incrementUsageStat(storage.UsageStatDownloadsCompleted, 1)
 			s.emit(EventDownloadCompleted, nil)
 		},
 	}
+}
+
+func (s *Service) incrementUsageStat(key storage.UsageStatKey, delta int64) {
+	if err := storage.IncrementUsageStat(key, delta); err != nil {
+		logging.Warn("increment usage stat failed", "key", key, "delta", delta, "error", err)
+		return
+	}
+	s.emit(EventUsageStatsUpdated, storage.GetUsageStats())
 }
 
 func (s *Service) emit(kind EventKind, payload any) {

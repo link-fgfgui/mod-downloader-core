@@ -52,19 +52,28 @@ func TestDownloadCompletionEventAndUsageStat(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(storage.Close)
-	events := make(chan Event, 1)
+	events := make(chan Event, 2)
 	svc := New(Options{OnEvent: func(event Event) { events <- event }})
 	svc.downloadEvents().OnDownloadCompleted()
 	if got := svc.GetUsageStats().DownloadsCompleted; got != 1 {
 		t.Fatalf("downloads completed = %d, want 1", got)
 	}
-	select {
-	case event := <-events:
-		if event.Kind != EventDownloadCompleted || event.Payload != nil {
-			t.Fatalf("completion event = %#v", event)
+	seen := make(map[EventKind]Event)
+	for range 2 {
+		select {
+		case event := <-events:
+			seen[event.Kind] = event
+		case <-time.After(time.Second):
+			t.Fatal("download completion events not emitted")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("download completion event not emitted")
+	}
+	if event, ok := seen[EventDownloadCompleted]; !ok || event.Payload != nil {
+		t.Fatalf("completion event = %#v", event)
+	}
+	if event, ok := seen[EventUsageStatsUpdated]; !ok {
+		t.Fatal("usage stats event not emitted")
+	} else if stats, ok := event.Payload.(storage.UsageStats); !ok || stats.DownloadsCompleted != 1 {
+		t.Fatalf("usage stats event = %#v", event)
 	}
 }
 
@@ -397,39 +406,22 @@ func TestFavoriteListReferenceServiceMethods(t *testing.T) {
 	}
 }
 
-func TestFavoriteGroupMetadataAndReorderServiceMethods(t *testing.T) {
+func TestFavoriteListMetadataAndReorderServiceMethods(t *testing.T) {
 	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(storage.Close)
 
 	svc := New(Options{})
-	first := svc.CreateFavoriteGroup("Utilities")
-	second := svc.CreateFavoriteGroup("Performance")
-	if first.ID == "" || second.ID == "" {
-		t.Fatalf("groups = %#v %#v", first, second)
-	}
-	if renamed := svc.RenameFavoriteGroup(first.ID, "Utility Mods"); renamed.ID != first.ID || renamed.Name != "Utility Mods" {
-		t.Fatalf("renamed group = %#v", renamed)
-	}
-	if !svc.ReorderFavoriteGroups([]string{second.ID, first.ID}) {
-		t.Fatal("ReorderFavoriteGroups returned false")
-	}
-	groups := svc.ListFavoriteGroups()
-	if len(groups) != 2 || groups[0].ID != second.ID || groups[1].ID != first.ID {
-		t.Fatalf("groups after reorder = %#v", groups)
-	}
-
 	listA := svc.CreateFavoriteList("A")
 	listB := svc.CreateFavoriteList("B")
 	updated := svc.UpdateFavoriteListMetadata(storage.FavoriteList{
 		ID:        listA.ID,
-		GroupID:   second.ID,
 		IconKind:  "mdi",
 		IconValue: "mdi-star",
 		Pinned:    true,
 	})
-	if updated.ID != listA.ID || updated.GroupID != second.ID || updated.IconKind != "mdi" || !updated.Pinned {
+	if updated.ID != listA.ID || updated.IconKind != "mdi" || !updated.Pinned {
 		t.Fatalf("updated list metadata = %#v", updated)
 	}
 	if !svc.ReorderFavoriteLists([]string{listB.ID, listA.ID}) {
@@ -438,15 +430,6 @@ func TestFavoriteGroupMetadataAndReorderServiceMethods(t *testing.T) {
 	lists := svc.ListFavoriteLists()
 	if len(lists) != 2 || lists[0].ID != listA.ID || lists[0].SortOrder <= lists[1].SortOrder {
 		t.Fatalf("lists after pinned metadata and reorder = %#v", lists)
-	}
-	if !svc.DeleteFavoriteGroup(second.ID) {
-		t.Fatal("DeleteFavoriteGroup returned false")
-	}
-	lists = svc.ListFavoriteLists()
-	for _, list := range lists {
-		if list.GroupID == second.ID {
-			t.Fatalf("deleted group still assigned to list: %#v", lists)
-		}
 	}
 }
 
@@ -740,25 +723,25 @@ func TestSaveUnusedDependencyCleanupSettingsPersists(t *testing.T) {
 	})
 
 	svc := New(Options{Config: &configs.Config{}})
-	if !svc.GetSettings().AutoScanUnusedDependencies {
-		t.Fatal("default auto scan unused dependencies = false, want true")
+	if svc.GetSettings().AutoScanUnusedDependencies {
+		t.Fatal("default auto scan unused dependencies = true, want false")
 	}
 	view := svc.SaveUnusedDependencyCleanupSettings(SaveUnusedDependencyCleanupSettingsRequest{
-		AutoScanUnusedDependencies: false,
+		AutoScanUnusedDependencies: true,
 	})
-	if view.AutoScanUnusedDependencies {
-		t.Fatal("view auto scan unused dependencies = true, want false")
+	if !view.AutoScanUnusedDependencies {
+		t.Fatal("view auto scan unused dependencies = false, want true")
 	}
-	if svc.Config().Prefers.AutoScanUnusedDependencies == nil || *svc.Config().Prefers.AutoScanUnusedDependencies {
-		t.Fatalf("config auto scan unused dependencies = %#v, want false", svc.Config().Prefers.AutoScanUnusedDependencies)
+	if svc.Config().Prefers.AutoScanUnusedDependencies == nil || !*svc.Config().Prefers.AutoScanUnusedDependencies {
+		t.Fatalf("config auto scan unused dependencies = %#v, want true", svc.Config().Prefers.AutoScanUnusedDependencies)
 	}
 
 	loaded, err := configs.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Prefers.AutoScanUnusedDependenciesValue() {
-		t.Fatal("persisted auto scan unused dependencies = true, want false")
+	if !loaded.Prefers.AutoScanUnusedDependenciesValue() {
+		t.Fatal("persisted auto scan unused dependencies = false, want true")
 	}
 }
 
@@ -807,5 +790,43 @@ func TestSaveMCIMSettingsPersistsAndReconfiguresProviders(t *testing.T) {
 	client = global.GetModrinthClient()
 	if client == nil || client.BaseURL == nil || client.BaseURL.String() == mcimModrinthBaseURL {
 		t.Fatalf("Modrinth official client = %#v", client)
+	}
+}
+
+func TestSaveNetworkSettingsClampsAndPersists(t *testing.T) {
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	appDir := t.TempDir()
+	if err := os.Chdir(appDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	svc := New(Options{Config: &configs.Config{}})
+	view := svc.SaveNetworkSettings(SaveNetworkSettingsRequest{
+		FileConcurrency:     100,
+		ConcurrentDownloads: -1,
+		RequestsPerSecond:   101,
+	})
+	if view.FileConcurrency != configs.MaxFileConcurrency ||
+		view.ConcurrentDownloads != configs.DefaultConcurrentDownloads ||
+		view.RequestsPerSecond != configs.MaxRequestsPerSecond {
+		t.Fatalf("network settings view = %#v", view)
+	}
+
+	loaded, err := configs.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Downloads.FileConcurrency != configs.MaxFileConcurrency ||
+		loaded.Downloads.ConcurrentDownloads != configs.DefaultConcurrentDownloads ||
+		loaded.API.RequestsPerSecond != configs.MaxRequestsPerSecond {
+		t.Fatalf("persisted network settings = %#v", loaded)
 	}
 }

@@ -86,7 +86,7 @@ func (s *Service) ExportFavoriteListPackwizZipForScope(listID, destinationPath, 
 		return ExportFavoriteListPackwizResult{}, err
 	}
 	logging.Info("favorite list exported as packwiz zip", "listID", listID, "path", destinationPath, "modCount", len(mods))
-	_ = storage.IncrementUsageStat(storage.UsageStatPackwizExports, 1)
+	s.incrementUsageStat(storage.UsageStatPackwizExports, 1)
 	return ExportFavoriteListPackwizResult{Path: destinationPath}, nil
 }
 

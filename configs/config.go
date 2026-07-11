@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/link-fgfgui/mod-downloader-core/logging"
 
@@ -45,13 +46,18 @@ func Load() (*Config, error) {
 				logging.Error("load config from environment failed", "error", err)
 				return nil, fmt.Errorf("read env: %w", err)
 			}
+			cfg.Logging = cfg.Logging.Canonical()
 			logging.Info("config loaded from environment", "hasCurseforgeKey", cfg.Keys.CurseforgeApiKey != "", "hasModrinthKey", cfg.Keys.ModrinthApiKey != "", "minecraftDir", cfg.Prefers.MinecraftDir)
 			return &cfg, nil
 		}
 		logging.Error("load config file failed", "path", path, "error", err)
 		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
+	if err := readLoggingEnv(&cfg.Logging); err != nil {
+		return nil, fmt.Errorf("read logging env: %w", err)
+	}
 
+	cfg.Logging = cfg.Logging.Canonical()
 	logging.Info("config loaded from file", "path", path, "hasCurseforgeKey", cfg.Keys.CurseforgeApiKey != "", "hasModrinthKey", cfg.Keys.ModrinthApiKey != "", "minecraftDir", cfg.Prefers.MinecraftDir)
 	return &cfg, nil
 }
@@ -70,15 +76,42 @@ func LoadLogging() (LoggingConfig, error) {
 			if err := cleanenv.ReadEnv(&cfg); err != nil {
 				return LoggingConfig{}, err
 			}
-			return cfg.Logging, nil
+			if err := readLoggingEnv(&cfg.Logging); err != nil {
+				return LoggingConfig{}, err
+			}
+			return cfg.Logging.Canonical(), nil
 		}
 		return LoggingConfig{}, err
 	}
-	return cfg.Logging, nil
+	if err := readLoggingEnv(&cfg.Logging); err != nil {
+		return LoggingConfig{}, err
+	}
+	return cfg.Logging.Canonical(), nil
 }
 
 func readEnv(cfg *Config) error {
-	return cleanenv.ReadEnv(cfg)
+	if err := cleanenv.ReadEnv(cfg); err != nil {
+		return err
+	}
+	return readLoggingEnv(&cfg.Logging)
+}
+
+func readLoggingEnv(cfg *LoggingConfig) error {
+	if raw, ok := os.LookupEnv("LOGGING_ENABLED"); ok {
+		value, err := strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("parse LOGGING_ENABLED: %w", err)
+		}
+		cfg.Enabled = BoolPtr(value)
+	}
+	if raw, ok := os.LookupEnv("LOGGING_DISABLED"); ok {
+		value, err := strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("parse LOGGING_DISABLED: %w", err)
+		}
+		cfg.Disabled = BoolPtr(value)
+	}
+	return nil
 }
 
 // LoadEnv reads configuration from environment variables only.
@@ -88,6 +121,7 @@ func LoadEnv() (*Config, error) {
 		logging.Error("load config from environment failed", "error", err)
 		return nil, fmt.Errorf("read env: %w", err)
 	}
+	cfg.Logging = cfg.Logging.Canonical()
 	logging.Info("config loaded from environment", "hasCurseforgeKey", cfg.Keys.CurseforgeApiKey != "", "hasModrinthKey", cfg.Keys.ModrinthApiKey != "", "minecraftDir", cfg.Prefers.MinecraftDir, "cacheDir", cfg.Runtime.CacheDir)
 	return &cfg, nil
 }
@@ -108,8 +142,10 @@ func Save(cfg *Config) error {
 	}
 	defer f.Close()
 
+	canonical := *cfg
+	canonical.Logging = cfg.Logging.Canonical()
 	encoder := toml.NewEncoder(f)
-	if err := encoder.Encode(cfg); err != nil {
+	if err := encoder.Encode(&canonical); err != nil {
 		logging.Error("encode config failed", "path", path, "error", err)
 		return fmt.Errorf("encode config: %w", err)
 	}
