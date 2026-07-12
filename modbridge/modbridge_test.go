@@ -465,6 +465,41 @@ func TestCachedRemoteModIDsCachesFailures(t *testing.T) {
 	}
 }
 
+func TestRemoteMetadataButtonStatusReflectsFailureTTL(t *testing.T) {
+	resetRemoteModIDCache()
+	t.Cleanup(resetRemoteModIDCache)
+
+	version := models.ModVersion{DownloadURL: "https://cdn.example.test/status.jar"}
+	if got := remoteMetadataButtonStatus(version, "fabric"); got != BtnStatusMetadataLoading {
+		t.Fatalf("initial metadata status = %q, want %q", got, BtnStatusMetadataLoading)
+	}
+
+	key := remoteModIDCacheKey(version.DownloadURL, "fabric")
+	remoteModIDCache.Lock()
+	remoteModIDCache.entries[key] = &remoteModIDCacheEntry{expiresAt: time.Now().Add(time.Second)}
+	remoteModIDCache.Unlock()
+	if got := remoteMetadataButtonStatus(version, "fabric"); got != BtnStatusMetadataFailed {
+		t.Fatalf("cached failure metadata status = %q, want %q", got, BtnStatusMetadataFailed)
+	}
+
+	remoteModIDCache.Lock()
+	remoteModIDCache.entries[key].expiresAt = time.Now().Add(-time.Second)
+	remoteModIDCache.Unlock()
+	if got := remoteMetadataButtonStatus(version, "fabric"); got != BtnStatusMetadataLoading {
+		t.Fatalf("expired failure metadata status = %q, want %q", got, BtnStatusMetadataLoading)
+	}
+}
+
+func TestApplyButtonStatusStylesMetadataStatesAsRetryable(t *testing.T) {
+	for _, status := range []string{BtnStatusMetadataLoading, BtnStatusMetadataFailed} {
+		state := defaultDownloadButtonState(models.ModProject{})
+		applyButtonStatus(&state, status)
+		if state.Status != status || state.Disabled || state.Loading || state.Color != "surface-variant" {
+			t.Fatalf("metadata state for %q = %#v, want enabled gray non-spinner button", status, state)
+		}
+	}
+}
+
 func TestMarkBackfillDeduplicatesByVersionID(t *testing.T) {
 	resetBackfillState()
 	t.Cleanup(resetBackfillState)

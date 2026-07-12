@@ -27,15 +27,17 @@ import (
 
 // Button status constants shared by downloader and modbridge.
 const (
-	BtnStatusNew          = "new"          // No same modId in instance -> standard download
-	BtnStatusInstalled    = "installed"    // Installed and same sha1 as latest -> disabled
-	BtnStatusUpdate       = "update"       // Same modId same project but not latest -> update
-	BtnStatusConflict     = "conflict"     // Same modId but not from this project's versions -> switch source
-	BtnStatusIncompatible = "incompatible" // Requested version declares an incompatible installed project
+	BtnStatusNew             = "new"          // No same modId in instance -> standard download
+	BtnStatusInstalled       = "installed"    // Installed and same sha1 as latest -> disabled
+	BtnStatusUpdate          = "update"       // Same modId same project but not latest -> update
+	BtnStatusConflict        = "conflict"     // Same modId but not from this project's versions -> switch source
+	BtnStatusIncompatible    = "incompatible" // Requested version declares an incompatible installed project
+	BtnStatusMetadataLoading = "metadataLoading"
+	BtnStatusMetadataFailed  = "metadataFailed"
 )
 
 const (
-	remoteModIDFailureTTL = 30 * time.Second
+	remoteModIDFailureTTL = 10 * time.Second
 	remoteModJarTimeout   = 30 * time.Second
 )
 
@@ -224,6 +226,7 @@ func InstallStatus(req appstructs.ModDownloadRequest) string {
 		}
 	} else {
 		markBackfill(version, req.ModLoader)
+		return remoteMetadataButtonStatus(version, req.ModLoader)
 	}
 
 	return BtnStatusNew
@@ -594,6 +597,21 @@ func remoteModIDBackfillSuppressed(downloadURL, modLoader string) bool {
 	return entry != nil && !entry.loading && len(entry.modIDs) == 0 && time.Now().Before(entry.expiresAt)
 }
 
+func remoteMetadataButtonStatus(version models.ModVersion, modLoader string) string {
+	if strings.TrimSpace(version.DownloadURL) == "" {
+		return BtnStatusMetadataFailed
+	}
+	key := remoteModIDCacheKey(version.DownloadURL, modLoader)
+	remoteModIDCache.Lock()
+	entry := remoteModIDCache.entries[key]
+	if entry != nil && !entry.loading && len(entry.modIDs) == 0 && time.Now().Before(entry.expiresAt) {
+		remoteModIDCache.Unlock()
+		return BtnStatusMetadataFailed
+	}
+	remoteModIDCache.Unlock()
+	return BtnStatusMetadataLoading
+}
+
 // PersistVersionModIDs persists modIDs for a platform version.
 // Returns true if the IDs were persisted successfully.
 func PersistVersionModIDs(platformVersionID string, modIDs []string) bool {
@@ -864,6 +882,12 @@ func applyButtonStatus(state *appstructs.ModDownloadButtonState, status string) 
 	case BtnStatusIncompatible:
 		state.Icon = "mdi-alert-octagon-outline"
 		state.Color = "error"
+	case BtnStatusMetadataLoading:
+		state.Icon = "mdi-progress-clock"
+		state.Color = "surface-variant"
+	case BtnStatusMetadataFailed:
+		state.Icon = "mdi-refresh"
+		state.Color = "surface-variant"
 	default:
 		state.Icon = "mdi-download"
 		state.Color = "primary"
