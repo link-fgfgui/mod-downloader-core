@@ -17,6 +17,11 @@ type PlatformAssociation struct {
 	ModrinthProjectID   string `json:"modrinthProjectId,omitempty"`
 }
 
+type CachedModVersionCandidate struct {
+	Project models.ModProject
+	Version models.ModVersion
+}
+
 type PinnedMod struct {
 	ID               string `json:"id"`
 	Platform         string `json:"platform"`
@@ -826,6 +831,83 @@ func GetPlatformVersions(platform, projectID string) ([]models.ModVersion, error
 	}
 	logging.Debug("platform versions loaded", "platform", platform, "projectID", projectID, "versionCount", len(versions))
 	return versions, nil
+}
+
+// FindCachedModVersionsByModID returns the newest compatible cached version for
+// each platform project declaring modID. It never refreshes provider metadata.
+func FindCachedModVersionsByModID(modID, minecraftVersion, modLoader string) []CachedModVersionCandidate {
+	d, err := readyDB()
+	if err != nil {
+		return nil
+	}
+	modID = strings.ToLower(strings.TrimSpace(modID))
+	minecraftVersion = strings.TrimSpace(minecraftVersion)
+	modLoader = strings.ToLower(strings.TrimSpace(modLoader))
+	if modID == "" {
+		return nil
+	}
+
+	byProject := make(map[platformKey]CachedModVersionCandidate)
+	_ = d.view(func(state *cacheState) error {
+		for key, version := range state.PlatformVersions {
+			if !containsCachedValue(version.ModIDs, modID) ||
+				!containsCachedValue(version.GameVersions, minecraftVersion) ||
+				!containsCachedValue(version.Loaders, modLoader) {
+				continue
+			}
+			if strings.TrimSpace(version.ID) == "" || strings.TrimSpace(version.DownloadURL) == "" {
+				continue
+			}
+			projectKey := platformKey{Platform: key.Platform, ProjectID: key.ProjectID}
+			current, ok := byProject[projectKey]
+			if ok && !cachedVersionBefore(current.Version, version) {
+				continue
+			}
+			project := state.ModPlatforms[projectKey]
+			if strings.TrimSpace(project.Platform) == "" {
+				project.Platform = key.Platform
+			}
+			if strings.TrimSpace(project.ProjectID) == "" {
+				project.ProjectID = key.ProjectID
+			}
+			byProject[projectKey] = CachedModVersionCandidate{
+				Project: copyProject(project),
+				Version: copyVersion(version),
+			}
+		}
+		return nil
+	})
+
+	out := make([]CachedModVersionCandidate, 0, len(byProject))
+	for _, candidate := range byProject {
+		out = append(out, candidate)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		left := models.ProjectKey(out[i].Project.Platform, out[i].Project.ProjectID)
+		right := models.ProjectKey(out[j].Project.Platform, out[j].Project.ProjectID)
+		return left < right
+	})
+	return out
+}
+
+func containsCachedValue(values []string, expected string) bool {
+	expected = strings.ToLower(strings.TrimSpace(expected))
+	if expected == "" {
+		return true
+	}
+	for _, value := range values {
+		if strings.ToLower(strings.TrimSpace(value)) == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func cachedVersionBefore(current, next models.ModVersion) bool {
+	if current.PublishedAt != next.PublishedAt {
+		return current.PublishedAt < next.PublishedAt
+	}
+	return strings.TrimSpace(current.ID) < strings.TrimSpace(next.ID)
 }
 
 // --- mod dependencies ---

@@ -132,6 +132,44 @@ func TestScanUnusedDependenciesIgnoresDisabledDependentsAndOrdinaryMods(t *testi
 	}
 }
 
+func TestScanUnusedDependenciesTreatsEnabledJijAsProvider(t *testing.T) {
+	mods := []structs.ModInfo{
+		{
+			ID:      "main",
+			Path:    "main.jar",
+			Enabled: true,
+			Dependencies: []structs.LocalModDependency{{
+				ModID: "architectury",
+				Type:  "required",
+			}},
+		},
+		{
+			ID:         "architectury",
+			Name:       "Architectury API",
+			Path:       "architectury.jar",
+			Enabled:    true,
+			Categories: []string{"library"},
+		},
+		{
+			ID:      "host",
+			Path:    "host.jar",
+			Enabled: true,
+			JijMods: []structs.JijModInfo{{ID: "Architectury", Name: "Architectury API"}},
+		},
+	}
+
+	result := scanUnusedDependencies(mods, nil)
+	if len(result.Candidates) != 1 || result.Candidates[0].Path != "architectury.jar" {
+		t.Fatalf("candidates = %#v, want standalone architectury", result.Candidates)
+	}
+
+	mods[2].Enabled = false
+	result = scanUnusedDependencies(mods, nil)
+	if len(result.Candidates) != 0 {
+		t.Fatalf("candidates with disabled JIJ host = %#v, want none", result.Candidates)
+	}
+}
+
 func setSelectedVersionForScanTest(t *testing.T, version structs.VersionInfo) {
 	t.Helper()
 	root := t.TempDir()

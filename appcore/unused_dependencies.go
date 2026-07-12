@@ -24,6 +24,8 @@ type localModDependencyGroup struct {
 	onlineName   string
 	enabled      bool
 	modIDs       []string
+	jijModIDs    []string
+	providedIDs  []string
 	dependencies []string
 	categories   []string
 }
@@ -42,11 +44,17 @@ func scanUnusedDependencies(mods []mcstructs.ModInfo, excludedPaths []string) ap
 
 	requiredByActive := make(map[string]bool)
 	requiredByExcluded := make(map[string]bool)
+	providerCounts := make(map[string]int)
 	for _, group := range groups {
 		if !group.enabled {
 			continue
 		}
 		isExcluded := excluded[group.pathKey]
+		if !isExcluded {
+			for _, providedID := range group.providedIDs {
+				providerCounts[providedID]++
+			}
+		}
 		for _, depID := range group.dependencies {
 			if isExcluded {
 				requiredByExcluded[depID] = true
@@ -64,7 +72,7 @@ func scanUnusedDependencies(mods []mcstructs.ModInfo, excludedPaths []string) ap
 		if len(group.modIDs) == 0 {
 			continue
 		}
-		if anyModIDRequired(group.modIDs, requiredByActive) {
+		if removesLastRequiredProvider(group, requiredByActive, providerCounts) {
 			continue
 		}
 		evidence := unusedDependencyEvidence(group, requiredByExcluded)
@@ -117,6 +125,7 @@ func localModDependencyGroups(mods []mcstructs.ModInfo) []localModDependencyGrou
 			order = append(order, key)
 		}
 		group.modIDs = appendNormalizedUnique(group.modIDs, mod.ID)
+		group.jijModIDs = appendJijModIDs(group.jijModIDs, mod.JijMods)
 		group.dependencies = appendDependencyIDs(group.dependencies, mod.Dependencies)
 		group.categories = appendNormalizedUniqueMany(group.categories, mod.Categories)
 		if group.fileName == "" {
@@ -135,11 +144,22 @@ func localModDependencyGroups(mods []mcstructs.ModInfo) []localModDependencyGrou
 	for _, key := range order {
 		group := byPath[key]
 		group.modIDs = uniqueLowerStrings(group.modIDs)
+		group.jijModIDs = uniqueLowerStrings(group.jijModIDs)
+		group.providedIDs = uniqueLowerStrings(append(append([]string(nil), group.modIDs...), group.jijModIDs...))
 		group.dependencies = uniqueLowerStrings(group.dependencies)
 		group.categories = uniqueLowerStrings(group.categories)
 		groups = append(groups, *group)
 	}
 	return groups
+}
+
+func removesLastRequiredProvider(group localModDependencyGroup, required map[string]bool, providerCounts map[string]int) bool {
+	for _, id := range group.providedIDs {
+		if required[id] && providerCounts[id] <= 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func unusedDependencyEvidence(group localModDependencyGroup, requiredByExcluded map[string]bool) []string {
@@ -167,6 +187,13 @@ func appendDependencyIDs(ids []string, deps []mcstructs.LocalModDependency) []st
 		if strings.EqualFold(strings.TrimSpace(dep.Type), "required") || strings.TrimSpace(dep.Type) == "" {
 			ids = appendNormalizedUnique(ids, dep.ModID)
 		}
+	}
+	return ids
+}
+
+func appendJijModIDs(ids []string, mods []mcstructs.JijModInfo) []string {
+	for _, mod := range mods {
+		ids = appendNormalizedUnique(ids, mod.ID)
 	}
 	return ids
 }

@@ -767,3 +767,47 @@ func TestCacheVersionModIDs(t *testing.T) {
 		t.Fatalf("GetVersionModIDs after reopen = %#v", direct)
 	}
 }
+
+func TestFindCachedModVersionsByModIDFiltersAndSurvivesReopen(t *testing.T) {
+	path := openTestDB(t)
+	for _, project := range []models.ModProject{
+		{Platform: "Modrinth", ProjectID: "architectury", Title: "Architectury API"},
+		{Platform: "CurseForge", ProjectID: "419699", Title: "Architectury API CF"},
+	} {
+		if err := UpsertModPlatform(project); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := SetPlatformVersions("Modrinth", "architectury", []models.ModVersion{
+		{ID: "mr-old", VersionID: "mr-old", ProjectID: "architectury", DownloadURL: "https://example.com/old.jar", PublishedAt: 1, GameVersions: []string{"1.21.1"}, Loaders: []string{"fabric"}, ModIDs: []string{"architectury"}},
+		{ID: "mr-new", VersionID: "mr-new", ProjectID: "architectury", DownloadURL: "https://example.com/new.jar", PublishedAt: 2, GameVersions: []string{"1.21.1"}, Loaders: []string{"fabric"}, ModIDs: []string{"Architectury"}},
+		{ID: "mr-forge", VersionID: "mr-forge", ProjectID: "architectury", DownloadURL: "https://example.com/forge.jar", PublishedAt: 3, GameVersions: []string{"1.21.1"}, Loaders: []string{"forge"}, ModIDs: []string{"architectury"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetPlatformVersions("CurseForge", "419699", []models.ModVersion{{
+		ID: "cf-new", VersionID: "cf-new", ProjectID: "419699", DownloadURL: "https://example.com/cf.jar", PublishedAt: 4, GameVersions: []string{"1.21.1"}, Loaders: []string{"fabric"}, ModIDs: []string{"architectury"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	assertCandidates := func() {
+		candidates := FindCachedModVersionsByModID(" ARCHITECTURY ", "1.21.1", "Fabric")
+		if len(candidates) != 2 {
+			t.Fatalf("candidate count = %d, want 2: %#v", len(candidates), candidates)
+		}
+		if candidates[0].Project.Platform != "CurseForge" || candidates[0].Version.ID != "cf-new" {
+			t.Fatalf("first candidate = %#v", candidates[0])
+		}
+		if candidates[1].Project.Platform != "Modrinth" || candidates[1].Version.ID != "mr-new" {
+			t.Fatalf("second candidate = %#v", candidates[1])
+		}
+		if miss := FindCachedModVersionsByModID("missing", "1.21.1", "fabric"); len(miss) != 0 {
+			t.Fatalf("cache miss = %#v", miss)
+		}
+	}
+
+	assertCandidates()
+	reopenTestDB(t, path)
+	assertCandidates()
+}
