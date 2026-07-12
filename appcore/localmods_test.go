@@ -68,6 +68,28 @@ func TestRefreshSelectedVersionModsPersistsRefreshedSnapshot(t *testing.T) {
 	}
 }
 
+func TestSelectVersionBindsModsWatcher(t *testing.T) {
+	_, modsDir := setupSelectedLocalModInstance(t)
+	svc := New(Options{})
+	t.Cleanup(svc.stopModsWatcher)
+
+	if _, err := svc.SelectVersion("test"); err != nil {
+		t.Fatal(err)
+	}
+
+	want, err := filepath.Abs(modsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.modsWatchMu.Lock()
+	got := svc.modsWatchDir
+	watching := svc.modsWatchCancel != nil
+	svc.modsWatchMu.Unlock()
+	if got != want || !watching {
+		t.Fatalf("mods watcher = dir %q active %v, want dir %q active true", got, watching, want)
+	}
+}
+
 func TestApplyLocalModBatchOperationDisableEnableInvertDelete(t *testing.T) {
 	root, modsDir := setupSelectedLocalModInstance(t)
 	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {

@@ -1103,6 +1103,7 @@ func (s *Service) SetMinecraftDir(dir string) string {
 		return ""
 	}
 	previousDir := global.GetMinecraftDir()
+	s.stopModsWatcher()
 	simplified := minecraft.SimplifyPathWithEnv(dir)
 	global.SetMinecraftDir(dir)
 	global.ClearLocalMods()
@@ -1117,6 +1118,7 @@ func (s *Service) SetMinecraftDir(dir string) string {
 		global.InvalidateVersions()
 		if strings.TrimSpace(previousDir) != "" {
 			s.LoadVersionsFromDisk(previousDir)
+			s.ensureModsWatcher(global.GetSelectedVersion())
 		}
 		return ""
 	}
@@ -1183,7 +1185,9 @@ func (s *Service) SelectVersion(versionKey string) (structs.VersionInfo, error) 
 		if !ValidMinecraftInstance(version) {
 			return structs.VersionInfo{}, errors.New("invalid minecraft version or mod loader")
 		}
-		return s.refreshAndSelectVersionMods(version, mcDir), nil
+		selected := s.refreshAndSelectVersionMods(version, mcDir)
+		s.ensureModsWatcher(selected)
+		return selected, nil
 	}
 
 	return structs.VersionInfo{}, fmt.Errorf("version not found: %s", versionKey)
@@ -1884,6 +1888,12 @@ func (s *Service) watchModsDir(ctx context.Context, dir, versionID, versionName 
 		timer = time.AfterFunc(250*time.Millisecond, func() {
 			selected := global.GetSelectedVersion()
 			if selected.ID != versionID && selected.Name != versionName {
+				return
+			}
+			s.modsWatchMu.Lock()
+			activeDir := s.modsWatchDir
+			s.modsWatchMu.Unlock()
+			if ctx.Err() != nil || activeDir != dir {
 				return
 			}
 			pendingMu.Lock()
