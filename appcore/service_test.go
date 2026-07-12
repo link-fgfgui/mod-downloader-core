@@ -745,6 +745,44 @@ func TestSaveUnusedDependencyCleanupSettingsPersists(t *testing.T) {
 	}
 }
 
+func TestSaveLanguagePersistsAndNormalizes(t *testing.T) {
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	appDir := t.TempDir()
+	if err := os.Chdir(appDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	svc := New(Options{Config: &configs.Config{}})
+	if got := svc.GetPreferences().Language; got != configs.LanguageSystem.String() {
+		t.Fatalf("default preference language = %q, want system", got)
+	}
+	if got := svc.SaveLanguage("zh-CN"); got != configs.LanguageChinese.String() {
+		t.Fatalf("SaveLanguage(zh-CN) = %q, want zh", got)
+	}
+	if got := svc.GetSettings().Language; got != configs.LanguageChinese.String() {
+		t.Fatalf("settings language = %q, want zh", got)
+	}
+
+	loaded, err := configs.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Prefers.Language.Normalized(); got != configs.LanguageChinese {
+		t.Fatalf("persisted language = %q, want zh", got)
+	}
+	if got := svc.SaveLanguage("invalid"); got != configs.LanguageSystem.String() {
+		t.Fatalf("SaveLanguage(invalid) = %q, want system", got)
+	}
+}
+
 func TestSaveMCIMSettingsPersistsAndReconfiguresProviders(t *testing.T) {
 	oldwd, err := os.Getwd()
 	if err != nil {

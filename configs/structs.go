@@ -56,6 +56,51 @@ func ParseTheme(value string) Theme {
 	}
 }
 
+type Language string
+
+const (
+	LanguageSystem  Language = "system"
+	LanguageChinese Language = "zh"
+	LanguageEnglish Language = "en"
+)
+
+func (l *Language) UnmarshalText(text []byte) error {
+	language := ParseLanguage(string(text))
+	if language == "" {
+		return fmt.Errorf("invalid language %q: expected system, zh, or en", strings.TrimSpace(string(text)))
+	}
+	*l = language
+	return nil
+}
+
+func (l Language) MarshalText() ([]byte, error) {
+	return []byte(l.Normalized().String()), nil
+}
+
+func (l Language) String() string {
+	return string(l)
+}
+
+func (l Language) Normalized() Language {
+	if normalized := ParseLanguage(string(l)); normalized != "" {
+		return normalized
+	}
+	return LanguageSystem
+}
+
+func ParseLanguage(value string) Language {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", string(LanguageSystem):
+		return LanguageSystem
+	case "zh-cn", "zh-hans", "chinese", string(LanguageChinese):
+		return LanguageChinese
+	case "english", string(LanguageEnglish):
+		return LanguageEnglish
+	default:
+		return ""
+	}
+}
+
 type AnimationMode string
 
 const (
@@ -103,6 +148,7 @@ func ParseAnimationMode(value string) AnimationMode {
 
 type Preferences struct {
 	Theme                       Theme         `toml:"theme" json:"theme" env:"THEME" env-default:"dark"`
+	Language                    Language      `toml:"language" json:"language" env:"LANGUAGE" env-default:"system"`
 	MinecraftDir                string        `toml:"minecraft_dir" json:"minecraft_dir" env:"MINECRAFT_DIR"`
 	AnimationMode               AnimationMode `toml:"animation_mode" json:"animation_mode" env:"ANIMATION_MODE"`
 	AnimationsEnabled           *bool         `toml:"animations_enabled" json:"animations_enabled"`

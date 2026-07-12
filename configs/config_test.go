@@ -11,6 +11,7 @@ import (
 
 func TestPreferencesThemeReadsPrefixedEnvironment(t *testing.T) {
 	t.Setenv("PREFERS_THEME", "light")
+	t.Setenv("PREFERS_LANGUAGE", "en")
 	t.Setenv("PREFERS_ANIMATION_DURATION_MULTIPLIER", "2.5")
 	t.Setenv("THEME", "dark")
 
@@ -21,11 +22,56 @@ func TestPreferencesThemeReadsPrefixedEnvironment(t *testing.T) {
 	if cfg.Prefers.Theme != ThemeLight {
 		t.Fatalf("theme = %q, want %q", cfg.Prefers.Theme, ThemeLight)
 	}
+	if cfg.Prefers.Language != LanguageEnglish {
+		t.Fatalf("language = %q, want %q", cfg.Prefers.Language, LanguageEnglish)
+	}
 	if cfg.Prefers.AnimationModeValue() != DefaultAnimationMode {
 		t.Fatalf("animation mode = %q, want %q", cfg.Prefers.AnimationModeValue(), DefaultAnimationMode)
 	}
 	if cfg.Prefers.NormalizedAnimationDurationMultiplier() != 2.5 {
 		t.Fatalf("animation multiplier = %v, want 2.5", cfg.Prefers.NormalizedAnimationDurationMultiplier())
+	}
+}
+
+func TestParseLanguageSupportsCanonicalAndCompatibleValues(t *testing.T) {
+	tests := map[string]Language{
+		"":        LanguageSystem,
+		"system":  LanguageSystem,
+		"zh":      LanguageChinese,
+		"zh-CN":   LanguageChinese,
+		"zh-Hans": LanguageChinese,
+		"chinese": LanguageChinese,
+		"en":      LanguageEnglish,
+		"english": LanguageEnglish,
+		" EN ":    LanguageEnglish,
+	}
+	for value, want := range tests {
+		if got := ParseLanguage(value); got != want {
+			t.Fatalf("ParseLanguage(%q) = %q, want %q", value, got, want)
+		}
+	}
+	if got := ParseLanguage("invalid"); got != "" {
+		t.Fatalf("ParseLanguage(invalid) = %q, want empty", got)
+	}
+	if got := Language("invalid").Normalized(); got != LanguageSystem {
+		t.Fatalf("invalid language normalized to %q, want %q", got, LanguageSystem)
+	}
+}
+
+func TestPreferencesLanguageReadsTOMLAndDefaultsToSystem(t *testing.T) {
+	if got := (Preferences{}).Language.Normalized(); got != LanguageSystem {
+		t.Fatalf("default language = %q, want %q", got, LanguageSystem)
+	}
+
+	var cfg Config
+	if _, err := toml.Decode(`
+[preferences]
+language = "zh"
+`, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Prefers.Language != LanguageChinese {
+		t.Fatalf("language = %q, want %q", cfg.Prefers.Language, LanguageChinese)
 	}
 }
 

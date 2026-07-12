@@ -96,6 +96,7 @@ type Service struct {
 
 type AppPreferences struct {
 	Theme                       string  `json:"theme"`
+	Language                    string  `json:"language"`
 	AnimationMode               string  `json:"animationMode"`
 	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
@@ -103,6 +104,7 @@ type AppPreferences struct {
 
 type SettingsView struct {
 	Theme                       string  `json:"theme"`
+	Language                    string  `json:"language"`
 	AnimationMode               string  `json:"animationMode"`
 	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
@@ -812,6 +814,7 @@ func (s *Service) GetPreferences() AppPreferences {
 	if s.config == nil {
 		return AppPreferences{
 			Theme:                       configs.ThemeDark.String(),
+			Language:                    configs.LanguageSystem.String(),
 			AnimationMode:               configs.DefaultAnimationMode.String(),
 			AnimationEnabled:            configs.DefaultAnimationsEnabled,
 			AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
@@ -820,6 +823,7 @@ func (s *Service) GetPreferences() AppPreferences {
 	animationMode := s.config.Prefers.AnimationModeValue()
 	return AppPreferences{
 		Theme:                       s.config.Prefers.Theme.Normalized().String(),
+		Language:                    s.config.Prefers.Language.Normalized().String(),
 		AnimationMode:               animationMode.String(),
 		AnimationEnabled:            animationMode != configs.AnimationModeOff,
 		AnimationDurationMultiplier: s.config.Prefers.NormalizedAnimationDurationMultiplier(),
@@ -829,6 +833,7 @@ func (s *Service) GetPreferences() AppPreferences {
 func (s *Service) GetSettings() SettingsView {
 	sv := SettingsView{
 		Theme:                       configs.ThemeDark.String(),
+		Language:                    configs.LanguageSystem.String(),
 		AnimationMode:               configs.DefaultAnimationMode.String(),
 		AnimationEnabled:            configs.DefaultAnimationsEnabled,
 		AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
@@ -840,6 +845,7 @@ func (s *Service) GetSettings() SettingsView {
 	if s.config != nil {
 		animationMode := s.config.Prefers.AnimationModeValue()
 		sv.Theme = s.config.Prefers.Theme.Normalized().String()
+		sv.Language = s.config.Prefers.Language.Normalized().String()
 		sv.AnimationMode = animationMode.String()
 		sv.AnimationEnabled = animationMode != configs.AnimationModeOff
 		sv.AnimationDurationMultiplier = s.config.Prefers.NormalizedAnimationDurationMultiplier()
@@ -877,6 +883,21 @@ func (s *Service) SaveTheme(theme string) string {
 	s.config.Prefers.Theme = parsed
 	if err := configs.Save(s.config); err != nil {
 		logging.Error("save theme failed", "theme", parsed, "error", err)
+	}
+	return parsed.String()
+}
+
+func (s *Service) SaveLanguage(language string) string {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	parsed := configs.ParseLanguage(language)
+	if parsed == "" {
+		parsed = configs.LanguageSystem
+	}
+	s.config.Prefers.Language = parsed
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save language failed", "language", parsed, "error", err)
 	}
 	return parsed.String()
 }
