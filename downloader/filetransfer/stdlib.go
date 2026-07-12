@@ -23,7 +23,7 @@ type StdlibBackend struct {
 
 func NewStdlibBackend(client *http.Client) *StdlibBackend {
 	if client == nil {
-		client = networking.NewClient(0)
+		client = networking.NewClientWithUserAgent(0, "mod-downloader/dev")
 	}
 	return &StdlibBackend{client: client}
 }

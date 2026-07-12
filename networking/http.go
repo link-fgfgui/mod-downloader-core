@@ -2,6 +2,7 @@ package networking
 
 import (
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -18,5 +19,29 @@ func NewTransport() *http.Transport {
 }
 
 func NewClient(timeout time.Duration) *http.Client {
-	return &http.Client{Transport: NewTransport(), Timeout: timeout}
+	return NewClientWithUserAgent(timeout, "")
+}
+
+// NewClientWithUserAgent returns an HTTP client that supplies the application
+// identity when the caller has not explicitly provided a User-Agent header.
+func NewClientWithUserAgent(timeout time.Duration, userAgent string) *http.Client {
+	userAgent = strings.TrimSpace(userAgent)
+	if userAgent == "" {
+		userAgent = "mod-downloader/dev"
+	}
+	return &http.Client{Transport: userAgentTransport{base: NewTransport(), userAgent: userAgent}, Timeout: timeout}
+}
+
+type userAgentTransport struct {
+	base      http.RoundTripper
+	userAgent string
+}
+
+func (t userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.Header = req.Header.Clone()
+	if clone.Header.Get("User-Agent") == "" {
+		clone.Header.Set("User-Agent", t.userAgent)
+	}
+	return t.base.RoundTrip(clone)
 }

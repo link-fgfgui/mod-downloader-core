@@ -28,7 +28,7 @@ var pinnedMinecraftReleaseVersions = []string{
 }
 
 func FetchMinecraftReleaseVersions() ([]string, error) {
-	client := networking.NewClient(10 * time.Second)
+	client := networking.NewClientWithUserAgent(10*time.Second, "mod-downloader/dev")
 	resp, err := client.Get(minecraftVersionManifestURL)
 	if err != nil {
 		return nil, err

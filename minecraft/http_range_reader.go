@@ -42,7 +42,7 @@ func newHTTPRangeReaderAt(url string, timeout time.Duration) (*httpRangeReaderAt
 		}
 	}
 
-	client := networking.NewClient(clientTimeout)
+	client := networking.NewClientWithUserAgent(clientTimeout, "mod-downloader/dev")
 	resolvedURL, err := resolveHTTPDownloadURL(client, url, deadline)
 	if err != nil {
 		resolvedURL = url

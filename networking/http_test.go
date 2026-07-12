@@ -69,3 +69,41 @@ func TestNewClientRoutesRequestsThroughResolvedProxy(t *testing.T) {
 		t.Fatalf("body = %q", body)
 	}
 }
+
+func TestNewClientWithUserAgent(t *testing.T) {
+	tests := []struct {
+		name      string
+		clientUA  string
+		requestUA string
+		want      string
+	}{
+		{name: "default", want: "mod-downloader/dev"},
+		{name: "versioned", clientUA: "mod-downloader/v1.2.3", want: "mod-downloader/v1.2.3"},
+		{name: "request override", clientUA: "mod-downloader/v1.2.3", requestUA: "custom-client/1.0", want: "custom-client/1.0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if got := req.Header.Get("User-Agent"); got != tt.want {
+					t.Errorf("User-Agent = %q, want %q", got, tt.want)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+
+			req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.requestUA != "" {
+				req.Header.Set("User-Agent", tt.requestUA)
+			}
+			resp, err := NewClientWithUserAgent(0, tt.clientUA).Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+		})
+	}
+}
