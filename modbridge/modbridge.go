@@ -35,7 +35,7 @@ const (
 )
 
 const (
-	remoteModIDFailureTTL = 5 * time.Minute
+	remoteModIDFailureTTL = 30 * time.Second
 	remoteModJarTimeout   = 30 * time.Second
 )
 
