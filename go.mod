@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	codeberg.org/jmansfield/go-modrinth v0.6.0
 	github.com/BurntSushi/toml v1.5.0
+	github.com/fsnotify/fsnotify v1.9.0
 	github.com/ilyakaznacheev/cleanenv v1.5.0
 	github.com/klauspost/compress v1.18.6
 	github.com/sjet47/go-curseforge v0.6.0

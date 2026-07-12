@@ -509,6 +509,33 @@ func ScanModsDir(modsDir string, instanceID string, minecraftVersion string, mod
 	return allMods
 }
 
+// ScanModFile parses one local mod file and updates the in-memory local index.
+func ScanModFile(jarPath, instanceID, minecraftVersion, modLoader, pathRoot string) []structs.ModInfo {
+	info, err := os.Stat(jarPath)
+	if err != nil || info.IsDir() || !isModJar(filepath.Base(jarPath)) {
+		return nil
+	}
+	hash, fingerprint := FileHashes(jarPath)
+	global.HardlinkIndexAdd(hash, jarPath)
+	mods := ParseModJarWithSHA1(jarPath, hash, modLoader)
+	if len(mods) == 0 {
+		return nil
+	}
+	baseName := StripJarSuffix(filepath.Base(jarPath))
+	pathValue := jarPath
+	if strings.TrimSpace(pathRoot) != "" {
+		if rel, err := filepath.Rel(pathRoot, jarPath); err == nil {
+			pathValue = rel
+		}
+	}
+	for i := range mods {
+		mods[i].FileName, mods[i].Path, mods[i].SHA1 = baseName, pathValue, hash
+		mods[i].CfFingerprint, mods[i].Enabled = fingerprint, isJarEnabled(filepath.Base(jarPath))
+		global.UpsertLocalMod(mods[i], instanceID, minecraftVersion, modLoader)
+	}
+	return mods
+}
+
 func parseModJar(jarPath string, modLoader string) []structs.ModInfo {
 	return ParseModJarWithSHA1(jarPath, FileSHA1(jarPath), modLoader)
 }

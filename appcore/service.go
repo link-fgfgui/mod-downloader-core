@@ -9,7 +9,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 
 	modrinth "codeberg.org/jmansfield/go-modrinth/modrinth"
 	"github.com/sjet47/go-curseforge"
@@ -83,9 +86,12 @@ type ConfigOverrides struct {
 }
 
 type Service struct {
-	ctx     context.Context
-	config  *configs.Config
-	options Options
+	ctx             context.Context
+	config          *configs.Config
+	options         Options
+	modsWatchMu     sync.Mutex
+	modsWatchCancel context.CancelFunc
+	modsWatchDir    string
 }
 
 type AppPreferences struct {
@@ -299,6 +305,7 @@ func loadMinecraftReleaseVersions() error {
 }
 
 func (s *Service) Shutdown() {
+	s.stopModsWatcher()
 	if s.config == nil {
 		s.config = &configs.Config{}
 	}
@@ -312,6 +319,7 @@ func (s *Service) Shutdown() {
 }
 
 func (s *Service) Close() {
+	s.stopModsWatcher()
 	providers.StopBackgroundTasks()
 	storage.Close()
 	logging.Close()
@@ -1155,7 +1163,9 @@ func (s *Service) RefreshSelectedVersionMods() structs.VersionInfo {
 	if selected.ID == "" && selected.Name == "" {
 		return structs.VersionInfo{}
 	}
-	return s.refreshAndSelectVersionMods(selected, global.GetMinecraftDir())
+	refreshed := s.refreshAndSelectVersionMods(selected, global.GetMinecraftDir())
+	s.ensureModsWatcher(refreshed)
+	return refreshed
 }
 
 func (s *Service) SelectVersion(versionKey string) (structs.VersionInfo, error) {
@@ -1234,7 +1244,89 @@ func (s *Service) ApplyLocalModBatchOperation(req appstructs.LocalModBatchOperat
 		return s.RefreshSelectedVersionMods(), err
 	}
 	s.recordLocalModUsage(ops)
-	return s.RefreshSelectedVersionMods(), nil
+	return s.refreshChangedLocalMods(ops), nil
+}
+
+func (s *Service) refreshChangedLocalMods(ops []localModFileOperation) structs.VersionInfo {
+	selected := global.GetSelectedVersion()
+	if selected.ID == "" && selected.Name == "" {
+		return selected
+	}
+	instanceID := versionInstanceDir(selected)
+	changed := make(map[string]bool)
+	for _, op := range ops {
+		global.RemoveLocalModByPath(op.source)
+		global.RemoveLocalModByPath(op.target)
+		changed[op.source], changed[op.target] = true, true
+		if op.action == LocalModBatchActionDelete {
+			continue
+		}
+		if strings.HasSuffix(op.target, ".jar") {
+			minecraft.ScanModFile(op.target, instanceID, selected.MinecraftVersion, selected.ModLoader, global.GetMinecraftDir())
+		}
+	}
+	mods := make([]structs.ModInfo, 0, len(selected.Mods))
+	for _, mod := range selected.Mods {
+		absPath := mod.Path
+		if !filepath.IsAbs(absPath) {
+			absPath = filepath.Join(global.GetMinecraftDir(), absPath)
+		}
+		if !changed[absPath] && !changed[mod.Path] {
+			mods = append(mods, mod)
+		}
+	}
+	for _, op := range ops {
+		if op.action == LocalModBatchActionDelete || !strings.HasSuffix(op.target, ".jar") {
+			continue
+		}
+		fresh := minecraft.ScanModFile(op.target, instanceID, selected.MinecraftVersion, selected.ModLoader, global.GetMinecraftDir())
+		mods = append(mods, fresh...)
+	}
+	enriched, missing := enrichModMetadata(mods)
+	setOnlineMetadataLoading(enriched, missing, true)
+	selected.Mods = enriched
+	global.SetSelectedVersion(selected)
+	s.emit(EventSelectedVersionChanged, selected)
+	s.resolveMissingModMetadata(selected, missing)
+	return selected
+}
+
+func (s *Service) refreshChangedPaths(paths []string) {
+	selected := global.GetSelectedVersion()
+	if selected.ID == "" && selected.Name == "" {
+		return
+	}
+	instanceID := versionInstanceDir(selected)
+	changed := make(map[string]bool)
+	for _, path := range paths {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			continue
+		}
+		global.RemoveLocalModByPath(abs)
+		changed[abs] = true
+	}
+	mods := make([]structs.ModInfo, 0, len(selected.Mods))
+	for _, mod := range selected.Mods {
+		abs := mod.Path
+		if !filepath.IsAbs(abs) {
+			abs = filepath.Join(global.GetMinecraftDir(), abs)
+		}
+		if !changed[abs] {
+			mods = append(mods, mod)
+		}
+	}
+	for _, path := range paths {
+		if strings.HasSuffix(strings.ToLower(path), ".jar") {
+			mods = append(mods, minecraft.ScanModFile(path, instanceID, selected.MinecraftVersion, selected.ModLoader, global.GetMinecraftDir())...)
+		}
+	}
+	enriched, missing := enrichModMetadata(mods)
+	setOnlineMetadataLoading(enriched, missing, true)
+	selected.Mods = enriched
+	global.SetSelectedVersion(selected)
+	s.emit(EventSelectedVersionChanged, selected)
+	s.resolveMissingModMetadata(selected, missing)
 }
 
 func (s *Service) recordLocalModUsage(ops []localModFileOperation) {
@@ -1731,6 +1823,102 @@ func (s *Service) refreshAndSelectVersionMods(version structs.VersionInfo, mcDir
 	s.emit(EventSelectedVersionChanged, refreshed)
 	s.resolveMissingModMetadata(refreshed, missingFiles)
 	return refreshed
+}
+
+func (s *Service) stopModsWatcher() {
+	s.modsWatchMu.Lock()
+	defer s.modsWatchMu.Unlock()
+	if s.modsWatchCancel != nil {
+		s.modsWatchCancel()
+		s.modsWatchCancel = nil
+	}
+	s.modsWatchDir = ""
+}
+
+func (s *Service) ensureModsWatcher(version structs.VersionInfo) {
+	dir := filepath.Join(minecraft.VersionDirPath(global.GetMinecraftDir(), version), "mods")
+	dir, err := filepath.Abs(dir)
+	if err != nil || strings.TrimSpace(dir) == "" {
+		return
+	}
+	s.modsWatchMu.Lock()
+	if s.modsWatchDir == dir && s.modsWatchCancel != nil {
+		s.modsWatchMu.Unlock()
+		return
+	}
+	if s.modsWatchCancel != nil {
+		s.modsWatchCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.modsWatchCancel = cancel
+	s.modsWatchDir = dir
+	s.modsWatchMu.Unlock()
+	go s.watchModsDir(ctx, dir, version.ID, version.Name)
+}
+
+func (s *Service) watchModsDir(ctx context.Context, dir, versionID, versionName string) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		logging.Warn("create mods watcher failed", "dir", dir, "error", err)
+		return
+	}
+	defer watcher.Close()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		logging.Warn("create mods directory for watcher failed", "dir", dir, "error", err)
+		return
+	}
+	if err := watcher.Add(dir); err != nil {
+		logging.Warn("watch mods directory failed", "dir", dir, "error", err)
+		return
+	}
+	var timer *time.Timer
+	pending := make(map[string]bool)
+	var pendingMu sync.Mutex
+	trigger := func(path string) {
+		pendingMu.Lock()
+		pending[path] = true
+		pendingMu.Unlock()
+		if timer != nil {
+			timer.Stop()
+		}
+		timer = time.AfterFunc(250*time.Millisecond, func() {
+			selected := global.GetSelectedVersion()
+			if selected.ID != versionID && selected.Name != versionName {
+				return
+			}
+			pendingMu.Lock()
+			paths := make([]string, 0, len(pending))
+			for path := range pending {
+				paths = append(paths, path)
+			}
+			pending = make(map[string]bool)
+			pendingMu.Unlock()
+			s.refreshChangedPaths(paths)
+		})
+	}
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			logging.Warn("mods watcher error", "dir", dir, "error", err)
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 {
+				trigger(event.Name)
+			}
+		}
+	}
 }
 
 func (s *Service) resolveMissingModMetadata(refreshed structs.VersionInfo, missingFiles map[string]uint32) {
