@@ -1,9 +1,12 @@
 package modbridge
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -382,6 +385,84 @@ func resetBackfillState() {
 	pendingBackfills = nil
 	pendingSet = make(map[string]struct{})
 	backfillMu.Unlock()
+}
+
+func resetRemoteModIDCache() {
+	remoteModIDCache.Lock()
+	remoteModIDCache.entries = make(map[string]*remoteModIDCacheEntry)
+	remoteModIDCache.Unlock()
+}
+
+func TestCachedRemoteModIDsDeduplicatesConcurrentParses(t *testing.T) {
+	resetRemoteModIDCache()
+	previousParse := parseRemoteModJarForIDs
+	t.Cleanup(func() {
+		parseRemoteModJarForIDs = previousParse
+		resetRemoteModIDCache()
+	})
+
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	parseRemoteModJarForIDs = func(string, string) ([]mcstructs.ModInfo, error) {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return []mcstructs.ModInfo{{ID: "ExampleMod"}}, nil
+	}
+
+	const workers = 8
+	results := make(chan []string, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ids, err := cachedRemoteModIDs("https://cdn.example.test/mod.jar", "fabric")
+			if err != nil {
+				t.Errorf("cachedRemoteModIDs() error = %v", err)
+			}
+			results <- ids
+		}()
+	}
+	<-started
+	close(release)
+	wg.Wait()
+	close(results)
+
+	if calls.Load() != 1 {
+		t.Fatalf("remote parse calls = %d, want 1", calls.Load())
+	}
+	for ids := range results {
+		if len(ids) != 1 || ids[0] != "examplemod" {
+			t.Fatalf("cached mod IDs = %#v, want [examplemod]", ids)
+		}
+	}
+}
+
+func TestCachedRemoteModIDsCachesFailures(t *testing.T) {
+	resetRemoteModIDCache()
+	previousParse := parseRemoteModJarForIDs
+	t.Cleanup(func() {
+		parseRemoteModJarForIDs = previousParse
+		resetRemoteModIDCache()
+	})
+
+	var calls atomic.Int32
+	parseRemoteModJarForIDs = func(string, string) ([]mcstructs.ModInfo, error) {
+		calls.Add(1)
+		return nil, errors.New("timeout")
+	}
+
+	for range 2 {
+		if _, err := cachedRemoteModIDs("https://cdn.example.test/bad.jar", "neoforge"); err == nil {
+			t.Fatal("cachedRemoteModIDs() error = nil, want failure")
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("remote parse calls = %d, want 1 during failure TTL", calls.Load())
+	}
 }
 
 func TestMarkBackfillDeduplicatesByVersionID(t *testing.T) {

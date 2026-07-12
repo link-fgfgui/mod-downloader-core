@@ -9,6 +9,7 @@ package modbridge
 import (
 	"archive/zip"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -32,6 +33,25 @@ const (
 	BtnStatusConflict     = "conflict"     // Same modId but not from this project's versions -> switch source
 	BtnStatusIncompatible = "incompatible" // Requested version declares an incompatible installed project
 )
+
+const (
+	remoteModIDFailureTTL = 5 * time.Minute
+	remoteModJarTimeout   = 30 * time.Second
+)
+
+type remoteModIDCacheEntry struct {
+	modIDs    []string
+	expiresAt time.Time
+	loading   bool
+	ready     chan struct{}
+}
+
+var remoteModIDCache = struct {
+	sync.Mutex
+	entries map[string]*remoteModIDCacheEntry
+}{entries: make(map[string]*remoteModIDCacheEntry)}
+
+var parseRemoteModJarForIDs = parseRemoteModJar
 
 // ResolveVersion returns the best matching platform version for a download request.
 func ResolveVersion(req appstructs.ModDownloadRequest) (models.ModVersion, bool) {
@@ -495,16 +515,11 @@ func VersionModIDs(version models.ModVersion, modLoader string) []string {
 		}
 	}
 
-	mods, err := parseRemoteModJar(version.DownloadURL, modLoader)
+	modIDs, err := cachedRemoteModIDs(version.DownloadURL, modLoader)
 	if err != nil {
 		logging.Warn("remote jar parse failed for version mod IDs", "downloadURL", version.DownloadURL, "error", err)
 		return nil
 	}
-
-	// Use only primary (strong-reference) mod IDs. JIJ / nested-jar entries must
-	// not be stored as version identifiers since they would cause false conflicts
-	// when the same modID appears as a JIJ in an unrelated host JAR.
-	modIDs := minecraft.PrimaryModIDs(mods)
 
 	if len(modIDs) > 0 && version.ID != "" {
 		if err := storage.SetVersionModIDs(version.ID, modIDs); err != nil {
@@ -512,6 +527,71 @@ func VersionModIDs(version models.ModVersion, modLoader string) []string {
 		}
 	}
 	return modIDs
+}
+
+// cachedRemoteModIDs deduplicates remote JAR parsing by URL and loader. This
+// covers both concurrent status checks and different platform versions that
+// point at the same physical file. Failed parses are cached briefly so a
+// repeated UI refresh cannot immediately replay the same timed-out requests.
+func cachedRemoteModIDs(downloadURL, modLoader string) ([]string, error) {
+	key := remoteModIDCacheKey(downloadURL, modLoader)
+	if strings.TrimSpace(downloadURL) == "" {
+		return nil, fmt.Errorf("empty download url")
+	}
+
+	for {
+		remoteModIDCache.Lock()
+		entry := remoteModIDCache.entries[key]
+		if entry != nil {
+			if entry.loading {
+				ready := entry.ready
+				remoteModIDCache.Unlock()
+				<-ready
+				continue
+			}
+			if entry.expiresAt.IsZero() || time.Now().Before(entry.expiresAt) {
+				modIDs := append([]string(nil), entry.modIDs...)
+				remoteModIDCache.Unlock()
+				if len(modIDs) == 0 {
+					return nil, fmt.Errorf("remote jar metadata unavailable (cached)")
+				}
+				return modIDs, nil
+			}
+		}
+		entry = &remoteModIDCacheEntry{loading: true, ready: make(chan struct{})}
+		remoteModIDCache.entries[key] = entry
+		remoteModIDCache.Unlock()
+
+		mods, err := parseRemoteModJarForIDs(downloadURL, modLoader)
+		modIDs := minecraft.PrimaryModIDs(mods)
+		remoteModIDCache.Lock()
+		entry.modIDs = append([]string(nil), modIDs...)
+		if err != nil || len(modIDs) == 0 {
+			entry.expiresAt = time.Now().Add(remoteModIDFailureTTL)
+		}
+		entry.loading = false
+		close(entry.ready)
+		remoteModIDCache.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		if len(modIDs) == 0 {
+			return nil, fmt.Errorf("no parseable mod metadata")
+		}
+		return modIDs, nil
+	}
+}
+
+func remoteModIDCacheKey(downloadURL, modLoader string) string {
+	return strings.TrimSpace(downloadURL) + "\x00" + strings.ToLower(strings.TrimSpace(modLoader))
+}
+
+func remoteModIDBackfillSuppressed(downloadURL, modLoader string) bool {
+	key := remoteModIDCacheKey(downloadURL, modLoader)
+	remoteModIDCache.Lock()
+	defer remoteModIDCache.Unlock()
+	entry := remoteModIDCache.entries[key]
+	return entry != nil && !entry.loading && len(entry.modIDs) == 0 && time.Now().Before(entry.expiresAt)
 }
 
 // PersistVersionModIDs persists modIDs for a platform version.
@@ -570,6 +650,9 @@ var (
 // work within a batch or while a prior backfill is still running.
 func markBackfill(version models.ModVersion, modLoader string) {
 	if strings.TrimSpace(version.ID) == "" {
+		return
+	}
+	if remoteModIDBackfillSuppressed(version.DownloadURL, modLoader) {
 		return
 	}
 	backfillMu.Lock()
@@ -732,7 +815,8 @@ func ApplyProjectMetadataToModInfos(mods []mcstructs.ModInfo, project models.Mod
 
 // parseRemoteModJar downloads a JAR via HTTP range requests and parses its mod metadata.
 func parseRemoteModJar(downloadURL string, modLoader string) ([]mcstructs.ModInfo, error) {
-	reader, err := minecraft.NewHTTPRangeReaderAtWithTimeout(downloadURL, 10*time.Second)
+	started := time.Now()
+	reader, err := minecraft.NewHTTPRangeReaderAtWithTimeout(downloadURL, remoteModJarTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -742,10 +826,20 @@ func parseRemoteModJar(downloadURL string, modLoader string) ([]mcstructs.ModInf
 		return nil, err
 	}
 	mods := minecraft.ParseModZipReader(zr, downloadURL, modLoader)
+	requests, bytesFetched := reader.RangeStats()
+	logging.Debug("remote jar metadata parsed", "url", downloadURL, "host", remoteHost(downloadURL), "size", reader.Size(), "rangeRequests", requests, "rangeBytes", bytesFetched, "modCount", len(mods), "elapsedMs", time.Since(started).Milliseconds())
 	if len(mods) == 0 {
 		return nil, fmt.Errorf("no parseable mod metadata")
 	}
 	return mods, nil
+}
+
+func remoteHost(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return parsed.Host
 }
 
 // --- private helpers ---
