@@ -49,6 +49,9 @@ type DownloadQueueState struct {
 	Pending           int                          `json:"pending"`
 	Running           int                          `json:"running"`
 	MessageCount      int                          `json:"messageCount"`
+	BytesComplete     int64                        `json:"bytesComplete"`
+	TotalBytes        int64                        `json:"totalBytes"`
+	BytesPerSecond    int64                        `json:"bytesPerSecond"`
 	Items             []DownloadQueueItem          `json:"items,omitempty"`
 	OptionalReminders []OptionalDependencyReminder `json:"optionalReminders,omitempty"`
 }
@@ -65,6 +68,8 @@ type DownloadQueueItem struct {
 	Cancelable       bool   `json:"cancelable"`
 	Retryable        bool   `json:"retryable"`
 	Reason           string `json:"reason,omitempty"`
+	BytesComplete    int64  `json:"bytesComplete"`
+	TotalBytes       int64  `json:"totalBytes"`
 }
 
 type DownloadFailedEvent struct {

@@ -29,6 +29,7 @@ type ModVersion struct {
 	Name         string          `json:"name"`         // Display name
 	Version      string          `json:"version"`      // Version number string
 	FileName     string          `json:"fileName"`     // JAR filename
+	FileSize     int64           `json:"fileSize"`     // File size in bytes when provider metadata includes it
 	DownloadURL  string          `json:"downloadUrl"`  // Direct download link
 	SHA1         string          `json:"sha1"`         // File hash (lowercase)
 	PublishedAt  int64           `json:"publishedAt"`  // Unix timestamp (seconds)

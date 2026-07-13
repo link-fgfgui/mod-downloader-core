@@ -64,6 +64,12 @@ type retryableDownloadJob struct {
 	Reason string
 }
 
+type downloadProgress struct {
+	BytesComplete  int64
+	TotalBytes     int64
+	BytesPerSecond int64
+}
+
 type optionalDependencyReminderState struct {
 	Snapshot appstructs.OptionalDependencyReminder
 	Requests []appstructs.ModDownloadRequest
@@ -102,6 +108,7 @@ var downloadQueue = struct {
 	workers           int
 	maxConcurrent     int
 	current           map[string]downloadJob
+	progress          map[string]downloadProgress
 }{}
 
 func Configure(config Config) {
@@ -227,6 +234,7 @@ func CancelDownload(ctx context.Context, id string, events ...Events) bool {
 			continue
 		}
 		downloadQueue.pending = append(downloadQueue.pending[:i], downloadQueue.pending[i+1:]...)
+		delete(downloadQueue.progress, job.ID)
 		appendRetryableDownloadLocked(job, "canceled", "canceled")
 		downloadQueue.Unlock()
 		emitDownloadQueueState(eventSink)
@@ -238,6 +246,7 @@ func CancelDownload(ctx context.Context, id string, events ...Events) bool {
 		cancel = job.cancel
 		if cancel != nil {
 			appendRetryableDownloadLocked(job, "canceled", "canceled")
+			delete(downloadQueue.progress, id)
 			delete(downloadQueue.current, id)
 			if downloadQueue.finalizedCancel == nil {
 				downloadQueue.finalizedCancel = make(map[string]struct{})
@@ -275,6 +284,7 @@ func RetryDownload(ctx context.Context, id string, events ...Events) bool {
 	}
 	if index >= 0 {
 		downloadQueue.retryable = append(downloadQueue.retryable[:index], downloadQueue.retryable[index+1:]...)
+		delete(downloadQueue.progress, id)
 		downloadQueue.Unlock()
 
 		job.ID = ""
@@ -435,7 +445,11 @@ func firstNonEmpty(values ...string) string {
 
 func enqueueDownload(ctx context.Context, job downloadJob, events Events) {
 	downloadQueue.Lock()
+	if len(downloadQueue.current) == 0 && len(downloadQueue.pending) == 0 {
+		downloadQueue.progress = nil
+	}
 	assignDownloadIDLocked(&job)
+	registerDownloadProgressLocked(job)
 	downloadQueue.pending = append(downloadQueue.pending, job)
 	workersToStart := reserveDownloadWorkersLocked()
 	downloadQueue.Unlock()
@@ -467,6 +481,7 @@ func prependPendingDownloads(jobs []downloadJob, events Events) {
 	for i := range jobs {
 		assignDownloadIDLocked(&jobs[i])
 		jobs[i].cancel = nil
+		registerDownloadProgressLocked(jobs[i])
 	}
 	downloadQueue.pending = append(append([]downloadJob(nil), jobs...), downloadQueue.pending...)
 	downloadQueue.Unlock()
@@ -479,6 +494,70 @@ func assignDownloadIDLocked(job *downloadJob) {
 	}
 	downloadQueue.nextID++
 	job.ID = fmt.Sprintf("download-%d", downloadQueue.nextID)
+}
+
+func registerDownloadProgressLocked(job downloadJob) {
+	if downloadQueue.progress == nil {
+		downloadQueue.progress = make(map[string]downloadProgress)
+	}
+	total := job.Version.FileSize
+	if total < 0 {
+		total = 0
+	}
+	downloadQueue.progress[job.ID] = downloadProgress{TotalBytes: total}
+}
+
+func removeDownloadProgress(id string) {
+	downloadQueue.Lock()
+	delete(downloadQueue.progress, id)
+	downloadQueue.Unlock()
+}
+
+func removeCurrentDownload(id string) {
+	downloadQueue.Lock()
+	delete(downloadQueue.current, id)
+	if len(downloadQueue.current) == 0 && len(downloadQueue.pending) == 0 {
+		downloadQueue.progress = nil
+	}
+	downloadQueue.Unlock()
+}
+
+func completeDownloadProgress(id string) {
+	downloadQueue.Lock()
+	progress, ok := downloadQueue.progress[id]
+	if ok {
+		if progress.TotalBytes > 0 {
+			progress.BytesComplete = progress.TotalBytes
+		}
+		progress.BytesPerSecond = 0
+		downloadQueue.progress[id] = progress
+	}
+	downloadQueue.Unlock()
+}
+
+func updateDownloadProgress(id string, value filetransfer.Progress, bytesPerSecond int64, events Events) {
+	downloadQueue.Lock()
+	progress, ok := downloadQueue.progress[id]
+	if !ok {
+		downloadQueue.Unlock()
+		return
+	}
+	if value.TotalBytes > 0 {
+		progress.TotalBytes = value.TotalBytes
+	}
+	if value.BytesComplete >= 0 {
+		progress.BytesComplete = value.BytesComplete
+	}
+	if progress.TotalBytes > 0 && progress.BytesComplete > progress.TotalBytes {
+		progress.BytesComplete = progress.TotalBytes
+	}
+	if bytesPerSecond < 0 {
+		bytesPerSecond = 0
+	}
+	progress.BytesPerSecond = bytesPerSecond
+	downloadQueue.progress[id] = progress
+	downloadQueue.Unlock()
+	emitDownloadQueueState(events)
 }
 
 func runDownloadQueue(ctx context.Context, events Events) {
@@ -516,6 +595,7 @@ func runDownloadQueue(ctx context.Context, events Events) {
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				logging.Info("download mod canceled", "fileName", job.Version.FileName, "versionID", job.Version.ID, "targetDir", job.TargetDir)
+				removeDownloadProgress(job.ID)
 				if consumeDownloadRestartRequest(job.ID) {
 					job.AutoAttempt = 0
 					enqueueDownload(parentCtx, job, events)
@@ -523,19 +603,22 @@ func runDownloadQueue(ctx context.Context, events Events) {
 					appendRetryableDownload(job, "canceled", "canceled")
 				}
 			} else if errors.Is(err, errDownloadRequeued) {
+				removeDownloadProgress(job.ID)
 				logging.Debug("download mod requeued after dependency analysis", "fileName", job.Version.FileName, "versionID", job.Version.ID, "targetDir", job.TargetDir)
 			} else if errors.Is(err, errDownloadStalled) && retryStalledDownload(parentCtx, job, events) {
 				logging.Warn("download mod stalled, retrying", "fileName", job.Version.FileName, "versionID", job.Version.ID, "targetDir", job.TargetDir, "attempt", job.AutoAttempt+1, "maxRetries", maxDownloadStallRetries)
 			} else {
+				removeDownloadProgress(job.ID)
 				logging.Error("download mod failed", "fileName", job.Version.FileName, "versionID", job.Version.ID, "targetDir", job.TargetDir, "error", err)
 				appendRetryableDownload(job, "failed", err.Error())
 				emitDownloadFailed(events, job, err)
 			}
+		} else {
+			completeDownloadProgress(job.ID)
+			emitDownloadQueueState(events)
 		}
 		cancel()
-		downloadQueue.Lock()
-		delete(downloadQueue.current, job.ID)
-		downloadQueue.Unlock()
+		removeCurrentDownload(job.ID)
 		emitDownloadQueueState(events)
 	}
 }
@@ -602,10 +685,10 @@ func downloadModJob(ctx context.Context, job downloadJob, events Events) (bool, 
 		if alreadyInstalled(existing, job.Version.SHA1) {
 			return false, nil
 		}
-		return downloadModToTarget(ctx, job, existing)
+		return downloadModToTarget(ctx, job, existing, events)
 	}
 
-	return downloadModWithLocalParse(ctx, job)
+	return downloadModWithLocalParse(ctx, job, events)
 }
 
 // tryHardlinkInstall consults the SHA1→path hardlink index before downloading.
@@ -990,8 +1073,8 @@ func isIncompatibleDependency(dep models.ModDependency) bool {
 	return modbridge.IsDependencyType(dep, "incompatible")
 }
 
-func downloadModToTarget(ctx context.Context, job downloadJob, existing []global.LocalModFilePath) (bool, error) {
-	tempPath, err := downloadFileToTemp(ctx, job)
+func downloadModToTarget(ctx context.Context, job downloadJob, existing []global.LocalModFilePath, events Events) (bool, error) {
+	tempPath, err := downloadFileToTemp(ctx, job, events)
 	if err != nil {
 		return false, err
 	}
@@ -1015,8 +1098,8 @@ func downloadModToTarget(ctx context.Context, job downloadJob, existing []global
 	return true, nil
 }
 
-func downloadModWithLocalParse(ctx context.Context, job downloadJob) (bool, error) {
-	tempPath, err := downloadFileToTemp(ctx, job)
+func downloadModWithLocalParse(ctx context.Context, job downloadJob, events Events) (bool, error) {
+	tempPath, err := downloadFileToTemp(ctx, job, events)
 	if err != nil {
 		return false, err
 	}
@@ -1081,7 +1164,8 @@ func downloadHeaders(job downloadJob) map[string]string {
 	return headers
 }
 
-func downloadFileToTemp(ctx context.Context, job downloadJob) (string, error) {
+func downloadFileToTemp(ctx context.Context, job downloadJob, events ...Events) (string, error) {
+	eventSink := firstEvents(events)
 	tempDir := filepath.Join(filepath.Dir(job.TargetDir), ".mod-downloader-tmp")
 	if err := os.MkdirAll(tempDir, 0o755); err != nil {
 		return "", err
@@ -1104,7 +1188,9 @@ func downloadFileToTemp(ctx context.Context, job downloadJob) (string, error) {
 		attempts += maxDownloadSHA1Retries
 	}
 	for attempt := 1; attempt <= attempts; attempt++ {
-		if _, err := doDownloadWithStallTimeout(ctx, newFileTransferBackend(), request); err != nil {
+		if _, err := doDownloadWithStallTimeout(ctx, newFileTransferBackend(), request, func(progress filetransfer.Progress, bytesPerSecond int64) {
+			updateDownloadProgress(job.ID, progress, bytesPerSecond, eventSink)
+		}); err != nil {
 			return "", err
 		}
 		if !verifySHA1 {
@@ -1225,6 +1311,7 @@ func currentDownloadQueueState() appstructs.DownloadQueueState {
 	downloadQueue.Lock()
 	defer downloadQueue.Unlock()
 	running := len(downloadQueue.current)
+	bytesComplete, totalBytes, bytesPerSecond := aggregateDownloadProgressLocked()
 	items := make([]appstructs.DownloadQueueItem, 0, running+len(downloadQueue.pending)+len(downloadQueue.retryable))
 	currentIDs := make([]string, 0, len(downloadQueue.current))
 	for id := range downloadQueue.current {
@@ -1234,10 +1321,13 @@ func currentDownloadQueueState() appstructs.DownloadQueueState {
 	for _, id := range currentIDs {
 		item := downloadQueueItemFromJob(downloadQueue.current[id], "running", true)
 		item.Retryable = true
+		applyDownloadProgressLocked(&item, id)
 		items = append(items, item)
 	}
 	for _, job := range downloadQueue.pending {
-		items = append(items, downloadQueueItemFromJob(job, "pending", true))
+		item := downloadQueueItemFromJob(job, "pending", true)
+		applyDownloadProgressLocked(&item, job.ID)
+		items = append(items, item)
 	}
 	for _, item := range downloadQueue.retryable {
 		queueItem := downloadQueueItemFromJob(item.Job, item.Status, false)
@@ -1254,9 +1344,66 @@ func currentDownloadQueueState() appstructs.DownloadQueueState {
 		Pending:           len(downloadQueue.pending),
 		Running:           running,
 		MessageCount:      len(reminders),
+		BytesComplete:     bytesComplete,
+		TotalBytes:        totalBytes,
+		BytesPerSecond:    bytesPerSecond,
 		Items:             items,
 		OptionalReminders: reminders,
 	}
+}
+
+func applyDownloadProgressLocked(item *appstructs.DownloadQueueItem, id string) {
+	progress, ok := downloadQueue.progress[id]
+	if !ok {
+		return
+	}
+	item.BytesComplete = nonNegativeDownloadBytes(progress.BytesComplete)
+	item.TotalBytes = nonNegativeDownloadBytes(progress.TotalBytes)
+	if item.TotalBytes > 0 && item.BytesComplete > item.TotalBytes {
+		item.BytesComplete = item.TotalBytes
+	}
+}
+
+func aggregateDownloadProgressLocked() (int64, int64, int64) {
+	var complete, total, speed int64
+	for _, progress := range downloadQueue.progress {
+		if progress.TotalBytes > 0 {
+			complete = addDownloadBytes(complete, minDownloadBytes(progress.BytesComplete, progress.TotalBytes))
+			total = addDownloadBytes(total, progress.TotalBytes)
+		}
+	}
+	for id := range downloadQueue.current {
+		if progress, ok := downloadQueue.progress[id]; ok && progress.BytesPerSecond > 0 {
+			speed = addDownloadBytes(speed, progress.BytesPerSecond)
+		}
+	}
+	return complete, total, speed
+}
+
+func nonNegativeDownloadBytes(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func minDownloadBytes(left, right int64) int64 {
+	left = nonNegativeDownloadBytes(left)
+	right = nonNegativeDownloadBytes(right)
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func addDownloadBytes(left, right int64) int64 {
+	left = nonNegativeDownloadBytes(left)
+	right = nonNegativeDownloadBytes(right)
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if left > maxInt64-right {
+		return maxInt64
+	}
+	return left + right
 }
 
 func downloadQueueItemFromJob(job downloadJob, status string, cancelable bool) appstructs.DownloadQueueItem {
@@ -1338,6 +1485,7 @@ func retryStalledDownload(ctx context.Context, job downloadJob, events Events) b
 	if job.AutoAttempt >= maxDownloadStallRetries {
 		return false
 	}
+	removeDownloadProgress(job.ID)
 	job.ID = ""
 	job.cancel = nil
 	job.AutoAttempt++
@@ -1350,7 +1498,7 @@ type transferOutcome struct {
 	err    error
 }
 
-func doDownloadWithStallTimeout(ctx context.Context, backend filetransfer.Backend, req filetransfer.Request) (filetransfer.Result, error) {
+func doDownloadWithStallTimeout(ctx context.Context, backend filetransfer.Backend, req filetransfer.Request, onProgress ...func(filetransfer.Progress, int64)) (filetransfer.Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1358,12 +1506,33 @@ func doDownloadWithStallTimeout(ctx context.Context, backend filetransfer.Backen
 	defer cancel()
 	tracker := filetransfer.NewProgressTracker(nil)
 	done := make(chan transferOutcome, 1)
+	var progressCallback func(filetransfer.Progress, int64)
+	if len(onProgress) > 0 {
+		progressCallback = onProgress[0]
+	}
+	lastSampleBytes := tracker.Snapshot().BytesComplete
+	lastSampleAt := time.Now()
+	notifyProgress := func() {
+		if progressCallback == nil {
+			return
+		}
+		progress := tracker.Snapshot()
+		elapsed := time.Since(lastSampleAt).Seconds()
+		bytesPerSecond := int64(0)
+		if elapsed > 0 && progress.BytesComplete > lastSampleBytes {
+			bytesPerSecond = int64(float64(progress.BytesComplete-lastSampleBytes) / elapsed)
+		}
+		progressCallback(progress, bytesPerSecond)
+		lastSampleBytes = progress.BytesComplete
+		lastSampleAt = time.Now()
+	}
 	go func() {
 		result, err := backend.Download(attemptCtx, req, tracker)
 		done <- transferOutcome{result: result, err: err}
 	}()
 	if downloadStallTimeout <= 0 {
 		outcome := <-done
+		notifyProgress()
 		return outcome.result, outcome.err
 	}
 	pollInterval := downloadProgressPollInterval
@@ -1377,12 +1546,15 @@ func doDownloadWithStallTimeout(ctx context.Context, backend filetransfer.Backen
 	for {
 		select {
 		case outcome := <-done:
+			notifyProgress()
 			return outcome.result, outcome.err
 		case <-ctx.Done():
 			cancel()
 			<-done
+			notifyProgress()
 			return filetransfer.Result{}, ctx.Err()
 		case <-ticker.C:
+			notifyProgress()
 			currentBytes := tracker.Snapshot().BytesComplete
 			if currentBytes > lastBytes {
 				lastBytes = currentBytes
@@ -1397,6 +1569,7 @@ func doDownloadWithStallTimeout(ctx context.Context, backend filetransfer.Backen
 				}
 				cancel()
 				<-done
+				notifyProgress()
 				return filetransfer.Result{}, errDownloadStalled
 			}
 		}

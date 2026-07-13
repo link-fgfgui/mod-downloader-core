@@ -953,6 +953,7 @@ func (p curseForgeProvider) fileToModVersion(file cfSchema.File) models.ModVersi
 		Name:         file.DisplayName,
 		Version:      file.DisplayName,
 		FileName:     file.FileName,
+		FileSize:     file.FileLength,
 		DownloadURL:  file.DownloadURL,
 		SHA1:         curseForgeFileSHA1(file),
 		PublishedAt:  file.FileDate.Unix(),
@@ -1086,6 +1087,9 @@ func (p modrinthProvider) setModVersionFileFields(result *models.ModVersion, fil
 	}
 	if file.Filename != nil {
 		result.FileName = *file.Filename
+	}
+	if file.Size != nil && *file.Size > 0 {
+		result.FileSize = int64(*file.Size)
 	}
 	if file.URL != nil {
 		result.DownloadURL = *file.URL

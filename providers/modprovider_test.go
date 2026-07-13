@@ -12,6 +12,7 @@ import (
 
 	modrinth "codeberg.org/jmansfield/go-modrinth/modrinth"
 	"github.com/link-fgfgui/mod-downloader-core/global"
+	"github.com/link-fgfgui/mod-downloader-core/models"
 	"github.com/link-fgfgui/mod-downloader-core/storage"
 	curseforge "github.com/sjet47/go-curseforge"
 	cfAPI "github.com/sjet47/go-curseforge/api"
@@ -261,6 +262,32 @@ func TestModrinthProjectToModProjectCategories(t *testing.T) {
 		AdditionalCategories: []string{"Magic", "library"},
 	})
 	assertStrings(t, project.Categories, []string{"library", "technology", "magic"})
+}
+
+func TestProviderVersionConvertersPreserveFileSize(t *testing.T) {
+	curseForgeVersion := curseForgeProvider{}.fileToModVersion(cfSchema.File{
+		FileName:   "curseforge.jar",
+		FileLength: 4096,
+	})
+	if curseForgeVersion.FileSize != 4096 {
+		t.Fatalf("CurseForge file size = %d, want 4096", curseForgeVersion.FileSize)
+	}
+
+	fileName := "modrinth.jar"
+	fileSize := uint32(8192)
+	modrinthVersion := models.ModVersion{}
+	modrinthProvider{}.setModVersionFileFields(&modrinthVersion, &modrinth.File{
+		Filename: &fileName,
+		Size:     &fileSize,
+	})
+	if modrinthVersion.FileSize != 8192 {
+		t.Fatalf("Modrinth file size = %d, want 8192", modrinthVersion.FileSize)
+	}
+
+	modrinthProvider{}.setModVersionFileFields(&modrinthVersion, &modrinth.File{})
+	if modrinthVersion.FileSize != 8192 {
+		t.Fatalf("missing Modrinth size replaced known value: %d", modrinthVersion.FileSize)
+	}
 }
 
 func assertStrings(t *testing.T, got []string, want []string) {

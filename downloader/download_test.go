@@ -38,6 +38,7 @@ func resetDownloadQueueForTest(t *testing.T) {
 	downloadQueue.workers = 0
 	downloadQueue.maxConcurrent = 1
 	downloadQueue.current = nil
+	downloadQueue.progress = nil
 	downloadQueue.Unlock()
 	downloadFileConcurrency.Store(filetransfer.DefaultConcurrency)
 	downloadVerifySHA1.Store(false)
@@ -93,6 +94,88 @@ func waitForDownloadState(t *testing.T, match func(appstructs.DownloadQueueState
 	state := GetDownloadQueueState()
 	t.Fatalf("download state did not match before timeout: %#v", state)
 	return state
+}
+
+func TestDownloadQueueStateAggregatesByteProgressAndActiveSpeed(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	downloadQueue.Lock()
+	downloadQueue.current = map[string]downloadJob{
+		"download-running": {ID: "download-running", Version: models.ModVersion{ID: "running"}},
+	}
+	downloadQueue.pending = []downloadJob{
+		{ID: "download-pending", Version: models.ModVersion{ID: "pending"}},
+	}
+	downloadQueue.progress = map[string]downloadProgress{
+		"download-complete": {BytesComplete: 100, TotalBytes: 100},
+		"download-running":  {BytesComplete: 200, TotalBytes: 500, BytesPerSecond: 300},
+		"download-pending":  {BytesComplete: 0, TotalBytes: 1000},
+		"download-unknown":  {BytesComplete: 80, TotalBytes: 0, BytesPerSecond: 900},
+	}
+	downloadQueue.Unlock()
+
+	state := GetDownloadQueueState()
+	if state.BytesComplete != 300 || state.TotalBytes != 1600 || state.BytesPerSecond != 300 {
+		t.Fatalf("aggregate progress = (%d/%d, %d B/s), want (300/1600, 300 B/s)", state.BytesComplete, state.TotalBytes, state.BytesPerSecond)
+	}
+	if len(state.Items) != 2 {
+		t.Fatalf("items = %d, want active items only", len(state.Items))
+	}
+	for _, item := range state.Items {
+		switch item.ID {
+		case "download-running":
+			if item.BytesComplete != 200 || item.TotalBytes != 500 {
+				t.Fatalf("running item progress = %#v", item)
+			}
+		case "download-pending":
+			if item.BytesComplete != 0 || item.TotalBytes != 1000 {
+				t.Fatalf("pending item progress = %#v", item)
+			}
+		}
+	}
+}
+
+func TestDownloadQueueProgressUpdateUsesTransferTotalAndEmitsAfterUnlock(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	downloadQueue.Lock()
+	downloadQueue.current = map[string]downloadJob{
+		"download-1": {ID: "download-1", Version: models.ModVersion{ID: "version-1"}},
+	}
+	downloadQueue.progress = map[string]downloadProgress{
+		"download-1": {TotalBytes: 100},
+	}
+	downloadQueue.Unlock()
+
+	emitted := make(chan appstructs.DownloadQueueState, 1)
+	updateDownloadProgress("download-1", filetransfer.Progress{BytesComplete: 40, TotalBytes: 80}, 50, Events{
+		OnQueueState: func(state appstructs.DownloadQueueState) {
+			emitted <- state
+		},
+	})
+	state := <-emitted
+	if state.BytesComplete != 40 || state.TotalBytes != 80 || state.BytesPerSecond != 50 {
+		t.Fatalf("emitted state = %#v", state)
+	}
+	if state.Items[0].BytesComplete != 40 || state.Items[0].TotalBytes != 80 {
+		t.Fatalf("emitted item = %#v", state.Items[0])
+	}
+}
+
+func TestDownloadQueueProgressClearsAfterActiveDrain(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	downloadQueue.Lock()
+	downloadQueue.current = map[string]downloadJob{
+		"download-1": {ID: "download-1"},
+	}
+	downloadQueue.progress = map[string]downloadProgress{
+		"download-1": {BytesComplete: 100, TotalBytes: 100},
+	}
+	downloadQueue.Unlock()
+
+	removeCurrentDownload("download-1")
+	state := GetDownloadQueueState()
+	if state.BytesComplete != 0 || state.TotalBytes != 0 || state.BytesPerSecond != 0 {
+		t.Fatalf("drained progress = %#v, want zero aggregate", state)
+	}
 }
 
 func TestGetDownloadStatesReturnsDefaultWhenSelectedInstanceHasNoLocalMods(t *testing.T) {
@@ -610,10 +693,12 @@ func (successfulTransferBackend) Kind() filetransfer.BackendKind {
 	return filetransfer.BackendStdlib
 }
 
-func (b successfulTransferBackend) Download(_ context.Context, req filetransfer.Request, _ *filetransfer.ProgressTracker) (filetransfer.Result, error) {
+func (b successfulTransferBackend) Download(_ context.Context, req filetransfer.Request, tracker *filetransfer.ProgressTracker) (filetransfer.Result, error) {
+	tracker.Reset(int64(len(b.content)))
 	if err := os.WriteFile(req.Destination, b.content, 0o644); err != nil {
 		return filetransfer.Result{}, err
 	}
+	tracker.SetComplete(int64(len(b.content)))
 	return filetransfer.Result{
 		Path:          req.Destination,
 		BytesComplete: int64(len(b.content)),
@@ -716,6 +801,23 @@ func TestDoDownloadWithStallTimeoutCancelsBackend(t *testing.T) {
 	})
 	if !errors.Is(err, errDownloadStalled) {
 		t.Fatalf("err = %v, want errDownloadStalled", err)
+	}
+}
+
+func TestDoDownloadWithStallTimeoutEmitsFinalProgressForShortTransfer(t *testing.T) {
+	content := []byte("short transfer")
+	var progress filetransfer.Progress
+	_, err := doDownloadWithStallTimeout(t.Context(), successfulTransferBackend{content: content}, filetransfer.Request{
+		URL:         "https://example.invalid/file.jar",
+		Destination: filepath.Join(t.TempDir(), "file.jar"),
+	}, func(value filetransfer.Progress, _ int64) {
+		progress = value
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.BytesComplete != int64(len(content)) || progress.TotalBytes != int64(len(content)) {
+		t.Fatalf("final progress = %#v, want %d/%d", progress, len(content), len(content))
 	}
 }
 
