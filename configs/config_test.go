@@ -305,16 +305,26 @@ file_concurrency = 8
 concurrent_downloads = 3
 adaptive_file_concurrency = true
 target_download_rate_mib = 2.5
+verify_sha1 = true
 [api]
 requests_per_second = 12
 `, &cfg); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Downloads.FileConcurrencyValue() != 8 || cfg.Downloads.ConcurrentDownloadsValue() != 3 || !cfg.Downloads.AdaptiveFileConcurrency || cfg.Downloads.TargetDownloadRateMiBValue() != 2.5 {
+	if cfg.Downloads.FileConcurrencyValue() != 8 || cfg.Downloads.ConcurrentDownloadsValue() != 3 || !cfg.Downloads.AdaptiveFileConcurrency || cfg.Downloads.TargetDownloadRateMiBValue() != 2.5 || !cfg.Downloads.VerifySHA1 {
 		t.Fatalf("downloads = %#v", cfg.Downloads)
 	}
 	if cfg.API.RequestsPerSecondValue() != 12 {
 		t.Fatalf("API = %#v", cfg.API)
+	}
+
+	t.Setenv("DOWNLOADS_VERIFY_SHA1", "true")
+	cfg = Config{}
+	if err := readEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Downloads.VerifySHA1 {
+		t.Fatal("environment verify SHA1 = false, want true")
 	}
 }
 

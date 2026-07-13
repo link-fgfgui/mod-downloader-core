@@ -243,6 +243,7 @@ type DownloadConfig struct {
 	ConcurrentDownloads     int     `toml:"concurrent_downloads" json:"concurrentDownloads" env:"CONCURRENT_DOWNLOADS"`
 	AdaptiveFileConcurrency bool    `toml:"adaptive_file_concurrency" json:"adaptiveFileConcurrency" env:"ADAPTIVE_FILE_CONCURRENCY"`
 	TargetDownloadRateMiB   float64 `toml:"target_download_rate_mib" json:"targetDownloadRateMiB" env:"TARGET_DOWNLOAD_RATE_MIB"`
+	VerifySHA1              bool    `toml:"verify_sha1" json:"verifySha1" env:"VERIFY_SHA1"`
 }
 
 func (c DownloadConfig) FileConcurrencyValue() int {

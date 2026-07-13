@@ -3,6 +3,8 @@ package downloader
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -38,6 +40,7 @@ func resetDownloadQueueForTest(t *testing.T) {
 	downloadQueue.current = nil
 	downloadQueue.Unlock()
 	downloadFileConcurrency.Store(filetransfer.DefaultConcurrency)
+	downloadVerifySHA1.Store(false)
 	resetDownloaderHooksForTest(t)
 }
 
@@ -771,6 +774,98 @@ func TestDownloadFileToTempPreservesProviderURL(t *testing.T) {
 	if req := <-requests; req.URL != providerURL {
 		t.Fatalf("transfer URL = %q, want provider URL %q", req.URL, providerURL)
 	}
+}
+
+func TestDownloadFileToTempRetriesSHA1Mismatch(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	Configure(Config{VerifySHA1: true})
+	t.Cleanup(func() { Configure(Config{}) })
+
+	bad := []byte("corrupt download")
+	good := []byte("verified download")
+	digest := sha1.Sum(good)
+	backend := &sequencedTransferBackend{contents: [][]byte{bad, good}}
+	newFileTransferBackend = func() filetransfer.Backend { return backend }
+	t.Cleanup(func() {
+		newFileTransferBackend = func() filetransfer.Backend { return filetransfer.NewStdlibBackend(nil) }
+	})
+
+	path, err := downloadFileToTemp(t.Context(), downloadJob{
+		Version: models.ModVersion{
+			DownloadURL: "https://example.test/mod.jar",
+			FileName:    "mod.jar",
+			SHA1:        hex.EncodeToString(digest[:]),
+		},
+		TargetDir: filepath.Join(t.TempDir(), "mods"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.calls != 2 {
+		t.Fatalf("download attempts = %d, want 2", backend.calls)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(content, good) {
+		t.Fatalf("downloaded content = %q, want %q", content, good)
+	}
+}
+
+func TestDownloadFileToTempRemovesFileAfterSHA1RetriesExhausted(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	Configure(Config{VerifySHA1: true})
+	t.Cleanup(func() { Configure(Config{}) })
+
+	digest := sha1.Sum([]byte("expected"))
+	backend := &sequencedTransferBackend{contents: [][]byte{
+		[]byte("bad 1"), []byte("bad 2"), []byte("bad 3"),
+	}}
+	newFileTransferBackend = func() filetransfer.Backend { return backend }
+	t.Cleanup(func() {
+		newFileTransferBackend = func() filetransfer.Backend { return filetransfer.NewStdlibBackend(nil) }
+	})
+
+	root := t.TempDir()
+	path, err := downloadFileToTemp(t.Context(), downloadJob{
+		Version: models.ModVersion{
+			DownloadURL: "https://example.test/mod.jar",
+			FileName:    "mod.jar",
+			SHA1:        hex.EncodeToString(digest[:]),
+		},
+		TargetDir: filepath.Join(root, "mods"),
+	})
+	if err == nil {
+		t.Fatal("downloadFileToTemp() error = nil, want SHA1 mismatch")
+	}
+	if backend.calls != 3 {
+		t.Fatalf("download attempts = %d, want 3", backend.calls)
+	}
+	if path != "" {
+		t.Fatalf("path = %q, want empty", path)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, ".mod-downloader-tmp", "mod.jar")); !os.IsNotExist(statErr) {
+		t.Fatalf("temporary download file still exists, stat error = %v", statErr)
+	}
+}
+
+type sequencedTransferBackend struct {
+	contents [][]byte
+	calls    int
+}
+
+func (*sequencedTransferBackend) Kind() filetransfer.BackendKind {
+	return filetransfer.BackendStdlib
+}
+
+func (b *sequencedTransferBackend) Download(_ context.Context, req filetransfer.Request, _ *filetransfer.ProgressTracker) (filetransfer.Result, error) {
+	content := b.contents[b.calls]
+	b.calls++
+	if err := os.WriteFile(req.Destination, content, 0o644); err != nil {
+		return filetransfer.Result{}, err
+	}
+	return filetransfer.Result{Path: req.Destination}, nil
 }
 
 type requestCaptureTransferBackend struct {

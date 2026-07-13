@@ -852,12 +852,14 @@ func TestSaveNetworkSettingsClampsAndPersists(t *testing.T) {
 		ConcurrentDownloads:     -1,
 		AdaptiveFileConcurrency: true,
 		TargetDownloadRateMiB:   10,
+		VerifySHA1:              true,
 		RequestsPerSecond:       101,
 	})
 	if view.FileConcurrency != configs.MaxFileConcurrency ||
 		view.ConcurrentDownloads != configs.DefaultConcurrentDownloads ||
 		!view.AdaptiveFileConcurrency ||
 		view.TargetDownloadRateMiB != configs.MaxTargetDownloadRateMiB ||
+		!view.VerifySHA1 ||
 		view.RequestsPerSecond != configs.MaxRequestsPerSecond {
 		t.Fatalf("network settings view = %#v", view)
 	}
@@ -870,6 +872,7 @@ func TestSaveNetworkSettingsClampsAndPersists(t *testing.T) {
 		loaded.Downloads.ConcurrentDownloads != configs.DefaultConcurrentDownloads ||
 		!loaded.Downloads.AdaptiveFileConcurrency ||
 		loaded.Downloads.TargetDownloadRateMiB != configs.MaxTargetDownloadRateMiB ||
+		!loaded.Downloads.VerifySHA1 ||
 		loaded.API.RequestsPerSecond != configs.MaxRequestsPerSecond {
 		t.Fatalf("persisted network settings = %#v", loaded)
 	}

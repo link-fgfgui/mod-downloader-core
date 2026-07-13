@@ -55,6 +55,7 @@ type Config struct {
 	ConcurrentDownloads     int
 	AdaptiveFileConcurrency bool
 	TargetDownloadRateMiB   float64
+	VerifySHA1              bool
 }
 
 type retryableDownloadJob struct {
@@ -71,6 +72,7 @@ type optionalDependencyReminderState struct {
 const (
 	maxRetryableDownloadHistory = 20
 	maxDownloadStallRetries     = 2
+	maxDownloadSHA1Retries      = 2
 )
 
 var (
@@ -84,6 +86,7 @@ var (
 	downloadFileConcurrency          atomic.Int64
 	downloadAdaptiveFileConcurrency  atomic.Bool
 	downloadTargetRateBytesPerSecond atomic.Int64
+	downloadVerifySHA1               atomic.Bool
 )
 
 var downloadQueue = struct {
@@ -117,6 +120,7 @@ func Configure(config Config) {
 		targetRateBytesPerSecond = int64(1024 * 1024)
 	}
 	downloadTargetRateBytesPerSecond.Store(targetRateBytesPerSecond)
+	downloadVerifySHA1.Store(config.VerifySHA1)
 	downloadQueue.Lock()
 	downloadQueue.maxConcurrent = concurrentDownloads
 	downloadQueue.Unlock()
@@ -132,6 +136,10 @@ func configuredFileConcurrency() int {
 		return filetransfer.DefaultConcurrency
 	}
 	return value
+}
+
+func configuredVerifySHA1() bool {
+	return downloadVerifySHA1.Load()
 }
 
 func QueueModDownload(ctx context.Context, req appstructs.ModDownloadRequest, curseForgeAPIKey string, events ...Events) appstructs.ModDownloadResult {
@@ -1090,10 +1098,31 @@ func downloadFileToTemp(ctx context.Context, job downloadJob) (string, error) {
 		TargetBytesPerSecond: targetRateBytesPerSecond,
 		OverwriteExisting:    true,
 	}
-	if _, err := doDownloadWithStallTimeout(ctx, newFileTransferBackend(), request); err != nil {
-		return "", err
+	verifySHA1 := configuredVerifySHA1() && strings.TrimSpace(job.Version.SHA1) != ""
+	attempts := 1
+	if verifySHA1 {
+		attempts += maxDownloadSHA1Retries
 	}
-	return tempPath, nil
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if _, err := doDownloadWithStallTimeout(ctx, newFileTransferBackend(), request); err != nil {
+			return "", err
+		}
+		if !verifySHA1 {
+			return tempPath, nil
+		}
+		expectedSHA1 := strings.ToLower(strings.TrimSpace(job.Version.SHA1))
+		actualSHA1 := minecraft.FileSHA1(tempPath)
+		if strings.EqualFold(actualSHA1, expectedSHA1) {
+			return tempPath, nil
+		}
+		_ = os.Remove(tempPath)
+		if attempt < attempts {
+			logging.Warn("download SHA1 mismatch; retrying", "path", tempPath, "expectedSHA1", expectedSHA1, "actualSHA1", actualSHA1, "attempt", attempt, "maxAttempts", attempts)
+			continue
+		}
+		return "", fmt.Errorf("downloaded file SHA1 mismatch: got %s, want %s", actualSHA1, expectedSHA1)
+	}
+	return "", fmt.Errorf("download SHA1 verification failed")
 }
 
 func downloadFileName(job downloadJob) string {

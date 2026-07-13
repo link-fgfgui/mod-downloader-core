@@ -81,6 +81,7 @@ func (s *Service) Startup(ctx context.Context) error {
 		ConcurrentDownloads:     s.config.Downloads.ConcurrentDownloadsValue(),
 		AdaptiveFileConcurrency: s.config.Downloads.AdaptiveFileConcurrency,
 		TargetDownloadRateMiB:   s.config.Downloads.TargetDownloadRateMiBValue(),
+		VerifySHA1:              s.config.Downloads.VerifySHA1,
 	})
 	if minecraftDir := minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir); strings.TrimSpace(minecraftDir) != "" {
 		s.config.Prefers.MinecraftDir = minecraftDir
@@ -676,6 +677,7 @@ func (s *Service) GetSettings() SettingsView {
 		sv.ConcurrentDownloads = s.config.Downloads.ConcurrentDownloadsValue()
 		sv.AdaptiveFileConcurrency = s.config.Downloads.AdaptiveFileConcurrency
 		sv.TargetDownloadRateMiB = s.config.Downloads.TargetDownloadRateMiBValue()
+		sv.VerifySHA1 = s.config.Downloads.VerifySHA1
 		sv.RequestsPerSecond = s.config.API.RequestsPerSecondValue()
 		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir))
 		sv.CacheDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Runtime.CacheDir))
@@ -772,6 +774,7 @@ func (s *Service) SaveMCIMSettings(req SaveMCIMSettingsRequest) SettingsView {
 		ConcurrentDownloads:     s.config.Downloads.ConcurrentDownloadsValue(),
 		AdaptiveFileConcurrency: s.config.Downloads.AdaptiveFileConcurrency,
 		TargetDownloadRateMiB:   s.config.Downloads.TargetDownloadRateMiBValue(),
+		VerifySHA1:              s.config.Downloads.VerifySHA1,
 	})
 	return s.GetSettings()
 }
@@ -784,6 +787,7 @@ func (s *Service) SaveNetworkSettings(req SaveNetworkSettingsRequest) SettingsVi
 	s.config.Downloads.ConcurrentDownloads = configs.DownloadConfig{ConcurrentDownloads: req.ConcurrentDownloads}.ConcurrentDownloadsValue()
 	s.config.Downloads.AdaptiveFileConcurrency = req.AdaptiveFileConcurrency
 	s.config.Downloads.TargetDownloadRateMiB = configs.DownloadConfig{TargetDownloadRateMiB: req.TargetDownloadRateMiB}.TargetDownloadRateMiBValue()
+	s.config.Downloads.VerifySHA1 = req.VerifySHA1
 	s.config.API.RequestsPerSecond = configs.APIConfig{RequestsPerSecond: req.RequestsPerSecond}.RequestsPerSecondValue()
 	if err := configs.Save(s.config); err != nil {
 		logging.Error("save network settings failed", "error", err)
@@ -793,6 +797,7 @@ func (s *Service) SaveNetworkSettings(req SaveNetworkSettingsRequest) SettingsVi
 		ConcurrentDownloads:     s.config.Downloads.ConcurrentDownloads,
 		AdaptiveFileConcurrency: s.config.Downloads.AdaptiveFileConcurrency,
 		TargetDownloadRateMiB:   s.config.Downloads.TargetDownloadRateMiB,
+		VerifySHA1:              s.config.Downloads.VerifySHA1,
 	})
 	s.configureProviderClients()
 	return s.GetSettings()

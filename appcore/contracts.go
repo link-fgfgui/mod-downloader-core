@@ -85,6 +85,7 @@ type SettingsView struct {
 	ConcurrentDownloads         int     `json:"concurrentDownloads"`
 	AdaptiveFileConcurrency     bool    `json:"adaptiveFileConcurrency"`
 	TargetDownloadRateMiB       float64 `json:"targetDownloadRateMiB"`
+	VerifySHA1                  bool    `json:"verifySha1"`
 	RequestsPerSecond           int     `json:"requestsPerSecond"`
 }
 
@@ -112,6 +113,7 @@ type SaveNetworkSettingsRequest struct {
 	ConcurrentDownloads     int     `json:"concurrentDownloads"`
 	AdaptiveFileConcurrency bool    `json:"adaptiveFileConcurrency"`
 	TargetDownloadRateMiB   float64 `json:"targetDownloadRateMiB"`
+	VerifySHA1              bool    `json:"verifySha1"`
 	RequestsPerSecond       int     `json:"requestsPerSecond"`
 }
 
