@@ -1104,23 +1104,24 @@ func (s *Service) refreshChangedLocalMods(ops []localModFileOperation) structs.V
 		return selected
 	}
 	instanceID := versionInstanceDir(selected)
+	mcDir := global.GetMinecraftDir()
 	changed := make(map[string]bool)
 	for _, op := range ops {
-		global.RemoveLocalModByPath(op.source)
-		global.RemoveLocalModByPath(op.target)
+		removeLocalModPathVariants(op.source, mcDir)
+		removeLocalModPathVariants(op.target, mcDir)
 		changed[op.source], changed[op.target] = true, true
 		if op.action == LocalModBatchActionDelete {
 			continue
 		}
 		if strings.HasSuffix(op.target, ".jar") {
-			minecraft.ScanModFile(op.target, instanceID, selected.MinecraftVersion, selected.ModLoader, global.GetMinecraftDir())
+			minecraft.ScanModFile(op.target, instanceID, selected.MinecraftVersion, selected.ModLoader, mcDir)
 		}
 	}
 	mods := make([]structs.ModInfo, 0, len(selected.Mods))
 	for _, mod := range selected.Mods {
 		absPath := mod.Path
 		if !filepath.IsAbs(absPath) {
-			absPath = filepath.Join(global.GetMinecraftDir(), absPath)
+			absPath = filepath.Join(mcDir, absPath)
 		}
 		if !changed[absPath] && !changed[mod.Path] {
 			mods = append(mods, mod)
@@ -1130,7 +1131,7 @@ func (s *Service) refreshChangedLocalMods(ops []localModFileOperation) structs.V
 		if op.action == LocalModBatchActionDelete || !strings.HasSuffix(op.target, ".jar") {
 			continue
 		}
-		fresh := minecraft.ScanModFile(op.target, instanceID, selected.MinecraftVersion, selected.ModLoader, global.GetMinecraftDir())
+		fresh := minecraft.ScanModFile(op.target, instanceID, selected.MinecraftVersion, selected.ModLoader, mcDir)
 		mods = append(mods, fresh...)
 	}
 	enriched, missing := enrichModMetadata(mods)
@@ -1148,20 +1149,21 @@ func (s *Service) refreshChangedPaths(paths []string) {
 		return
 	}
 	instanceID := versionInstanceDir(selected)
+	mcDir := global.GetMinecraftDir()
 	changed := make(map[string]bool)
 	for _, path := range paths {
 		abs, err := filepath.Abs(path)
 		if err != nil {
 			continue
 		}
-		global.RemoveLocalModByPath(abs)
+		removeLocalModPathVariants(abs, mcDir)
 		changed[abs] = true
 	}
 	mods := make([]structs.ModInfo, 0, len(selected.Mods))
 	for _, mod := range selected.Mods {
 		abs := mod.Path
 		if !filepath.IsAbs(abs) {
-			abs = filepath.Join(global.GetMinecraftDir(), abs)
+			abs = filepath.Join(mcDir, abs)
 		}
 		if !changed[abs] {
 			mods = append(mods, mod)
@@ -1169,7 +1171,7 @@ func (s *Service) refreshChangedPaths(paths []string) {
 	}
 	for _, path := range paths {
 		if strings.HasSuffix(strings.ToLower(path), ".jar") {
-			mods = append(mods, minecraft.ScanModFile(path, instanceID, selected.MinecraftVersion, selected.ModLoader, global.GetMinecraftDir())...)
+			mods = append(mods, minecraft.ScanModFile(path, instanceID, selected.MinecraftVersion, selected.ModLoader, mcDir)...)
 		}
 	}
 	enriched, missing := enrichModMetadata(mods)
@@ -1178,6 +1180,22 @@ func (s *Service) refreshChangedPaths(paths []string) {
 	global.SetSelectedVersion(selected)
 	s.emit(EventSelectedVersionChanged, selected)
 	s.resolveMissingModMetadata(selected, missing)
+}
+
+func removeLocalModPathVariants(path, mcDir string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	global.RemoveLocalModByPath(path)
+	if abs, err := filepath.Abs(path); err == nil {
+		global.RemoveLocalModByPath(abs)
+		if strings.TrimSpace(mcDir) != "" {
+			if rel, err := filepath.Rel(mcDir, abs); err == nil {
+				global.RemoveLocalModByPath(rel)
+			}
+		}
+	}
 }
 
 func (s *Service) recordLocalModUsage(ops []localModFileOperation) {

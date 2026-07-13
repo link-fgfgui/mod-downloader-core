@@ -147,6 +147,57 @@ func TestApplyLocalModBatchOperationDisableEnableInvertDelete(t *testing.T) {
 	}
 }
 
+func TestApplyLocalModBatchOperationDeleteClearsRelativeLocalIndex(t *testing.T) {
+	_, modsDir := setupSelectedLocalModInstance(t)
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(storage.Close)
+
+	modPath := filepath.Join(modsDir, "remove.jar")
+	writeFabricJar(t, modPath)
+	svc := New(Options{})
+	if got := svc.RefreshSelectedVersionMods(); len(got.Mods) != 1 {
+		t.Fatalf("initial mods = %#v, want one mod", got.Mods)
+	}
+	if paths := global.LocalModPathsInInstance("test"); len(paths) != 1 {
+		t.Fatalf("initial local index = %#v, want one path", paths)
+	}
+
+	if _, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
+		Action: LocalModBatchActionDelete,
+		Paths:  []string{modPath},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if paths := global.LocalModPathsInInstance("test"); len(paths) != 0 {
+		t.Fatalf("local index after delete = %#v, want empty", paths)
+	}
+}
+
+func TestRefreshChangedPathsClearsRelativeLocalIndex(t *testing.T) {
+	_, modsDir := setupSelectedLocalModInstance(t)
+	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(storage.Close)
+
+	modPath := filepath.Join(modsDir, "watched.jar")
+	writeFabricJar(t, modPath)
+	svc := New(Options{})
+	if got := svc.RefreshSelectedVersionMods(); len(got.Mods) != 1 {
+		t.Fatalf("initial mods = %#v, want one mod", got.Mods)
+	}
+	if err := os.Remove(modPath); err != nil {
+		t.Fatal(err)
+	}
+
+	svc.refreshChangedPaths([]string{modPath})
+	if paths := global.LocalModPathsInInstance("test"); len(paths) != 0 {
+		t.Fatalf("local index after fs event = %#v, want empty", paths)
+	}
+}
+
 func TestApplyLocalModBatchOperationDeduplicatesPaths(t *testing.T) {
 	_, modsDir := setupSelectedLocalModInstance(t)
 	source := filepath.Join(modsDir, "dup.jar")
