@@ -227,11 +227,11 @@ type RuntimeConfig struct {
 
 const (
 	DefaultFileConcurrency       = 4
-	DefaultConcurrentDownloads   = 1
+	DefaultConcurrentDownloads   = 16
 	MinFileConcurrency           = 1
 	MaxFileConcurrency           = 32
 	MinConcurrentDownloads       = 1
-	MaxConcurrentDownloads       = 16
+	MaxConcurrentDownloads       = 256
 	MinRequestsPerSecond         = 0
 	MaxRequestsPerSecond         = 100
 	DefaultTargetDownloadRateMiB = 1.0
