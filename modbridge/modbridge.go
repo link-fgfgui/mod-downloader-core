@@ -8,11 +8,13 @@ package modbridge
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/link-fgfgui/mod-downloader-core/global"
@@ -52,6 +54,10 @@ var remoteModIDCache = struct {
 	sync.Mutex
 	entries map[string]*remoteModIDCacheEntry
 }{entries: make(map[string]*remoteModIDCacheEntry)}
+
+var simpleMode atomic.Bool
+
+var errSimpleMode = errors.New("remote mod ID resolution disabled by simple mode")
 
 var parseRemoteModJarForIDs = parseRemoteModJar
 
@@ -105,6 +111,24 @@ var remoteModIDGate = newRemoteModIDConcurrencyGate(1)
 // allowed to finish; waiting parses use the new limit.
 func ConfigureRemoteModIDConcurrency(limit int) {
 	remoteModIDGate.configure(limit)
+}
+
+// ConfigureSimpleMode applies the process-wide policy for remote mod ID
+// resolution. Enabling it drops queued backfills; a parse already inside the
+// HTTP parser is allowed to finish, while all later callers are rejected.
+func ConfigureSimpleMode(enabled bool) {
+	simpleMode.Store(enabled)
+	if !enabled {
+		return
+	}
+	backfillMu.Lock()
+	pendingBackfills = nil
+	pendingSet = make(map[string]struct{})
+	backfillMu.Unlock()
+}
+
+func SimpleModeEnabled() bool {
+	return simpleMode.Load()
 }
 
 // ResolveVersion returns the best matching platform version for a download request.
@@ -287,6 +311,9 @@ func InstallStatus(req appstructs.ModDownloadRequest) string {
 // InstallStatusPrecise may parse the remote jar to discover mod IDs.
 // Use it for install-time dependency decisions, not for search-list button state.
 func InstallStatusPrecise(req appstructs.ModDownloadRequest) string {
+	if SimpleModeEnabled() {
+		return BtnStatusNew
+	}
 	req.ProjectID = strings.TrimSpace(req.ProjectID)
 	if req.ProjectID == "" {
 		req.ProjectID = providers.ProjectReferenceFromSearchResult(req.Result)
@@ -333,12 +360,18 @@ func InstallStatusPrecise(req appstructs.ModDownloadRequest) string {
 // IncompatibleConflicts resolves a request's platform-level incompatible
 // dependencies against local installed mods in the target instance.
 func IncompatibleConflicts(req appstructs.ModDownloadRequest) []appstructs.IncompatibleConflict {
+	if SimpleModeEnabled() {
+		return nil
+	}
 	return incompatibleConflicts(req, true)
 }
 
 // IncompatibleConflictsCached is the search-list variant. It never parses
 // remote jars; missing mod IDs are queued for the existing async backfill.
 func IncompatibleConflictsCached(req appstructs.ModDownloadRequest) []appstructs.IncompatibleConflict {
+	if SimpleModeEnabled() {
+		return nil
+	}
 	return incompatibleConflicts(req, false)
 }
 
@@ -472,6 +505,13 @@ func DownloadStates(req appstructs.DownloadStatesRequest, onBackfillComplete fun
 	req.ModLoader = strings.ToLower(strings.TrimSpace(req.ModLoader))
 	req.TargetDir = cleanPath(req.TargetDir)
 	req.InstanceID = strings.TrimSpace(req.InstanceID)
+	if SimpleModeEnabled() {
+		states := make([]appstructs.ModDownloadButtonState, len(req.Results))
+		for i := range req.Results {
+			states[i] = defaultDownloadButtonState(req.Results[i])
+		}
+		return states
+	}
 
 	states := make([]appstructs.ModDownloadButtonState, len(req.Results))
 	targetReq, instanceID, targetDir, ok := ResolveInstallTarget(appstructs.ModDownloadRequest{
@@ -555,6 +595,9 @@ func conflictingLocalFileName(req appstructs.ModDownloadRequest, instanceID stri
 // are empty. The DB read-back is what prevents duplicate range fetches when the
 // same version struct is reused across calls (e.g. tryHardlinkInstall + downloadModJob).
 func VersionModIDs(version models.ModVersion, modLoader string) []string {
+	if SimpleModeEnabled() {
+		return nil
+	}
 	if modIDs := normalizedModIDs(version.ModIDs); len(modIDs) > 0 {
 		return modIDs
 	}
@@ -591,8 +634,10 @@ func cachedRemoteModIDs(downloadURL, modLoader string) ([]string, error) {
 	if strings.TrimSpace(downloadURL) == "" {
 		return nil, fmt.Errorf("empty download url")
 	}
-
 	for {
+		if SimpleModeEnabled() {
+			return nil, errSimpleMode
+		}
 		remoteModIDCache.Lock()
 		entry := remoteModIDCache.entries[key]
 		if entry != nil {
@@ -616,6 +661,17 @@ func cachedRemoteModIDs(downloadURL, modLoader string) ([]string, error) {
 		remoteModIDCache.Unlock()
 
 		release := remoteModIDGate.acquire()
+		if SimpleModeEnabled() {
+			release()
+			remoteModIDCache.Lock()
+			if current := remoteModIDCache.entries[key]; current == entry {
+				delete(remoteModIDCache.entries, key)
+				entry.loading = false
+				close(entry.ready)
+			}
+			remoteModIDCache.Unlock()
+			return nil, errSimpleMode
+		}
 		mods, err := func() ([]mcstructs.ModInfo, error) {
 			defer release()
 			return parseRemoteModJarForIDs(downloadURL, modLoader)
@@ -721,6 +777,9 @@ var (
 // concurrent InstallStatus calls for the same version don't enqueue duplicate
 // work within a batch or while a prior backfill is still running.
 func markBackfill(version models.ModVersion, modLoader string) {
+	if SimpleModeEnabled() {
+		return
+	}
 	if strings.TrimSpace(version.ID) == "" {
 		return
 	}
@@ -755,6 +814,9 @@ func drainPendingBackfills() []pendingBackfill {
 // may parse the remote JAR and writes the result back to the DB cache) under
 // an in-flight guard so the same version.ID is never parsed concurrently.
 func backfillVersionModIDs(version models.ModVersion, modLoader string) {
+	if SimpleModeEnabled() {
+		return
+	}
 	if strings.TrimSpace(version.ID) == "" {
 		return
 	}
@@ -775,6 +837,9 @@ func backfillVersionModIDs(version models.ModVersion, modLoader string) {
 }
 
 func runRemoteModIDBackfills(backfills []pendingBackfill) {
+	if SimpleModeEnabled() {
+		return
+	}
 	var wg sync.WaitGroup
 	for _, backfill := range backfills {
 		wg.Add(1)

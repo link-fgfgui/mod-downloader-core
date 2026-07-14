@@ -75,6 +75,32 @@ language = "zh"
 	}
 }
 
+func TestPreferencesSimpleModeReadsTOMLAndEnvironment(t *testing.T) {
+	if (Preferences{}).SimpleMode {
+		t.Fatal("default simple mode = true, want false")
+	}
+
+	var cfg Config
+	if _, err := toml.Decode(`
+[preferences]
+simple_mode = true
+`, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Prefers.SimpleMode {
+		t.Fatal("TOML simple mode = false, want true")
+	}
+
+	t.Setenv("PREFERS_SIMPLE_MODE", "true")
+	cfg = Config{}
+	if err := readEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Prefers.SimpleMode {
+		t.Fatal("environment simple mode = false, want true")
+	}
+}
+
 func TestLoadEnvDoesNotReadTOML(t *testing.T) {
 	dir := t.TempDir()
 	oldwd, err := os.Getwd()

@@ -69,6 +69,7 @@ type AppPreferences struct {
 type SettingsView struct {
 	Theme                       string  `json:"theme"`
 	Language                    string  `json:"language"`
+	SimpleMode                  bool    `json:"simpleMode"`
 	AnimationMode               string  `json:"animationMode"`
 	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
@@ -98,6 +99,10 @@ type SaveAnimationSettingsRequest struct {
 	AnimationMode               string  `json:"animationMode"`
 	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
+}
+
+type SaveSimpleModeSettingsRequest struct {
+	SimpleMode bool `json:"simpleMode"`
 }
 
 type SaveUnusedDependencyCleanupSettingsRequest struct {

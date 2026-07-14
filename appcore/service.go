@@ -37,6 +37,7 @@ const minecraftReleaseCacheTTL = 24 * time.Hour
 var (
 	fetchMinecraftReleaseVersions   = minecraft.FetchMinecraftReleaseVersions
 	configureRemoteModIDConcurrency = modbridge.ConfigureRemoteModIDConcurrency
+	configureSimpleMode             = downloader.ConfigureSimpleMode
 )
 
 const APIKeyKeepSentinel = "<keep>"
@@ -86,6 +87,7 @@ func (s *Service) Startup(ctx context.Context) error {
 		TargetDownloadRateMiB:   s.config.Downloads.TargetDownloadRateMiBValue(),
 		VerifySHA1:              s.config.Downloads.VerifySHA1,
 	})
+	configureSimpleMode(s.config.Prefers.SimpleMode)
 	configureRemoteModIDConcurrency(s.config.Downloads.ConcurrentDownloadsValue())
 	if minecraftDir := minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir); strings.TrimSpace(minecraftDir) != "" {
 		s.config.Prefers.MinecraftDir = minecraftDir
@@ -660,6 +662,7 @@ func (s *Service) GetSettings() SettingsView {
 	sv := SettingsView{
 		Theme:                       configs.ThemeDark.String(),
 		Language:                    configs.LanguageSystem.String(),
+		SimpleMode:                  false,
 		AnimationMode:               configs.DefaultAnimationMode.String(),
 		AnimationEnabled:            configs.DefaultAnimationsEnabled,
 		AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
@@ -672,6 +675,7 @@ func (s *Service) GetSettings() SettingsView {
 		animationMode := s.config.Prefers.AnimationModeValue()
 		sv.Theme = s.config.Prefers.Theme.Normalized().String()
 		sv.Language = s.config.Prefers.Language.Normalized().String()
+		sv.SimpleMode = s.config.Prefers.SimpleMode
 		sv.AnimationMode = animationMode.String()
 		sv.AnimationEnabled = animationMode != configs.AnimationModeOff
 		sv.AnimationDurationMultiplier = s.config.Prefers.NormalizedAnimationDurationMultiplier()
@@ -750,6 +754,18 @@ func (s *Service) SaveAnimationSettings(req SaveAnimationSettingsRequest) Settin
 	if err := configs.Save(s.config); err != nil {
 		logging.Error("save animation settings failed", "animationMode", animationMode, "animationDurationMultiplier", req.AnimationDurationMultiplier, "error", err)
 	}
+	return s.GetSettings()
+}
+
+func (s *Service) SaveSimpleModeSettings(req SaveSimpleModeSettingsRequest) SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	s.config.Prefers.SimpleMode = req.SimpleMode
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save simple mode setting failed", "simpleMode", req.SimpleMode, "error", err)
+	}
+	configureSimpleMode(req.SimpleMode, s.downloadEvents())
 	return s.GetSettings()
 }
 

@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/link-fgfgui/mod-downloader-core/configs"
+	"github.com/link-fgfgui/mod-downloader-core/downloader"
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/logging"
 	"github.com/link-fgfgui/mod-downloader-core/minecraft"
+	"github.com/link-fgfgui/mod-downloader-core/modbridge"
 	"github.com/link-fgfgui/mod-downloader-core/models"
 	"github.com/link-fgfgui/mod-downloader-core/providers"
 	"github.com/link-fgfgui/mod-downloader-core/storage"
@@ -123,11 +125,15 @@ func TestStartupConfiguresRemoteModIDConcurrency(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		configureRemoteModIDConcurrency = previousConfigure
+		downloader.ConfigureSimpleMode(false)
 	})
 
 	dir := t.TempDir()
 	svc := New(Options{
-		Config: &configs.Config{Downloads: configs.DownloadConfig{ConcurrentDownloads: 3}},
+		Config: &configs.Config{
+			Prefers:   configs.Preferences{SimpleMode: true},
+			Downloads: configs.DownloadConfig{ConcurrentDownloads: 3},
+		},
 		Runtime: RuntimeOptions{
 			WorkDir:   dir,
 			CachePath: filepath.Join(dir, storage.CacheFileName),
@@ -137,6 +143,9 @@ func TestStartupConfiguresRemoteModIDConcurrency(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(svc.Close)
+	if !modbridge.SimpleModeEnabled() {
+		t.Fatal("startup simple mode = false, want true")
+	}
 
 	select {
 	case limit := <-configured:
@@ -775,6 +784,45 @@ func TestSaveUnusedDependencyCleanupSettingsPersists(t *testing.T) {
 	}
 	if !loaded.Prefers.AutoScanUnusedDependenciesValue() {
 		t.Fatal("persisted auto scan unused dependencies = false, want true")
+	}
+}
+
+func TestSaveSimpleModeSettingsPersistsAndAppliesImmediately(t *testing.T) {
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	appDir := t.TempDir()
+	if err := os.Chdir(appDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		downloader.ConfigureSimpleMode(false)
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	svc := New(Options{Config: &configs.Config{}})
+	if svc.GetSettings().SimpleMode {
+		t.Fatal("default simple mode = true, want false")
+	}
+	view := svc.SaveSimpleModeSettings(SaveSimpleModeSettingsRequest{SimpleMode: true})
+	if !view.SimpleMode || !svc.Config().Prefers.SimpleMode || !modbridge.SimpleModeEnabled() {
+		t.Fatalf("enabled simple mode was not applied: view=%#v config=%#v runtime=%v", view, svc.Config().Prefers, modbridge.SimpleModeEnabled())
+	}
+
+	loaded, err := configs.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Prefers.SimpleMode {
+		t.Fatal("persisted simple mode = false, want true")
+	}
+
+	view = svc.SaveSimpleModeSettings(SaveSimpleModeSettingsRequest{SimpleMode: false})
+	if view.SimpleMode || modbridge.SimpleModeEnabled() {
+		t.Fatalf("disabled simple mode remained active: view=%#v runtime=%v", view, modbridge.SimpleModeEnabled())
 	}
 }
 

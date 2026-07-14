@@ -388,9 +388,137 @@ func resetBackfillState() {
 }
 
 func resetRemoteModIDCache() {
+	ConfigureSimpleMode(false)
 	remoteModIDCache.Lock()
 	remoteModIDCache.entries = make(map[string]*remoteModIDCacheEntry)
 	remoteModIDCache.Unlock()
+}
+
+func TestSimpleModeIgnoresCachedModIDsAndBackfills(t *testing.T) {
+	resetRemoteModIDCache()
+	resetBackfillState()
+	previousParse := parseRemoteModJarForIDs
+	t.Cleanup(func() {
+		parseRemoteModJarForIDs = previousParse
+		ConfigureSimpleMode(false)
+		resetRemoteModIDCache()
+		resetBackfillState()
+	})
+
+	var calls atomic.Int32
+	parseRemoteModJarForIDs = func(string, string) ([]mcstructs.ModInfo, error) {
+		calls.Add(1)
+		return []mcstructs.ModInfo{{ID: "remote"}}, nil
+	}
+	ConfigureSimpleMode(true)
+	version := models.ModVersion{
+		ID:          "simple-version",
+		DownloadURL: "https://cdn.example.test/simple.jar",
+		ModIDs:      []string{"cached"},
+	}
+	if got := VersionModIDs(version, "fabric"); len(got) != 0 {
+		t.Fatalf("VersionModIDs() = %#v, want no IDs in simple mode", got)
+	}
+	if _, err := cachedRemoteModIDs(version.DownloadURL, "fabric"); !errors.Is(err, errSimpleMode) {
+		t.Fatalf("cachedRemoteModIDs() error = %v, want %v", err, errSimpleMode)
+	}
+	markBackfill(version, "fabric")
+	if pending := drainPendingBackfills(); len(pending) != 0 {
+		t.Fatalf("simple mode queued %d backfills, want 0", len(pending))
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("remote parse calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestSimpleModeReturnsOrdinaryDownloadStates(t *testing.T) {
+	ConfigureSimpleMode(true)
+	t.Cleanup(func() { ConfigureSimpleMode(false) })
+
+	states := DownloadStates(appstructs.DownloadStatesRequest{Results: []models.ModProject{{
+		ID:        "modrinth:sodium",
+		Platform:  "Modrinth",
+		ProjectID: "sodium",
+	}}}, func() {
+		t.Fatal("simple mode must not run a backfill completion callback")
+	})
+	if len(states) != 1 {
+		t.Fatalf("state count = %d, want 1", len(states))
+	}
+	state := states[0]
+	if state.Key != "modrinth:sodium" || state.Status != BtnStatusNew || state.Disabled || state.Icon != "mdi-download" || state.Color != "primary" {
+		t.Fatalf("simple mode state = %#v, want ordinary download state", state)
+	}
+}
+
+func TestSimpleModeStopsQueuedParsesAndAllowsInflightParseToFinish(t *testing.T) {
+	resetRemoteModIDCache()
+	ConfigureRemoteModIDConcurrency(1)
+	previousParse := parseRemoteModJarForIDs
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseAll()
+		parseRemoteModJarForIDs = previousParse
+		ConfigureSimpleMode(false)
+		ConfigureRemoteModIDConcurrency(1)
+		resetRemoteModIDCache()
+	})
+
+	var calls atomic.Int32
+	parseRemoteModJarForIDs = func(string, string) ([]mcstructs.ModInfo, error) {
+		calls.Add(1)
+		started <- struct{}{}
+		<-release
+		return []mcstructs.ModInfo{{ID: "example"}}, nil
+	}
+	type result struct {
+		ids []string
+		err error
+	}
+	results := make(chan result, 2)
+	go func() {
+		ids, err := cachedRemoteModIDs("https://cdn.example.test/inflight.jar", "fabric")
+		results <- result{ids: ids, err: err}
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first remote parse did not start")
+	}
+	go func() {
+		ids, err := cachedRemoteModIDs("https://cdn.example.test/queued.jar", "fabric")
+		results <- result{ids: ids, err: err}
+	}()
+	select {
+	case <-started:
+		t.Fatal("queued parse started above the configured limit")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	ConfigureSimpleMode(true)
+	releaseAll()
+	var succeeded, disabled int
+	for range 2 {
+		select {
+		case got := <-results:
+			switch {
+			case got.err == nil && len(got.ids) == 1 && got.ids[0] == "example":
+				succeeded++
+			case errors.Is(got.err, errSimpleMode) && len(got.ids) == 0:
+				disabled++
+			default:
+				t.Fatalf("unexpected parse result: %#v", got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("simple mode left a parser caller blocked")
+		}
+	}
+	if succeeded != 1 || disabled != 1 || calls.Load() != 1 {
+		t.Fatalf("parse outcomes: succeeded=%d disabled=%d calls=%d", succeeded, disabled, calls.Load())
+	}
 }
 
 func TestCachedRemoteModIDsDeduplicatesConcurrentParses(t *testing.T) {

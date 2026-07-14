@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha1"
@@ -26,6 +27,7 @@ import (
 
 func resetDownloadQueueForTest(t *testing.T) {
 	t.Helper()
+	ConfigureSimpleMode(false)
 	downloadQueue.Lock()
 	downloadQueue.nextID = 0
 	downloadQueue.nextReminderID = 0
@@ -43,6 +45,63 @@ func resetDownloadQueueForTest(t *testing.T) {
 	downloadFileConcurrency.Store(filetransfer.DefaultConcurrency)
 	downloadVerifySHA1.Store(false)
 	resetDownloaderHooksForTest(t)
+}
+
+func TestConfigureSimpleModeClearsAndBlocksOptionalDependencyReminders(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	t.Cleanup(func() { ConfigureSimpleMode(false) })
+	downloadQueue.Lock()
+	downloadQueue.optionalReminders = []optionalDependencyReminderState{{
+		Snapshot: appstructs.OptionalDependencyReminder{ID: "optional-1"},
+		Requests: []appstructs.ModDownloadRequest{{ProjectID: "modrinth:optional"}},
+	}}
+	downloadQueue.Unlock()
+
+	emitted := make(chan appstructs.DownloadQueueState, 1)
+	ConfigureSimpleMode(true, Events{OnQueueState: func(state appstructs.DownloadQueueState) {
+		emitted <- state
+	}})
+	select {
+	case state := <-emitted:
+		if state.MessageCount != 0 || len(state.OptionalReminders) != 0 {
+			t.Fatalf("simple mode queue state = %#v, want no optional reminders", state)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("clearing optional reminders did not emit queue state")
+	}
+	if results := InstallOptionalDependencies(t.Context(), "optional-1", ""); len(results) != 0 {
+		t.Fatalf("stale optional install results = %#v, want none", results)
+	}
+}
+
+func TestPrepareDownloadDependenciesSkipsAllDependencyWorkInSimpleMode(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	t.Cleanup(func() { ConfigureSimpleMode(false) })
+	ConfigureSimpleMode(true)
+
+	refreshMatchingProjectVersions = func(models.ModProject, string, string) []models.ModVersion {
+		t.Fatal("simple mode refreshed dependency metadata")
+		return nil
+	}
+	installStatusPrecise = func(appstructs.ModDownloadRequest) string {
+		t.Fatal("simple mode checked precise dependency status")
+		return modbridge.BtnStatusNew
+	}
+	job := downloadJob{Version: models.ModVersion{Dependencies: []models.ModDependency{
+		{DependencyProjectID: "required", DependencyType: "required"},
+		{DependencyProjectID: "optional", DependencyType: "optional"},
+		{DependencyProjectID: "incompatible", DependencyType: "incompatible"},
+	}}}
+	dependencies, prepared, err := prepareDownloadDependencies(t.Context(), job, Events{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dependencies) != 0 || !prepared.dependenciesDone || len(prepared.IncompatiblePaths) != 0 {
+		t.Fatalf("simple mode dependency result = %#v, %#v", dependencies, prepared)
+	}
+	if state := GetDownloadQueueState(); state.MessageCount != 0 || len(state.OptionalReminders) != 0 {
+		t.Fatalf("simple mode created optional reminders: %#v", state)
+	}
 }
 
 func resetDownloaderHooksForTest(t *testing.T) {
@@ -323,6 +382,73 @@ func TestDownloadCompletedEventOnlyFiresForNewInstalledFile(t *testing.T) {
 		t.Fatal("existing target emitted a second completion")
 	case <-time.After(50 * time.Millisecond):
 	}
+}
+
+func TestSimpleModeDownloadUsesLocalParseFallback(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	openDownloadTestDatabase(t)
+	ConfigureSimpleMode(true)
+	t.Cleanup(func() { ConfigureSimpleMode(false) })
+	newFileTransferBackend = func() filetransfer.Backend {
+		return successfulTransferBackend{content: fabricModTestJar(t, "simple-example")}
+	}
+
+	targetDir := t.TempDir()
+	version := models.ModVersion{
+		ID:           "simple-version",
+		VersionID:    "simple-version",
+		Platform:     "Modrinth",
+		ProjectID:    "simple-example",
+		FileName:     "simple-example.jar",
+		DownloadURL:  "https://example.test/simple-example.jar",
+		GameVersions: []string{"1.21.1"},
+		Loaders:      []string{"fabric"},
+		ModIDs:       []string{"cached-id-must-be-ignored"},
+	}
+	seedDownloadProjectVersion(t, "simple-example", version)
+	installed, err := downloadModJob(t.Context(), downloadJob{
+		Version:          version,
+		ProjectID:        "modrinth:simple-example",
+		TargetDir:        targetDir,
+		InstanceID:       "test:" + targetDir,
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+		dependenciesDone: true,
+	}, Events{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !installed {
+		t.Fatal("simple mode local-parse download installed = false, want true")
+	}
+	if _, err := os.Stat(filepath.Join(targetDir, version.FileName)); err != nil {
+		t.Fatalf("installed file missing: %v", err)
+	}
+	if got := modbridge.VersionModIDs(version, "fabric"); len(got) != 0 {
+		t.Fatalf("simple mode exposed persisted local IDs: %#v", got)
+	}
+	ConfigureSimpleMode(false)
+	if got := modbridge.VersionModIDs(models.ModVersion{ID: version.ID}, "fabric"); len(got) != 1 || got[0] != "simple-example" {
+		t.Fatalf("normal mode persisted local IDs = %#v, want [simple-example]", got)
+	}
+}
+
+func fabricModTestJar(t *testing.T, modID string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	entry, err := zw.Create("fabric.mod.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := fmt.Sprintf(`{"schemaVersion":1,"id":%q,"version":"1.0.0","name":"Simple Example"}`, modID)
+	if _, err := entry.Write([]byte(metadata)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
 func TestCancelDownloadDuringDependencyAnalysisKeepsRetryableQueueItem(t *testing.T) {

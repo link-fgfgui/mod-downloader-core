@@ -150,6 +150,7 @@ type Preferences struct {
 	Theme                       Theme         `toml:"theme" json:"theme" env:"THEME" env-default:"dark"`
 	Language                    Language      `toml:"language" json:"language" env:"LANGUAGE" env-default:"system"`
 	MinecraftDir                string        `toml:"minecraft_dir" json:"minecraft_dir" env:"MINECRAFT_DIR"`
+	SimpleMode                  bool          `toml:"simple_mode" json:"simple_mode" env:"SIMPLE_MODE"`
 	AnimationMode               AnimationMode `toml:"animation_mode" json:"animation_mode" env:"ANIMATION_MODE"`
 	AnimationsEnabled           *bool         `toml:"animations_enabled" json:"animations_enabled"`
 	AnimationDurationMultiplier float64       `toml:"animation_duration_multiplier" json:"animation_duration_multiplier" env:"ANIMATION_DURATION_MULTIPLIER"`

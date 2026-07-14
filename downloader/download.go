@@ -133,6 +133,15 @@ func Configure(config Config) {
 	downloadQueue.Unlock()
 }
 
+// ConfigureSimpleMode applies the shared remote-metadata policy and clears
+// optional-dependency reminders that are no longer valid in this mode.
+func ConfigureSimpleMode(enabled bool, events ...Events) {
+	modbridge.ConfigureSimpleMode(enabled)
+	if enabled {
+		ClearOptionalDependencyReminders(events...)
+	}
+}
+
 func configuredAdaptiveFileConcurrency() (bool, int64) {
 	return downloadAdaptiveFileConcurrency.Load(), downloadTargetRateBytesPerSecond.Load()
 }
@@ -356,6 +365,9 @@ func InstallOptionalDependencies(ctx context.Context, id string, curseForgeAPIKe
 }
 
 func InstallOptionalDependenciesWithUserAgent(ctx context.Context, id string, curseForgeAPIKey string, userAgent string, events ...Events) []appstructs.ModDownloadResult {
+	if modbridge.SimpleModeEnabled() {
+		return nil
+	}
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return nil
@@ -841,6 +853,10 @@ func prepareDownloadDependencies(ctx context.Context, job downloadJob, events Ev
 	if err := ctxErr(ctx); err != nil {
 		return nil, job, err
 	}
+	if modbridge.SimpleModeEnabled() {
+		job.dependenciesDone = true
+		return nil, job, nil
+	}
 	req := downloadRequestFromJob(job)
 	version := hydrateDownloadDependencies(req, job.Version)
 	if err := ctxErr(ctx); err != nil {
@@ -877,6 +893,9 @@ func downloadRequestFromJob(job downloadJob) appstructs.ModDownloadRequest {
 }
 
 func missingRequiredDependencyJobs(ctx context.Context, req appstructs.ModDownloadRequest, version models.ModVersion, curseForgeAPIKey string, userAgent string, visited map[string]bool) ([]downloadJob, error) {
+	if modbridge.SimpleModeEnabled() {
+		return nil, nil
+	}
 	dependencies := make([]downloadJob, 0)
 	for _, dep := range version.Dependencies {
 		if err := ctxErr(ctx); err != nil {
@@ -917,6 +936,9 @@ func missingRequiredDependencyJobs(ctx context.Context, req appstructs.ModDownlo
 }
 
 func appendOptionalDependencyReminder(parent appstructs.ModDownloadRequest, version models.ModVersion, events Events) {
+	if modbridge.SimpleModeEnabled() {
+		return
+	}
 	candidates := make([]appstructs.OptionalDependencyCandidate, 0)
 	requests := make([]appstructs.ModDownloadRequest, 0)
 	for _, dep := range version.Dependencies {
