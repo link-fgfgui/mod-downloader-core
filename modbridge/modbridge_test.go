@@ -395,9 +395,11 @@ func resetRemoteModIDCache() {
 
 func TestCachedRemoteModIDsDeduplicatesConcurrentParses(t *testing.T) {
 	resetRemoteModIDCache()
+	ConfigureRemoteModIDConcurrency(1)
 	previousParse := parseRemoteModJarForIDs
 	t.Cleanup(func() {
 		parseRemoteModJarForIDs = previousParse
+		ConfigureRemoteModIDConcurrency(1)
 		resetRemoteModIDCache()
 	})
 
@@ -438,6 +440,154 @@ func TestCachedRemoteModIDsDeduplicatesConcurrentParses(t *testing.T) {
 		if len(ids) != 1 || ids[0] != "examplemod" {
 			t.Fatalf("cached mod IDs = %#v, want [examplemod]", ids)
 		}
+	}
+}
+
+func TestCachedRemoteModIDsHonorsUpdatedConcurrencyLimit(t *testing.T) {
+	resetRemoteModIDCache()
+	ConfigureRemoteModIDConcurrency(2)
+	previousParse := parseRemoteModJarForIDs
+	t.Cleanup(func() {
+		parseRemoteModJarForIDs = previousParse
+		ConfigureRemoteModIDConcurrency(1)
+		resetRemoteModIDCache()
+	})
+
+	var active atomic.Int32
+	var maxActive atomic.Int32
+	started := make(chan struct{}, 3)
+	release := make(chan struct{}, 3)
+	parseRemoteModJarForIDs = func(string, string) ([]mcstructs.ModInfo, error) {
+		current := active.Add(1)
+		for {
+			observed := maxActive.Load()
+			if current <= observed || maxActive.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-release
+		active.Add(-1)
+		return []mcstructs.ModInfo{{ID: "ExampleMod"}}, nil
+	}
+
+	urls := []string{
+		"https://cdn.example.test/one.jar",
+		"https://cdn.example.test/two.jar",
+		"https://cdn.example.test/three.jar",
+	}
+	errs := make(chan error, len(urls))
+	for _, downloadURL := range urls {
+		go func() {
+			_, err := cachedRemoteModIDs(downloadURL, "fabric")
+			errs <- err
+		}()
+	}
+
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for initial remote JAR parses")
+		}
+	}
+	select {
+	case <-started:
+		t.Fatal("third remote JAR parse started above configured limit")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	ConfigureRemoteModIDConcurrency(1)
+	release <- struct{}{}
+	select {
+	case <-started:
+		t.Fatal("waiting parse started before active work fell below lowered limit")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	release <- struct{}{}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("waiting parse did not start after capacity became available")
+	}
+	release <- struct{}{}
+
+	for range urls {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatalf("cachedRemoteModIDs() error = %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for remote JAR parse result")
+		}
+	}
+	if got := maxActive.Load(); got != 2 {
+		t.Fatalf("maximum concurrent remote JAR parses = %d, want 2", got)
+	}
+}
+
+func TestRunRemoteModIDBackfillsUsesConfiguredConcurrency(t *testing.T) {
+	openModbridgeTestDB(t)
+	resetBackfillState()
+	resetRemoteModIDCache()
+	ConfigureRemoteModIDConcurrency(2)
+	previousParse := parseRemoteModJarForIDs
+	t.Cleanup(func() {
+		parseRemoteModJarForIDs = previousParse
+		ConfigureRemoteModIDConcurrency(1)
+		resetRemoteModIDCache()
+		resetBackfillState()
+	})
+
+	started := make(chan struct{}, 3)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAll := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	t.Cleanup(releaseAll)
+	parseRemoteModJarForIDs = func(string, string) ([]mcstructs.ModInfo, error) {
+		started <- struct{}{}
+		<-release
+		return []mcstructs.ModInfo{{ID: "ExampleMod"}}, nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		runRemoteModIDBackfills([]pendingBackfill{
+			{version: models.ModVersion{ID: "v-one", DownloadURL: "https://cdn.example.test/one.jar"}, modLoader: "fabric"},
+			{version: models.ModVersion{ID: "v-two", DownloadURL: "https://cdn.example.test/two.jar"}, modLoader: "fabric"},
+			{version: models.ModVersion{ID: "v-three", DownloadURL: "https://cdn.example.test/three.jar"}, modLoader: "fabric"},
+		})
+		close(done)
+	}()
+
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("batch did not start remote JAR backfills concurrently")
+		}
+	}
+	select {
+	case <-started:
+		t.Fatal("batch exceeded configured remote JAR concurrency")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseAll()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("remote JAR backfill batch did not complete")
+	}
+}
+
+func TestRemoteModJarTimeout(t *testing.T) {
+	if remoteModJarTimeout != 45*time.Second {
+		t.Fatalf("remoteModJarTimeout = %s, want 45s", remoteModJarTimeout)
 	}
 }
 

@@ -38,7 +38,7 @@ const (
 
 const (
 	remoteModIDFailureTTL = 10 * time.Second
-	remoteModJarTimeout   = 30 * time.Second
+	remoteModJarTimeout   = 45 * time.Second
 )
 
 type remoteModIDCacheEntry struct {
@@ -54,6 +54,58 @@ var remoteModIDCache = struct {
 }{entries: make(map[string]*remoteModIDCacheEntry)}
 
 var parseRemoteModJarForIDs = parseRemoteModJar
+
+type remoteModIDConcurrencyGate struct {
+	cond   *sync.Cond
+	limit  int
+	active int
+}
+
+func newRemoteModIDConcurrencyGate(limit int) *remoteModIDConcurrencyGate {
+	gate := &remoteModIDConcurrencyGate{limit: normalizedRemoteModIDConcurrency(limit)}
+	gate.cond = sync.NewCond(&sync.Mutex{})
+	return gate
+}
+
+func normalizedRemoteModIDConcurrency(limit int) int {
+	if limit <= 0 {
+		return 1
+	}
+	return limit
+}
+
+func (g *remoteModIDConcurrencyGate) configure(limit int) {
+	limit = normalizedRemoteModIDConcurrency(limit)
+	g.cond.L.Lock()
+	g.limit = limit
+	g.cond.Broadcast()
+	g.cond.L.Unlock()
+}
+
+func (g *remoteModIDConcurrencyGate) acquire() func() {
+	g.cond.L.Lock()
+	for g.active >= g.limit {
+		g.cond.Wait()
+	}
+	g.active++
+	g.cond.L.Unlock()
+
+	return func() {
+		g.cond.L.Lock()
+		g.active--
+		g.cond.Broadcast()
+		g.cond.L.Unlock()
+	}
+}
+
+var remoteModIDGate = newRemoteModIDConcurrencyGate(1)
+
+// ConfigureRemoteModIDConcurrency updates the maximum number of uncached
+// remote JAR metadata parses that may run concurrently. Existing parses are
+// allowed to finish; waiting parses use the new limit.
+func ConfigureRemoteModIDConcurrency(limit int) {
+	remoteModIDGate.configure(limit)
+}
 
 // ResolveVersion returns the best matching platform version for a download request.
 func ResolveVersion(req appstructs.ModDownloadRequest) (models.ModVersion, bool) {
@@ -476,9 +528,7 @@ func DownloadStates(req appstructs.DownloadStatesRequest, onBackfillComplete fun
 	backfill := drainPendingBackfills()
 	if len(backfill) > 0 && onBackfillComplete != nil {
 		go func() {
-			for _, b := range backfill {
-				backfillVersionModIDs(b.version, b.modLoader)
-			}
+			runRemoteModIDBackfills(backfill)
 			onBackfillComplete()
 		}()
 	}
@@ -565,7 +615,11 @@ func cachedRemoteModIDs(downloadURL, modLoader string) ([]string, error) {
 		remoteModIDCache.entries[key] = entry
 		remoteModIDCache.Unlock()
 
-		mods, err := parseRemoteModJarForIDs(downloadURL, modLoader)
+		release := remoteModIDGate.acquire()
+		mods, err := func() ([]mcstructs.ModInfo, error) {
+			defer release()
+			return parseRemoteModJarForIDs(downloadURL, modLoader)
+		}()
 		modIDs := minecraft.PrimaryModIDs(mods)
 		remoteModIDCache.Lock()
 		entry.modIDs = append([]string(nil), modIDs...)
@@ -718,6 +772,18 @@ func backfillVersionModIDs(version models.ModVersion, modLoader string) {
 	}()
 
 	_ = VersionModIDs(version, modLoader)
+}
+
+func runRemoteModIDBackfills(backfills []pendingBackfill) {
+	var wg sync.WaitGroup
+	for _, backfill := range backfills {
+		wg.Add(1)
+		go func(item pendingBackfill) {
+			defer wg.Done()
+			backfillVersionModIDs(item.version, item.modLoader)
+		}(backfill)
+	}
+	wg.Wait()
 }
 
 // --- local mod index refresh (R2) ---

@@ -115,6 +115,39 @@ force_file = true
 	}
 }
 
+func TestStartupConfiguresRemoteModIDConcurrency(t *testing.T) {
+	previousConfigure := configureRemoteModIDConcurrency
+	configured := make(chan int, 1)
+	configureRemoteModIDConcurrency = func(limit int) {
+		configured <- limit
+	}
+	t.Cleanup(func() {
+		configureRemoteModIDConcurrency = previousConfigure
+	})
+
+	dir := t.TempDir()
+	svc := New(Options{
+		Config: &configs.Config{Downloads: configs.DownloadConfig{ConcurrentDownloads: 3}},
+		Runtime: RuntimeOptions{
+			WorkDir:   dir,
+			CachePath: filepath.Join(dir, storage.CacheFileName),
+		},
+	})
+	if err := svc.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(svc.Close)
+
+	select {
+	case limit := <-configured:
+		if limit != 3 {
+			t.Fatalf("remote mod ID concurrency = %d, want 3", limit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote mod ID concurrency was not configured during startup")
+	}
+}
+
 func TestStartupBootstrapsDisabledLoggingWithoutCreatingFile(t *testing.T) {
 	dir := t.TempDir()
 	oldwd, err := os.Getwd()
@@ -832,6 +865,15 @@ func TestSaveMCIMSettingsPersistsAndReconfiguresProviders(t *testing.T) {
 }
 
 func TestSaveNetworkSettingsClampsAndPersists(t *testing.T) {
+	previousConfigure := configureRemoteModIDConcurrency
+	configured := make(chan int, 1)
+	configureRemoteModIDConcurrency = func(limit int) {
+		configured <- limit
+	}
+	t.Cleanup(func() {
+		configureRemoteModIDConcurrency = previousConfigure
+	})
+
 	oldwd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -875,5 +917,13 @@ func TestSaveNetworkSettingsClampsAndPersists(t *testing.T) {
 		!loaded.Downloads.VerifySHA1 ||
 		loaded.API.RequestsPerSecond != configs.MaxRequestsPerSecond {
 		t.Fatalf("persisted network settings = %#v", loaded)
+	}
+	select {
+	case limit := <-configured:
+		if limit != configs.DefaultConcurrentDownloads {
+			t.Fatalf("saved remote mod ID concurrency = %d, want %d", limit, configs.DefaultConcurrentDownloads)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote mod ID concurrency was not configured after saving network settings")
 	}
 }

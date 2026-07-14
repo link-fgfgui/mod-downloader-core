@@ -34,7 +34,10 @@ import (
 
 const minecraftReleaseCacheTTL = 24 * time.Hour
 
-var fetchMinecraftReleaseVersions = minecraft.FetchMinecraftReleaseVersions
+var (
+	fetchMinecraftReleaseVersions   = minecraft.FetchMinecraftReleaseVersions
+	configureRemoteModIDConcurrency = modbridge.ConfigureRemoteModIDConcurrency
+)
 
 const APIKeyKeepSentinel = "<keep>"
 
@@ -83,6 +86,7 @@ func (s *Service) Startup(ctx context.Context) error {
 		TargetDownloadRateMiB:   s.config.Downloads.TargetDownloadRateMiBValue(),
 		VerifySHA1:              s.config.Downloads.VerifySHA1,
 	})
+	configureRemoteModIDConcurrency(s.config.Downloads.ConcurrentDownloadsValue())
 	if minecraftDir := minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir); strings.TrimSpace(minecraftDir) != "" {
 		s.config.Prefers.MinecraftDir = minecraftDir
 		global.SetMinecraftDir(minecraftDir)
@@ -799,6 +803,7 @@ func (s *Service) SaveNetworkSettings(req SaveNetworkSettingsRequest) SettingsVi
 		TargetDownloadRateMiB:   s.config.Downloads.TargetDownloadRateMiB,
 		VerifySHA1:              s.config.Downloads.VerifySHA1,
 	})
+	configureRemoteModIDConcurrency(s.config.Downloads.ConcurrentDownloads)
 	s.configureProviderClients()
 	return s.GetSettings()
 }
