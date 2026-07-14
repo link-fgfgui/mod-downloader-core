@@ -100,6 +100,7 @@ func (t curseForgeTransport) RoundTrip(req *http.Request) (*http.Response, error
 		}
 		clone.URL.Scheme = baseURL.Scheme
 		clone.URL.Host = baseURL.Host
+		clone.Host = baseURL.Host
 		clone.URL.Path = strings.TrimRight(baseURL.Path, "/") + "/" + strings.TrimLeft(clone.URL.Path, "/")
 		clone.URL.RawPath = ""
 	}

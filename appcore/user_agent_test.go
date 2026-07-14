@@ -110,6 +110,9 @@ func TestCurseForgeTransportRewritesMCIMURLWithoutAPIKey(t *testing.T) {
 			if got := req.URL.String(); got != "https://mod.mcimirror.top/curseforge/v1/mods/1?test=true" {
 				t.Fatalf("request URL = %q", got)
 			}
+			if got := req.Host; got != "mod.mcimirror.top" {
+				t.Fatalf("request Host = %q, want %q", got, "mod.mcimirror.top")
+			}
 			if got := req.Header.Get("User-Agent"); got != "mod-downloader/v1.2.3" {
 				t.Fatalf("User-Agent = %q", got)
 			}
