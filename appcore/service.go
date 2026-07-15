@@ -727,11 +727,12 @@ func (s *Service) GetSettings() SettingsView {
 		sv.RequestsPerSecond = s.config.API.RequestsPerSecondValue()
 		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir))
 		sv.CacheDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Runtime.CacheDir))
-		sv.HasCurseforgeKey = strings.TrimSpace(s.config.Keys.CurseforgeApiKey) != ""
-		sv.CurseforgeKeyMask = MaskKey(s.config.Keys.CurseforgeApiKey)
 		sv.HasModrinthKey = strings.TrimSpace(s.config.Keys.ModrinthApiKey) != ""
 		sv.ModrinthKeyMask = MaskKey(s.config.Keys.ModrinthApiKey)
 	}
+	effectiveCFKey := s.effectiveCurseforgeAPIKey()
+	sv.HasCurseforgeKey = effectiveCFKey != ""
+	sv.CurseforgeKeyMask = MaskKey(effectiveCFKey)
 	if sv.MinecraftDir == "" {
 		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(global.GetMinecraftDir())
 	}
@@ -913,7 +914,7 @@ func (s *Service) SaveApiKeys(req SaveApiKeysRequest) SettingsView {
 
 func (s *Service) QueueModDownload(req appstructs.ModDownloadRequest) appstructs.ModDownloadResult {
 	req = s.applyRuntimeDownloadRequest(req)
-	return downloader.QueueModDownloadWithUserAgent(s.ctx, req, s.Config().Keys.CurseforgeApiKey, s.UserAgent(), s.downloadEvents())
+	return downloader.QueueModDownloadWithUserAgent(s.ctx, req, s.effectiveCurseforgeAPIKey(), s.UserAgent(), s.downloadEvents())
 }
 
 func (s *Service) InstallModAndWait(ctx context.Context, req appstructs.ModDownloadRequest) InstallWaitResult {
@@ -928,7 +929,7 @@ func (s *Service) InstallModAndWait(ctx context.Context, req appstructs.ModDownl
 		}
 	}
 
-	result := downloader.QueueModDownloadWithUserAgent(ctx, req, s.Config().Keys.CurseforgeApiKey, s.UserAgent(), events)
+	result := downloader.QueueModDownloadWithUserAgent(ctx, req, s.effectiveCurseforgeAPIKey(), s.UserAgent(), events)
 	if !result.Queued {
 		return InstallWaitResult{Result: result, State: downloader.GetDownloadQueueState()}
 	}
@@ -992,7 +993,7 @@ func (s *Service) ClearOptionalDependencyReminders() bool {
 }
 
 func (s *Service) InstallOptionalDependencies(id string) []appstructs.ModDownloadResult {
-	return downloader.InstallOptionalDependenciesWithUserAgent(s.ctx, id, s.Config().Keys.CurseforgeApiKey, s.UserAgent(), s.downloadEvents())
+	return downloader.InstallOptionalDependenciesWithUserAgent(s.ctx, id, s.effectiveCurseforgeAPIKey(), s.UserAgent(), s.downloadEvents())
 }
 
 func (s *Service) AnalyzeBatchIncompatibleConflicts(req appstructs.BatchDownloadRequest) appstructs.BatchIncompatibleAnalysis {
@@ -1590,11 +1591,18 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func (s *Service) effectiveCurseforgeAPIKey() string {
+	if s == nil || s.config == nil {
+		return configs.EffectiveCurseforgeAPIKey("")
+	}
+	return configs.EffectiveCurseforgeAPIKey(s.config.Keys.CurseforgeApiKey)
+}
+
 func (s *Service) configureProviderClients() {
 	limiter := newRequestRateLimiter(s.Config().API.RequestsPerSecondValue())
 	limitedTransport := rateLimitedTransport{limiter: limiter, base: networking.NewTransport()}
 	useMCIM := s.Config().Prefers.MCIMEnabledValue()
-	curseForgeAPIKey := strings.TrimSpace(s.Config().Keys.CurseforgeApiKey)
+	curseForgeAPIKey := s.effectiveCurseforgeAPIKey()
 	if curseForgeAPIKey != "" || useMCIM {
 		apiBaseURL := ""
 		if useMCIM {
