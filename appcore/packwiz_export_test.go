@@ -57,7 +57,7 @@ func TestExportFavoriteListPackwizZipWritesPack(t *testing.T) {
 	storeFavoritePackwizVersion(t, "modrinth", "sodium", "version-1", "1.21.1", "fabric", "sodium.jar")
 
 	svc := New(Options{})
-	list := svc.CreateFavoriteList("Performance")
+	list := svc.CreateFavoriteListForScope("Performance", "1.21.1", "fabric")
 	saved := svc.AddFavoriteMod(storage.FavoriteMod{
 		ListID:           list.ID,
 		Platform:         "modrinth",
@@ -100,7 +100,7 @@ func TestExportFavoriteListPackwizZipForScopeFiltersItems(t *testing.T) {
 	storeFavoritePackwizVersion(t, "modrinth", "sodium", "version-1", "1.21.1", "fabric", "sodium.jar")
 
 	svc := New(Options{})
-	list := svc.CreateFavoriteList("Mixed")
+	list := svc.CreateFavoriteListForScope("Scoped", "1.21.1", "fabric")
 	svc.AddFavoriteMod(storage.FavoriteMod{
 		ListID:           list.ID,
 		Platform:         "modrinth",
@@ -110,16 +110,6 @@ func TestExportFavoriteListPackwizZipForScopeFiltersItems(t *testing.T) {
 		ModLoader:        "fabric",
 		Title:            "Sodium",
 	})
-	svc.AddFavoriteMod(storage.FavoriteMod{
-		ListID:           list.ID,
-		Platform:         "modrinth",
-		ModID:            "lithium",
-		VersionID:        "hidden-version",
-		MinecraftVersion: "1.20.1",
-		ModLoader:        "forge",
-		Title:            "Lithium",
-	})
-
 	result, err := svc.ExportFavoriteListPackwizZipForScope(list.ID, filepath.Join(t.TempDir(), "scoped"), "1.21.1", "Fabric")
 	if err != nil {
 		t.Fatal(err)
@@ -127,9 +117,6 @@ func TestExportFavoriteListPackwizZipForScopeFiltersItems(t *testing.T) {
 	paths := zipPaths(t, result.Path)
 	if !paths["mods/sodium.pw.toml"] {
 		t.Fatalf("missing scoped mod from exported zip paths %#v", paths)
-	}
-	if paths["mods/lithium.pw.toml"] {
-		t.Fatalf("hidden scope mod exported in zip paths %#v", paths)
 	}
 }
 
@@ -144,9 +131,9 @@ func TestExportFavoriteListPackwizZipIncludesRecursiveReferences(t *testing.T) {
 	}
 
 	svc := New(Options{})
-	root := svc.CreateFavoriteList("Root")
-	child := svc.CreateFavoriteList("Child")
-	grandchild := svc.CreateFavoriteList("Grandchild")
+	root := svc.CreateFavoriteListForScope("Root", "1.21.1", "fabric")
+	child := svc.CreateFavoriteListForScope("Child", "1.21.1", "fabric")
+	grandchild := svc.CreateFavoriteListForScope("Grandchild", "1.21.1", "fabric")
 	for _, entry := range []struct {
 		listID string
 		modID  string

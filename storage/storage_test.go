@@ -343,7 +343,7 @@ func TestListPinnedMods(t *testing.T) {
 func TestFavoriteListsAndModsPersist(t *testing.T) {
 	path := openTestDB(t)
 
-	first, err := CreateFavoriteList(" Utilities ")
+	first, err := CreateFavoriteListForScope(" Utilities ", "1.21.1", "Fabric")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +460,7 @@ func TestFavoriteModRequiresExistingList(t *testing.T) {
 	}
 }
 
-func TestSQLiteSchemaV2MigratesExistingFavorites(t *testing.T) {
+func TestSQLiteSchemaV3DiscardsExistingFavorites(t *testing.T) {
 	tmp := t.TempDir()
 	cachePath := filepath.Join(tmp, metadataCacheFileName)
 	userPath := UserDataPathForCachePath(cachePath)
@@ -470,9 +470,30 @@ func TestSQLiteSchemaV2MigratesExistingFavorites(t *testing.T) {
 	}
 	statements := []string{
 		`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)`,
+		`CREATE TABLE pinned_mods (
+			id TEXT PRIMARY KEY,
+			platform TEXT NOT NULL,
+			mod_id TEXT NOT NULL,
+			version_id TEXT NOT NULL,
+			minecraft_version TEXT NOT NULL,
+			mod_loader TEXT NOT NULL,
+			UNIQUE(platform, mod_id, minecraft_version, mod_loader)
+		)`,
+		`CREATE TABLE usage_stats (
+			key TEXT PRIMARY KEY,
+			value INTEGER NOT NULL DEFAULT 0 CHECK(value >= 0),
+			updated_at INTEGER NOT NULL
+		)`,
 		`CREATE TABLE favorite_lists (
 			id TEXT PRIMARY KEY,
+			group_id TEXT NOT NULL DEFAULT '',
 			name TEXT NOT NULL,
+			minecraft_version TEXT NOT NULL DEFAULT '',
+			mod_loader TEXT NOT NULL DEFAULT '',
+			icon_kind TEXT NOT NULL DEFAULT '',
+			icon_value TEXT NOT NULL DEFAULT '',
+			icon_url TEXT NOT NULL DEFAULT '',
+			pinned INTEGER NOT NULL DEFAULT 0,
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL,
 			sort_order INTEGER NOT NULL,
@@ -495,11 +516,31 @@ func TestSQLiteSchemaV2MigratesExistingFavorites(t *testing.T) {
 			updated_at INTEGER NOT NULL,
 			UNIQUE(list_id, platform, mod_id, minecraft_version, mod_loader)
 		)`,
-		`INSERT INTO schema_migrations(version, applied_at) VALUES (1, 100)`,
-		`INSERT INTO favorite_lists(id, name, created_at, updated_at, sort_order, system)
-		 VALUES ('legacy-list', 'Legacy', 10, 11, 1, 0)`,
+		`CREATE TABLE favorite_groups (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			sort_order INTEGER NOT NULL
+		)`,
+		`CREATE TABLE favorite_list_refs (
+			id TEXT PRIMARY KEY,
+			parent_list_id TEXT NOT NULL REFERENCES favorite_lists(id) ON DELETE CASCADE,
+			child_list_id TEXT NOT NULL REFERENCES favorite_lists(id) ON DELETE CASCADE,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			sort_order INTEGER NOT NULL,
+			UNIQUE(parent_list_id, child_list_id),
+			CHECK(parent_list_id <> child_list_id)
+		)`,
+		`INSERT INTO schema_migrations(version, applied_at) VALUES (1, 100), (2, 101)`,
+		`INSERT INTO pinned_mods(id, platform, mod_id, version_id, minecraft_version, mod_loader)
+			 VALUES ('pin', 'modrinth', 'sodium', 'v2', '1.21.1', 'fabric')`,
+		`INSERT INTO usage_stats(key, value, updated_at) VALUES ('downloads_completed', 7, 100)`,
+		`INSERT INTO favorite_lists(id, name, minecraft_version, mod_loader, created_at, updated_at, sort_order, system)
+			 VALUES ('legacy-list', 'Legacy', '1.20.1', 'fabric', 10, 11, 1, 0)`,
 		`INSERT INTO favorite_mods(id, list_id, platform, mod_id, version_id, minecraft_version, mod_loader, title, categories_json, created_at, updated_at)
-		 VALUES ('legacy-mod', 'legacy-list', 'modrinth', 'sodium', 'v1', '1.21.1', 'fabric', 'Sodium', '["performance"]', 12, 13)`,
+			 VALUES ('legacy-mod', 'legacy-list', 'modrinth', 'sodium', 'v1', '1.20.1', 'fabric', 'Sodium', '["performance"]', 12, 13)`,
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
@@ -515,24 +556,21 @@ func TestSQLiteSchemaV2MigratesExistingFavorites(t *testing.T) {
 	}
 	t.Cleanup(Close)
 
-	lists := ListFavoriteLists()
-	if len(lists) != 1 || lists[0].ID != "legacy-list" || lists[0].GroupID != "" || lists[0].Pinned {
-		t.Fatalf("migrated lists = %#v", lists)
+	if lists := ListFavoriteLists(); len(lists) != 0 {
+		t.Fatalf("legacy lists were not discarded = %#v", lists)
 	}
-	mods := ListFavoriteMods("legacy-list")
-	if len(mods) != 1 || mods[0].ID != "legacy-mod" || len(mods[0].Categories) != 1 {
-		t.Fatalf("migrated mods = %#v", mods)
+	if groups := ListFavoriteGroups(); len(groups) != 0 {
+		t.Fatalf("legacy groups were not discarded = %#v", groups)
+	}
+	if pin, ok := GetPinnedMod("modrinth", "sodium", "1.21.1", "fabric"); !ok || pin.VersionID != "v2" {
+		t.Fatalf("pin was not preserved = %#v, %v", pin, ok)
+	}
+	if stats := GetUsageStats(); stats.DownloadsCompleted != 7 {
+		t.Fatalf("usage stats were not preserved = %#v", stats)
 	}
 	var version int
-	if err := userDB.db.QueryRow(`SELECT version FROM schema_migrations WHERE version = 2`).Scan(&version); err != nil || version != 2 {
-		t.Fatalf("schema version 2 = %d, %v", version, err)
-	}
-	if _, ok, err := UpdateFavoriteListMetadata(FavoriteList{ID: "legacy-list", IconKind: "mdi", IconValue: "mdi-star", Pinned: true}); err != nil || !ok {
-		t.Fatalf("update migrated list = %v, %v", ok, err)
-	}
-	lists = ListFavoriteLists()
-	if len(lists) != 1 || !lists[0].Pinned || lists[0].IconValue != "mdi-star" {
-		t.Fatalf("updated migrated list = %#v", lists)
+	if err := userDB.db.QueryRow(`SELECT version FROM schema_migrations WHERE version = 3`).Scan(&version); err != nil || version != 3 {
+		t.Fatalf("schema version 3 = %d, %v", version, err)
 	}
 }
 
@@ -693,6 +731,86 @@ func TestFavoriteListScopeRoundTrip(t *testing.T) {
 	lists := ListFavoriteLists()
 	if len(lists) != 1 || lists[0].ID != created.ID || lists[0].MinecraftVersion != "1.21.1" || lists[0].ModLoader != "fabric" {
 		t.Fatalf("listed scope = %#v", lists)
+	}
+}
+
+func TestFavoriteListNameIsUniqueWithinScope(t *testing.T) {
+	openTestDB(t)
+
+	created, err := CreateFavoriteListForScope("Performance", "1.21.1", "Fabric")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateFavoriteListForScope(" performance ", "1.21.1", "fabric"); !errors.Is(err, ErrFavoriteListNameConflict) {
+		t.Fatalf("duplicate create error = %v", err)
+	}
+	otherScope, err := CreateFavoriteListForScope("Performance", "1.20.1", "fabric")
+	if err != nil || otherScope.ID == "" {
+		t.Fatalf("other scope create = %#v, %v", otherScope, err)
+	}
+	found, ok := GetFavoriteListByNameAndScope("PERFORMANCE", "1.21.1", "FABRIC")
+	if !ok || found.ID != created.ID {
+		t.Fatalf("scope lookup = %#v, %v", found, ok)
+	}
+}
+
+func TestFavoriteModUsesParentListScope(t *testing.T) {
+	openTestDB(t)
+
+	list, err := CreateFavoriteListForScope("Scoped", "1.21.1", "Fabric")
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, ok, err := UpsertFavoriteMod(FavoriteMod{
+		ListID:           list.ID,
+		Platform:         "modrinth",
+		ModID:            "sodium",
+		MinecraftVersion: "1.20.1",
+		ModLoader:        "forge",
+	})
+	if err != nil || !ok || saved.MinecraftVersion != "1.21.1" || saved.ModLoader != "fabric" {
+		t.Fatalf("canonicalized favorite = %#v, %v, %v", saved, ok, err)
+	}
+	_, err = userDB.db.Exec(
+		`INSERT INTO favorite_mods(id, list_id, platform, mod_id, minecraft_version, mod_loader, created_at, updated_at)
+		 VALUES ('invalid-scope', ?, 'modrinth', 'lithium', '1.20.1', 'forge', 1, 1)`,
+		list.ID,
+	)
+	if err == nil || !strings.Contains(err.Error(), "scope must match") {
+		t.Fatalf("raw mismatched scope error = %v", err)
+	}
+}
+
+func TestCreateFavoriteListWithModsForScopeIsAtomic(t *testing.T) {
+	openTestDB(t)
+
+	list, saved, err := CreateFavoriteListWithModsForScope("Performance", "1.21.1", "Fabric", []FavoriteMod{
+		{Platform: "modrinth", ModID: "sodium", MinecraftVersion: "wrong", ModLoader: "wrong", Title: "Sodium"},
+		{Platform: "modrinth", ModID: "sodium", Title: "Duplicate Sodium"},
+		{Platform: "modrinth", ModID: "lithium", Title: "Lithium"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list.MinecraftVersion != "1.21.1" || list.ModLoader != "fabric" || len(saved) != 2 {
+		t.Fatalf("atomic create = %#v, %#v", list, saved)
+	}
+	for _, mod := range saved {
+		if mod.ListID != list.ID || mod.MinecraftVersion != list.MinecraftVersion || mod.ModLoader != list.ModLoader {
+			t.Fatalf("saved mod scope = %#v", mod)
+		}
+	}
+	if _, _, err := CreateFavoriteListWithModsForScope("performance", "1.21.1", "fabric", []FavoriteMod{{Platform: "modrinth", ModID: "ferrite-core"}}); !errors.Is(err, ErrFavoriteListNameConflict) {
+		t.Fatalf("duplicate atomic create error = %v", err)
+	}
+	if lists := ListFavoriteLists(); len(lists) != 1 {
+		t.Fatalf("duplicate atomic create left a list = %#v", lists)
+	}
+	if _, _, err := CreateFavoriteListWithModsForScope("Invalid", "1.21.1", "fabric", []FavoriteMod{{ModID: "missing-platform"}}); err == nil {
+		t.Fatal("invalid atomic create succeeded")
+	}
+	if lists := ListFavoriteLists(); len(lists) != 1 {
+		t.Fatalf("invalid atomic create left a list = %#v", lists)
 	}
 }
 

@@ -1071,6 +1071,33 @@ func CreateFavoriteListForScope(name, minecraftVersion, modLoader string) (Favor
 	return list, nil
 }
 
+func GetFavoriteListByNameAndScope(name, minecraftVersion, modLoader string) (FavoriteList, bool) {
+	d, err := readyUserDB()
+	if err != nil {
+		return FavoriteList{}, false
+	}
+	list, found, err := d.getFavoriteListByNameAndScope(name, minecraftVersion, modLoader)
+	if err != nil {
+		logging.Error("get favorite list by name and scope failed", "name", name, "minecraftVersion", minecraftVersion, "modLoader", modLoader, "error", err)
+		return FavoriteList{}, false
+	}
+	return list, found
+}
+
+func CreateFavoriteListWithModsForScope(name, minecraftVersion, modLoader string, mods []FavoriteMod) (FavoriteList, []FavoriteMod, error) {
+	d, err := readyUserDB()
+	if err != nil {
+		return FavoriteList{}, nil, err
+	}
+	list, saved, err := d.createFavoriteListWithMods(name, minecraftVersion, modLoader, mods)
+	if err != nil {
+		logging.Error("create favorite list with mods failed", "name", name, "minecraftVersion", minecraftVersion, "modLoader", modLoader, "error", err)
+		return FavoriteList{}, nil, err
+	}
+	logging.Info("favorite list created with mods", "id", list.ID, "name", list.Name, "count", len(saved))
+	return list, saved, nil
+}
+
 func UpdateFavoriteListName(id, name string) (FavoriteList, bool, error) {
 	d, err := readyUserDB()
 	if err != nil {

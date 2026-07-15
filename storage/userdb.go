@@ -23,6 +23,7 @@ const sqliteDriverName = "sqlite"
 const favoriteRefMaxDepth = 32
 
 var errFavoriteListRefCycle = errors.New("favorite list reference would create a cycle")
+var ErrFavoriteListNameConflict = errors.New("favorite list name already exists in target scope")
 
 func openUserStore(path string) (*userStore, error) {
 	path = strings.TrimSpace(path)
@@ -109,6 +110,9 @@ func (s *userStore) ensureSchema() error {
 	if err := s.ensureSchemaV2(); err != nil {
 		return err
 	}
+	if err := s.ensureSchemaV3(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -165,6 +169,123 @@ func (s *userStore) ensureSchemaV2() error {
 			return err
 		}
 	}
+	return nil
+}
+
+func (s *userStore) ensureSchemaV3() error {
+	var applied int
+	err := s.db.QueryRow(`SELECT 1 FROM schema_migrations WHERE version = 3`).Scan(&applied)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	statements := []string{
+		`DROP TABLE IF EXISTS favorite_list_refs`,
+		`DROP TABLE IF EXISTS favorite_mods`,
+		`DROP TABLE IF EXISTS favorite_lists`,
+		`DROP TABLE IF EXISTS favorite_groups`,
+		`CREATE TABLE favorite_lists (
+			id TEXT PRIMARY KEY,
+			group_id TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL COLLATE NOCASE,
+			minecraft_version TEXT NOT NULL DEFAULT '',
+			mod_loader TEXT NOT NULL DEFAULT '',
+			icon_kind TEXT NOT NULL DEFAULT '',
+			icon_value TEXT NOT NULL DEFAULT '',
+			icon_url TEXT NOT NULL DEFAULT '',
+			pinned INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			sort_order INTEGER NOT NULL,
+			system INTEGER NOT NULL DEFAULT 0,
+			UNIQUE(name, minecraft_version, mod_loader)
+		)`,
+		`CREATE TABLE favorite_mods (
+			id TEXT PRIMARY KEY,
+			list_id TEXT NOT NULL REFERENCES favorite_lists(id) ON DELETE CASCADE,
+			platform TEXT NOT NULL,
+			mod_id TEXT NOT NULL,
+			version_id TEXT NOT NULL DEFAULT '',
+			minecraft_version TEXT NOT NULL DEFAULT '',
+			mod_loader TEXT NOT NULL DEFAULT '',
+			title TEXT NOT NULL DEFAULT '',
+			slug TEXT NOT NULL DEFAULT '',
+			icon_url TEXT NOT NULL DEFAULT '',
+			description TEXT NOT NULL DEFAULT '',
+			categories_json TEXT NOT NULL DEFAULT '[]',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			UNIQUE(list_id, platform, mod_id, minecraft_version, mod_loader)
+		)`,
+		`CREATE TABLE favorite_groups (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			sort_order INTEGER NOT NULL
+		)`,
+		`CREATE TABLE favorite_list_refs (
+			id TEXT PRIMARY KEY,
+			parent_list_id TEXT NOT NULL REFERENCES favorite_lists(id) ON DELETE CASCADE,
+			child_list_id TEXT NOT NULL REFERENCES favorite_lists(id) ON DELETE CASCADE,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			sort_order INTEGER NOT NULL,
+			UNIQUE(parent_list_id, child_list_id),
+			CHECK(parent_list_id <> child_list_id)
+		)`,
+		`CREATE TRIGGER favorite_mod_scope_insert
+			BEFORE INSERT ON favorite_mods
+			WHEN NOT EXISTS (
+				SELECT 1 FROM favorite_lists fl
+				WHERE fl.id = NEW.list_id
+				  AND fl.minecraft_version = NEW.minecraft_version
+				  AND fl.mod_loader = NEW.mod_loader
+			)
+			BEGIN
+				SELECT RAISE(ABORT, 'favorite mod scope must match favorite list scope');
+			END`,
+		`CREATE TRIGGER favorite_mod_scope_update
+			BEFORE UPDATE OF list_id, minecraft_version, mod_loader ON favorite_mods
+			WHEN NOT EXISTS (
+				SELECT 1 FROM favorite_lists fl
+				WHERE fl.id = NEW.list_id
+				  AND fl.minecraft_version = NEW.minecraft_version
+				  AND fl.mod_loader = NEW.mod_loader
+			)
+			BEGIN
+				SELECT RAISE(ABORT, 'favorite mod scope must match favorite list scope');
+			END`,
+		`CREATE INDEX idx_favorite_lists_pinned_order ON favorite_lists(pinned, sort_order, created_at)`,
+		`CREATE INDEX idx_favorite_lists_group_order ON favorite_lists(group_id, sort_order, created_at)`,
+		`CREATE INDEX idx_favorite_groups_order ON favorite_groups(sort_order, created_at)`,
+		`CREATE INDEX idx_favorite_list_refs_parent_order ON favorite_list_refs(parent_list_id, sort_order)`,
+		`CREATE INDEX idx_favorite_list_refs_child ON favorite_list_refs(child_list_id)`,
+		`INSERT INTO schema_migrations(version, applied_at) VALUES (3, unixepoch())`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
 	return nil
 }
 
@@ -296,9 +417,131 @@ func (s *userStore) createFavoriteList(name, minecraftVersion, modLoader string)
 		list.ID, list.Name, list.MinecraftVersion, list.ModLoader, list.CreatedAt, list.UpdatedAt, list.SortOrder, boolToInt(list.System),
 	)
 	if err != nil {
+		if isFavoriteListNameConflictError(err) {
+			return FavoriteList{}, ErrFavoriteListNameConflict
+		}
 		return FavoriteList{}, err
 	}
 	return list, nil
+}
+
+func (s *userStore) getFavoriteListByNameAndScope(name, minecraftVersion, modLoader string) (FavoriteList, bool, error) {
+	list := normalizeFavoriteList(FavoriteList{Name: name, MinecraftVersion: minecraftVersion, ModLoader: modLoader})
+	if list.Name == "" {
+		return FavoriteList{}, false, nil
+	}
+	found, err := scanFavoriteList(s.db.QueryRow(
+		`SELECT id, group_id, name, minecraft_version, mod_loader, icon_kind, icon_value, icon_url, pinned, created_at, updated_at, sort_order, system
+		 FROM favorite_lists WHERE name = ? AND minecraft_version = ? AND mod_loader = ?`,
+		list.Name, list.MinecraftVersion, list.ModLoader,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return FavoriteList{}, false, nil
+	}
+	if err != nil {
+		return FavoriteList{}, false, err
+	}
+	return found, true, nil
+}
+
+func (s *userStore) createFavoriteListWithMods(name, minecraftVersion, modLoader string, mods []FavoriteMod) (FavoriteList, []FavoriteMod, error) {
+	list := normalizeFavoriteList(FavoriteList{Name: name, MinecraftVersion: minecraftVersion, ModLoader: modLoader})
+	if list.Name == "" || list.MinecraftVersion == "" || list.ModLoader == "" || len(mods) == 0 {
+		return FavoriteList{}, nil, errors.New("favorite list name, scope, and mods are required")
+	}
+
+	normalized := make([]FavoriteMod, 0, len(mods))
+	seen := make(map[favoriteModKey]struct{}, len(mods))
+	for _, mod := range mods {
+		mod.ListID = ""
+		mod.MinecraftVersion = list.MinecraftVersion
+		mod.ModLoader = list.ModLoader
+		mod = normalizeFavoriteMod(mod)
+		if mod.Platform == "" || mod.ModID == "" {
+			return FavoriteList{}, nil, errors.New("favorite mod platform and mod id are required")
+		}
+		key := makeFavoriteModKey("", mod.Platform, mod.ModID, mod.MinecraftVersion, mod.ModLoader)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, mod)
+	}
+	if len(normalized) == 0 {
+		return FavoriteList{}, nil, errors.New("at least one unique favorite mod is required")
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return FavoriteList{}, nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var conflict int
+	err = tx.QueryRow(
+		`SELECT 1 FROM favorite_lists WHERE name = ? AND minecraft_version = ? AND mod_loader = ? LIMIT 1`,
+		list.Name, list.MinecraftVersion, list.ModLoader,
+	).Scan(&conflict)
+	if err == nil {
+		return FavoriteList{}, nil, ErrFavoriteListNameConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return FavoriteList{}, nil, err
+	}
+
+	now := time.Now().Unix()
+	var maxSortOrder int
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(sort_order), 0) FROM favorite_lists`).Scan(&maxSortOrder); err != nil {
+		return FavoriteList{}, nil, err
+	}
+	list.ID = NewID()
+	list.CreatedAt = now
+	list.UpdatedAt = now
+	list.SortOrder = maxSortOrder + 1
+	if _, err := tx.Exec(
+		`INSERT INTO favorite_lists(id, group_id, name, minecraft_version, mod_loader, icon_kind, icon_value, icon_url, pinned, created_at, updated_at, sort_order, system)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		list.ID, list.GroupID, list.Name, list.MinecraftVersion, list.ModLoader, list.IconKind, list.IconValue, list.IconURL,
+		boolToInt(list.Pinned), list.CreatedAt, list.UpdatedAt, list.SortOrder, boolToInt(list.System),
+	); err != nil {
+		if isFavoriteListNameConflictError(err) {
+			return FavoriteList{}, nil, ErrFavoriteListNameConflict
+		}
+		return FavoriteList{}, nil, err
+	}
+
+	saved := make([]FavoriteMod, 0, len(normalized))
+	for _, mod := range normalized {
+		mod.ListID = list.ID
+		mod.ID = NewID()
+		mod.CreatedAt = now
+		mod.UpdatedAt = now
+		categoriesJSON, err := favoriteCategoriesJSON(mod.Categories)
+		if err != nil {
+			return FavoriteList{}, nil, err
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO favorite_mods(
+				id, list_id, platform, mod_id, version_id, minecraft_version, mod_loader,
+				title, slug, icon_url, description, categories_json, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			mod.ID, mod.ListID, mod.Platform, mod.ModID, mod.VersionID, mod.MinecraftVersion, mod.ModLoader,
+			mod.Title, mod.Slug, mod.IconURL, mod.Description, categoriesJSON, mod.CreatedAt, mod.UpdatedAt,
+		); err != nil {
+			return FavoriteList{}, nil, err
+		}
+		saved = append(saved, copyFavoriteMod(mod))
+	}
+	if err := tx.Commit(); err != nil {
+		return FavoriteList{}, nil, err
+	}
+	committed = true
+	return list, saved, nil
 }
 
 func (s *userStore) updateFavoriteListName(id, name string) (FavoriteList, bool, error) {
@@ -310,6 +553,9 @@ func (s *userStore) updateFavoriteListName(id, name string) (FavoriteList, bool,
 	now := time.Now().Unix()
 	result, err := s.db.Exec(`UPDATE favorite_lists SET name = ?, updated_at = ? WHERE id = ?`, name, now, id)
 	if err != nil {
+		if isFavoriteListNameConflictError(err) {
+			return FavoriteList{}, false, ErrFavoriteListNameConflict
+		}
 		return FavoriteList{}, false, err
 	}
 	affected, err := result.RowsAffected()
@@ -321,6 +567,13 @@ func (s *userStore) updateFavoriteListName(id, name string) (FavoriteList, bool,
 	}
 	list, ok, err := s.getFavoriteList(id)
 	return list, ok, err
+}
+
+func isFavoriteListNameConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "unique constraint failed: favorite_lists.name")
 }
 
 func (s *userStore) getFavoriteList(id string) (FavoriteList, bool, error) {
@@ -620,11 +873,15 @@ func (s *userStore) upsertFavoriteMod(mod FavoriteMod) (FavoriteMod, bool, error
 	if mod.ListID == "" || mod.Platform == "" || mod.ModID == "" {
 		return FavoriteMod{}, false, nil
 	}
-	if _, ok, err := s.getFavoriteList(mod.ListID); err != nil {
+	list, ok, err := s.getFavoriteList(mod.ListID)
+	if err != nil {
 		return FavoriteMod{}, false, err
-	} else if !ok {
+	}
+	if !ok {
 		return FavoriteMod{}, false, nil
 	}
+	mod.MinecraftVersion = list.MinecraftVersion
+	mod.ModLoader = list.ModLoader
 
 	if existing, ok, err := s.getFavoriteModByKey(mod.ListID, mod.Platform, mod.ModID, mod.MinecraftVersion, mod.ModLoader); err != nil {
 		return FavoriteMod{}, false, err
@@ -693,6 +950,15 @@ func (s *userStore) deleteFavoriteMod(listID, platform, modID, mcVersion, modLoa
 	if key.ListID == "" || key.Platform == "" || key.ModID == "" {
 		return false, nil
 	}
+	list, ok, err := s.getFavoriteList(key.ListID)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	key.MinecraftVersion = list.MinecraftVersion
+	key.ModLoader = list.ModLoader
 	result, err := s.db.Exec(
 		`DELETE FROM favorite_mods
 		 WHERE list_id = ? AND platform = ? AND mod_id = ? AND minecraft_version = ? AND mod_loader = ?`,

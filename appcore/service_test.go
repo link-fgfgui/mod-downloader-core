@@ -475,14 +475,13 @@ func TestFavoriteListMetadataAndReorderServiceMethods(t *testing.T) {
 	}
 }
 
-func TestFavoriteMigrationPreviewAndApplyAllMatch(t *testing.T) {
-	svc := openFavoriteMigrationService(t)
-	storeFavoriteMigrationProject(t, "Modrinth", "sodium", "sodium", []models.ModVersion{
-		favoriteMigrationVersion("Modrinth", "sodium", "sodium-1.21.1", "1.21.1", "fabric", 20),
+func TestFavoriteCrossVersionCopyPreviewAndApplyAllMatch(t *testing.T) {
+	svc := openFavoriteCrossVersionCopyService(t)
+	storeFavoriteCrossVersionCopyProject(t, "Modrinth", "sodium", "sodium", []models.ModVersion{
+		favoriteCrossVersionCopyVersion("Modrinth", "sodium", "sodium-1.21.1", "1.21.1", "fabric", 20),
 	})
 
-	source := svc.CreateFavoriteList("Source")
-	target := svc.CreateFavoriteList("Target")
+	source := svc.CreateFavoriteListForScope("Source", "1.20.1", "fabric")
 	sourceMod := svc.AddFavoriteMod(storage.FavoriteMod{
 		ListID:           source.ID,
 		Platform:         "modrinth",
@@ -494,28 +493,33 @@ func TestFavoriteMigrationPreviewAndApplyAllMatch(t *testing.T) {
 		Slug:             "sodium",
 	})
 
-	req := FavoriteMigrationRequest{
+	req := FavoriteCrossVersionCopyRequest{
 		SourceListID:     source.ID,
-		TargetListID:     target.ID,
 		MinecraftVersion: "1.21.1",
 		ModLoader:        "Fabric",
 	}
-	preview := svc.PreviewFavoriteListMigration(req)
+	preview := svc.PreviewFavoriteListCrossVersionCopy(req)
 	if len(preview.Matched) != 1 || len(preview.Conflicts) != 0 || len(preview.Errors) != 0 {
 		t.Fatalf("preview = %#v", preview)
 	}
-	if mods := svc.ListFavoriteMods(target.ID); len(mods) != 0 {
-		t.Fatalf("preview wrote target mods: %#v", mods)
+	if preview.TargetListName != source.Name || preview.MinecraftVersion != "1.21.1" || preview.ModLoader != "fabric" || preview.NameConflict {
+		t.Fatalf("preview target = %#v", preview)
 	}
-	if got := preview.Matched[0].Target; got.ListID != target.ID || got.VersionID != "sodium-1.21.1" || got.MinecraftVersion != "1.21.1" || got.ModLoader != "fabric" {
+	if lists := svc.ListFavoriteLists(); len(lists) != 1 {
+		t.Fatalf("preview wrote a target list: %#v", lists)
+	}
+	if got := preview.Matched[0].Target; got.ListID != "" || got.VersionID != "sodium-1.21.1" || got.MinecraftVersion != "1.21.1" || got.ModLoader != "fabric" {
 		t.Fatalf("matched target = %#v", got)
 	}
 
-	applied := svc.ApplyFavoriteListMigration(req)
+	applied := svc.ApplyFavoriteListCrossVersionCopy(req)
 	if !applied.Applied || applied.Result.Added != 1 || applied.Result.Updated != 0 || applied.Result.Skipped != 0 {
 		t.Fatalf("apply result = %#v", applied)
 	}
-	targetMods := svc.ListFavoriteMods(target.ID)
+	if applied.TargetList.ID == "" || applied.TargetList.Name != source.Name || applied.TargetList.MinecraftVersion != "1.21.1" || applied.TargetList.ModLoader != "fabric" {
+		t.Fatalf("target list = %#v", applied.TargetList)
+	}
+	targetMods := svc.ListFavoriteMods(applied.TargetList.ID)
 	if len(targetMods) != 1 || targetMods[0].ID == sourceMod.ID || targetMods[0].VersionID != "sodium-1.21.1" {
 		t.Fatalf("target mods = %#v, source = %#v", targetMods, sourceMod)
 	}
@@ -525,63 +529,59 @@ func TestFavoriteMigrationPreviewAndApplyAllMatch(t *testing.T) {
 	}
 }
 
-func TestFavoriteMigrationPartialConflictRequiresIgnore(t *testing.T) {
-	svc := openFavoriteMigrationService(t)
-	storeFavoriteMigrationProject(t, "Modrinth", "sodium", "sodium", []models.ModVersion{
-		favoriteMigrationVersion("Modrinth", "sodium", "sodium-1.21.1", "1.21.1", "fabric", 20),
+func TestFavoriteCrossVersionCopyPartialConflictRequiresIgnore(t *testing.T) {
+	svc := openFavoriteCrossVersionCopyService(t)
+	storeFavoriteCrossVersionCopyProject(t, "Modrinth", "sodium", "sodium", []models.ModVersion{
+		favoriteCrossVersionCopyVersion("Modrinth", "sodium", "sodium-1.21.1", "1.21.1", "fabric", 20),
 	})
-	storeFavoriteMigrationProject(t, "Modrinth", "lithium", "lithium", []models.ModVersion{
-		favoriteMigrationVersion("Modrinth", "lithium", "lithium-1.20.1", "1.20.1", "fabric", 10),
+	storeFavoriteCrossVersionCopyProject(t, "Modrinth", "lithium", "lithium", []models.ModVersion{
+		favoriteCrossVersionCopyVersion("Modrinth", "lithium", "lithium-1.20.1", "1.20.1", "fabric", 10),
 	})
 
-	source := svc.CreateFavoriteList("Source")
-	target := svc.CreateFavoriteList("Target")
+	source := svc.CreateFavoriteListForScope("Source", "1.20.1", "fabric")
 	svc.AddFavoriteMod(storage.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "sodium", Slug: "sodium", Title: "Sodium"})
 	svc.AddFavoriteMod(storage.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "lithium", Slug: "lithium", Title: "Lithium"})
 
-	req := FavoriteMigrationRequest{
+	req := FavoriteCrossVersionCopyRequest{
 		SourceListID:     source.ID,
-		TargetListID:     target.ID,
 		MinecraftVersion: "1.21.1",
 		ModLoader:        "fabric",
 	}
-	preview := svc.PreviewFavoriteListMigration(req)
+	preview := svc.PreviewFavoriteListCrossVersionCopy(req)
 	if len(preview.Matched) != 1 || len(preview.Conflicts) != 1 {
 		t.Fatalf("preview = %#v", preview)
 	}
 
-	blocked := svc.ApplyFavoriteListMigration(req)
+	blocked := svc.ApplyFavoriteListCrossVersionCopy(req)
 	if blocked.Applied || blocked.Result.Added != 0 || blocked.Result.Updated != 0 {
 		t.Fatalf("blocked apply result = %#v", blocked)
 	}
-	if mods := svc.ListFavoriteMods(target.ID); len(mods) != 0 {
-		t.Fatalf("non-ignore apply wrote target mods: %#v", mods)
+	if lists := svc.ListFavoriteLists(); len(lists) != 1 {
+		t.Fatalf("non-ignore apply wrote target list: %#v", lists)
 	}
 
 	req.IgnoreConflicts = true
-	applied := svc.ApplyFavoriteListMigration(req)
+	applied := svc.ApplyFavoriteListCrossVersionCopy(req)
 	if !applied.Applied || applied.Result.Added != 1 || applied.Result.Skipped != 1 {
 		t.Fatalf("ignore-conflict apply result = %#v", applied)
 	}
-	targetMods := svc.ListFavoriteMods(target.ID)
+	targetMods := svc.ListFavoriteMods(applied.TargetList.ID)
 	if len(targetMods) != 1 || targetMods[0].ModID != "sodium" {
 		t.Fatalf("target mods = %#v", targetMods)
 	}
 }
 
-func TestFavoriteMigrationAllConflictWritesNothing(t *testing.T) {
-	svc := openFavoriteMigrationService(t)
-	storeFavoriteMigrationProject(t, "Modrinth", "lithium", "lithium", []models.ModVersion{
-		favoriteMigrationVersion("Modrinth", "lithium", "lithium-1.20.1", "1.20.1", "fabric", 10),
+func TestFavoriteCrossVersionCopyAllConflictWritesNothing(t *testing.T) {
+	svc := openFavoriteCrossVersionCopyService(t)
+	storeFavoriteCrossVersionCopyProject(t, "Modrinth", "lithium", "lithium", []models.ModVersion{
+		favoriteCrossVersionCopyVersion("Modrinth", "lithium", "lithium-1.20.1", "1.20.1", "fabric", 10),
 	})
 
-	source := svc.CreateFavoriteList("Source")
-	target := svc.CreateFavoriteList("Target")
+	source := svc.CreateFavoriteListForScope("Source", "1.20.1", "fabric")
 	svc.AddFavoriteMod(storage.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "lithium", Slug: "lithium", Title: "Lithium"})
 
-	applied := svc.ApplyFavoriteListMigration(FavoriteMigrationRequest{
+	applied := svc.ApplyFavoriteListCrossVersionCopy(FavoriteCrossVersionCopyRequest{
 		SourceListID:     source.ID,
-		TargetListID:     target.ID,
 		MinecraftVersion: "1.21.1",
 		ModLoader:        "fabric",
 		IgnoreConflicts:  true,
@@ -589,21 +589,19 @@ func TestFavoriteMigrationAllConflictWritesNothing(t *testing.T) {
 	if applied.Result.Added != 0 || applied.Result.Updated != 0 || applied.Result.Skipped != 1 {
 		t.Fatalf("all-conflict apply result = %#v", applied)
 	}
-	if mods := svc.ListFavoriteMods(target.ID); len(mods) != 0 {
-		t.Fatalf("all-conflict apply wrote target mods: %#v", mods)
+	if lists := svc.ListFavoriteLists(); len(lists) != 1 {
+		t.Fatalf("all-conflict apply wrote target list: %#v", lists)
 	}
 }
 
-func TestFavoriteMigrationMissingProjectLookupConflict(t *testing.T) {
-	svc := openFavoriteMigrationService(t)
-	stubFavoriteMigrationProjectLookup(t)
-	source := svc.CreateFavoriteList("Source")
-	target := svc.CreateFavoriteList("Target")
+func TestFavoriteCrossVersionCopyMissingProjectLookupConflict(t *testing.T) {
+	svc := openFavoriteCrossVersionCopyService(t)
+	stubFavoriteCrossVersionCopyProjectLookup(t)
+	source := svc.CreateFavoriteListForScope("Source", "1.20.1", "fabric")
 	svc.AddFavoriteMod(storage.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "missing-project", Title: "Missing"})
 
-	preview := svc.PreviewFavoriteListMigration(FavoriteMigrationRequest{
+	preview := svc.PreviewFavoriteListCrossVersionCopy(FavoriteCrossVersionCopyRequest{
 		SourceListID:     source.ID,
-		TargetListID:     target.ID,
 		MinecraftVersion: "1.21.1",
 		ModLoader:        "fabric",
 	})
@@ -612,23 +610,21 @@ func TestFavoriteMigrationMissingProjectLookupConflict(t *testing.T) {
 	}
 }
 
-func TestFavoriteMigrationUsesReferencedListContents(t *testing.T) {
-	svc := openFavoriteMigrationService(t)
-	storeFavoriteMigrationProject(t, "CurseForge", "238222", "jei", []models.ModVersion{
-		favoriteMigrationVersion("CurseForge", "238222", "jei-1.21.1", "1.21.1", "neoforge", 20),
+func TestFavoriteCrossVersionCopyUsesReferencedListContents(t *testing.T) {
+	svc := openFavoriteCrossVersionCopyService(t)
+	storeFavoriteCrossVersionCopyProject(t, "CurseForge", "238222", "jei", []models.ModVersion{
+		favoriteCrossVersionCopyVersion("CurseForge", "238222", "jei-1.21.1", "1.21.1", "neoforge", 20),
 	})
 
-	source := svc.CreateFavoriteList("Source")
-	child := svc.CreateFavoriteList("Child")
-	target := svc.CreateFavoriteList("Target")
+	source := svc.CreateFavoriteListForScope("Source", "1.20.1", "neoforge")
+	child := svc.CreateFavoriteListForScope("Child", "1.20.1", "neoforge")
 	svc.AddFavoriteMod(storage.FavoriteMod{ListID: child.ID, Platform: "curseforge", ModID: "238222", Slug: "jei", Title: "JEI"})
 	if ref := svc.AddFavoriteListReference(source.ID, child.ID); ref.ID == "" {
 		t.Fatal("AddFavoriteListReference returned empty ref")
 	}
 
-	preview := svc.PreviewFavoriteListMigration(FavoriteMigrationRequest{
+	preview := svc.PreviewFavoriteListCrossVersionCopy(FavoriteCrossVersionCopyRequest{
 		SourceListID:     source.ID,
-		TargetListID:     target.ID,
 		MinecraftVersion: "1.21.1",
 		ModLoader:        "NeoForge",
 	})
@@ -640,7 +636,49 @@ func TestFavoriteMigrationUsesReferencedListContents(t *testing.T) {
 	}
 }
 
-func openFavoriteMigrationService(t *testing.T) *Service {
+func TestFavoriteCrossVersionCopyRejectsTargetNameConflict(t *testing.T) {
+	svc := openFavoriteCrossVersionCopyService(t)
+	storeFavoriteCrossVersionCopyProject(t, "Modrinth", "sodium", "sodium", []models.ModVersion{
+		favoriteCrossVersionCopyVersion("Modrinth", "sodium", "sodium-1.21.1", "1.21.1", "fabric", 20),
+	})
+	source := svc.CreateFavoriteListForScope("Performance", "1.20.1", "fabric")
+	svc.AddFavoriteMod(storage.FavoriteMod{ListID: source.ID, Platform: "modrinth", ModID: "sodium", Slug: "sodium"})
+	req := FavoriteCrossVersionCopyRequest{
+		SourceListID:     source.ID,
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+	}
+	preview := svc.PreviewFavoriteListCrossVersionCopy(req)
+	if preview.NameConflict || len(preview.Errors) != 0 {
+		t.Fatalf("initial preview = %#v", preview)
+	}
+	conflicting := svc.CreateFavoriteListForScope("performance", "1.21.1", "fabric")
+	if conflicting.ID == "" {
+		t.Fatal("failed to create concurrent target")
+	}
+	applied := svc.ApplyFavoriteListCrossVersionCopy(req)
+	if applied.Applied || !applied.Preview.NameConflict || len(applied.Result.Errors) == 0 {
+		t.Fatalf("conflicting apply = %#v", applied)
+	}
+	if lists := svc.ListFavoriteLists(); len(lists) != 2 {
+		t.Fatalf("conflicting apply created another list = %#v", lists)
+	}
+}
+
+func TestFavoriteCrossVersionCopyRejectsSourceScope(t *testing.T) {
+	svc := openFavoriteCrossVersionCopyService(t)
+	source := svc.CreateFavoriteListForScope("Performance", "1.21.1", "Fabric")
+	preview := svc.PreviewFavoriteListCrossVersionCopy(FavoriteCrossVersionCopyRequest{
+		SourceListID:     source.ID,
+		MinecraftVersion: "1.21.1",
+		ModLoader:        "fabric",
+	})
+	if len(preview.Errors) != 1 || preview.Errors[0] != "target scope must differ from source scope" {
+		t.Fatalf("same-scope preview = %#v", preview)
+	}
+}
+
+func openFavoriteCrossVersionCopyService(t *testing.T) *Service {
 	t.Helper()
 	providers.StartBackgroundTasks()
 	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
@@ -654,7 +692,7 @@ func openFavoriteMigrationService(t *testing.T) *Service {
 	return New(Options{})
 }
 
-func storeFavoriteMigrationProject(t *testing.T, platform, projectID, slug string, versions []models.ModVersion) {
+func storeFavoriteCrossVersionCopyProject(t *testing.T, platform, projectID, slug string, versions []models.ModVersion) {
 	t.Helper()
 	if err := storage.UpsertModPlatform(models.ModProject{
 		ID:        models.ProjectKey(platform, projectID),
@@ -674,7 +712,7 @@ func storeFavoriteMigrationProject(t *testing.T, platform, projectID, slug strin
 	}
 }
 
-func favoriteMigrationVersion(platform, projectID, versionID, minecraftVersion, modLoader string, publishedAt int64) models.ModVersion {
+func favoriteCrossVersionCopyVersion(platform, projectID, versionID, minecraftVersion, modLoader string, publishedAt int64) models.ModVersion {
 	return models.ModVersion{
 		ID:           versionID,
 		Platform:     platform,
@@ -687,19 +725,19 @@ func favoriteMigrationVersion(platform, projectID, versionID, minecraftVersion, 
 	}
 }
 
-func stubFavoriteMigrationProjectLookup(t *testing.T) {
+func stubFavoriteCrossVersionCopyProjectLookup(t *testing.T) {
 	t.Helper()
-	lookupByID := favoriteMigrationLookupProjectByID
-	lookupBySlug := favoriteMigrationLookupProjectBySlug
-	favoriteMigrationLookupProjectByID = func(platform, projectID, mcVersion, modLoader string) (models.ModProject, bool) {
+	lookupByID := favoriteCrossVersionCopyLookupProjectByID
+	lookupBySlug := favoriteCrossVersionCopyLookupProjectBySlug
+	favoriteCrossVersionCopyLookupProjectByID = func(platform, projectID, mcVersion, modLoader string) (models.ModProject, bool) {
 		return models.ModProject{}, false
 	}
-	favoriteMigrationLookupProjectBySlug = func(platform, slug, mcVersion, modLoader string) (models.ModProject, bool) {
+	favoriteCrossVersionCopyLookupProjectBySlug = func(platform, slug, mcVersion, modLoader string) (models.ModProject, bool) {
 		return models.ModProject{}, false
 	}
 	t.Cleanup(func() {
-		favoriteMigrationLookupProjectByID = lookupByID
-		favoriteMigrationLookupProjectBySlug = lookupBySlug
+		favoriteCrossVersionCopyLookupProjectByID = lookupByID
+		favoriteCrossVersionCopyLookupProjectBySlug = lookupBySlug
 	})
 }
 

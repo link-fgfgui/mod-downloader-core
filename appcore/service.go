@@ -43,8 +43,8 @@ var (
 const APIKeyKeepSentinel = "<keep>"
 
 var (
-	favoriteMigrationLookupProjectByID   = providers.LookupProjectByPlatformID
-	favoriteMigrationLookupProjectBySlug = providers.LookupProjectByPlatformSlug
+	favoriteCrossVersionCopyLookupProjectByID   = providers.LookupProjectByPlatformID
+	favoriteCrossVersionCopyLookupProjectBySlug = providers.LookupProjectByPlatformSlug
 )
 
 const (
@@ -409,29 +409,44 @@ func (s *Service) CopyFavoriteListToList(req FavoriteListCopyRequest) FavoriteBu
 	})
 }
 
-func (s *Service) PreviewFavoriteListMigration(req FavoriteMigrationRequest) FavoriteMigrationPreview {
+func (s *Service) PreviewFavoriteListCrossVersionCopy(req FavoriteCrossVersionCopyRequest) FavoriteCrossVersionCopyPreview {
 	sourceListID := strings.TrimSpace(req.SourceListID)
-	targetListID := strings.TrimSpace(req.TargetListID)
 	minecraftVersion := strings.TrimSpace(req.MinecraftVersion)
 	modLoader := strings.ToLower(strings.TrimSpace(req.ModLoader))
-	preview := FavoriteMigrationPreview{
-		SourceListID: sourceListID,
-		TargetListID: targetListID,
+	preview := FavoriteCrossVersionCopyPreview{
+		SourceListID:     sourceListID,
+		MinecraftVersion: minecraftVersion,
+		ModLoader:        modLoader,
 	}
-	if sourceListID == "" || targetListID == "" {
-		preview.Errors = append(preview.Errors, "source and target list are required")
+	if sourceListID == "" {
+		preview.Errors = append(preview.Errors, "source list is required")
 		return preview
 	}
 	if minecraftVersion == "" || modLoader == "" {
 		preview.Errors = append(preview.Errors, "minecraft version and modloader are required")
 		return preview
 	}
+	sourceList, ok := storage.GetFavoriteList(sourceListID)
+	if !ok {
+		preview.Errors = append(preview.Errors, "source list not found")
+		return preview
+	}
+	preview.TargetListName = sourceList.Name
+	if sourceList.MinecraftVersion == minecraftVersion && sourceList.ModLoader == modLoader {
+		preview.Errors = append(preview.Errors, "target scope must differ from source scope")
+		return preview
+	}
+	if _, found := storage.GetFavoriteListByNameAndScope(sourceList.Name, minecraftVersion, modLoader); found {
+		preview.NameConflict = true
+		preview.Errors = append(preview.Errors, "a favorite list with the same name already exists in the target scope")
+		return preview
+	}
 
 	contents := storage.ListFavoriteContents(sourceListID)
 	for _, entry := range contents.Mods {
-		project, ok := s.favoriteMigrationProject(entry.FavoriteMod, minecraftVersion, modLoader)
+		project, ok := s.favoriteCrossVersionCopyProject(entry.FavoriteMod, minecraftVersion, modLoader)
 		if !ok {
-			preview.Conflicts = append(preview.Conflicts, FavoriteMigrationConflict{
+			preview.Conflicts = append(preview.Conflicts, FavoriteCrossVersionCopyConflict{
 				Source: entry,
 				Reason: "project not found",
 			})
@@ -439,16 +454,16 @@ func (s *Service) PreviewFavoriteListMigration(req FavoriteMigrationRequest) Fav
 		}
 		versions := providers.ListMatchingProjectVersions(project, minecraftVersion, modLoader)
 		if len(versions) == 0 {
-			preview.Conflicts = append(preview.Conflicts, FavoriteMigrationConflict{
+			preview.Conflicts = append(preview.Conflicts, FavoriteCrossVersionCopyConflict{
 				Source: entry,
 				Reason: "matching version not found",
 			})
 			continue
 		}
-		target := favoriteModForTargetList(entry.FavoriteMod, targetListID)
+		target := favoriteModForTargetList(entry.FavoriteMod, "")
 		target.MinecraftVersion = minecraftVersion
 		target.ModLoader = modLoader
-		target.VersionID = favoriteMigrationVersionID(versions[0])
+		target.VersionID = favoriteCrossVersionCopyVersionID(versions[0])
 		if strings.TrimSpace(target.ModID) == "" {
 			target.ModID = strings.TrimSpace(project.ProjectID)
 		}
@@ -458,7 +473,7 @@ func (s *Service) PreviewFavoriteListMigration(req FavoriteMigrationRequest) Fav
 		if strings.TrimSpace(target.Slug) == "" {
 			target.Slug = strings.TrimSpace(project.Slug)
 		}
-		preview.Matched = append(preview.Matched, FavoriteMigrationMatch{
+		preview.Matched = append(preview.Matched, FavoriteCrossVersionCopyMatch{
 			Source:  entry,
 			Target:  target,
 			Project: project,
@@ -468,32 +483,55 @@ func (s *Service) PreviewFavoriteListMigration(req FavoriteMigrationRequest) Fav
 	return preview
 }
 
-func (s *Service) ApplyFavoriteListMigration(req FavoriteMigrationRequest) FavoriteMigrationApplyResult {
-	preview := s.PreviewFavoriteListMigration(req)
-	result := FavoriteMigrationApplyResult{Preview: preview}
+func (s *Service) ApplyFavoriteListCrossVersionCopy(req FavoriteCrossVersionCopyRequest) FavoriteCrossVersionCopyApplyResult {
+	preview := s.PreviewFavoriteListCrossVersionCopy(req)
+	result := FavoriteCrossVersionCopyApplyResult{Preview: preview}
 	if len(preview.Errors) > 0 {
 		result.Result.Errors = append(result.Result.Errors, preview.Errors...)
 		return result
 	}
 	if len(preview.Conflicts) > 0 && !req.IgnoreConflicts {
 		result.Result.Skipped = len(preview.Matched) + len(preview.Conflicts)
-		result.Result.Errors = append(result.Result.Errors, "migration conflicts must be ignored or resolved before applying")
+		result.Result.Errors = append(result.Result.Errors, "copy conflicts must be ignored or resolved before applying")
+		return result
+	}
+	if len(preview.Matched) == 0 {
+		result.Result.Skipped = len(preview.Conflicts)
+		result.Result.Errors = append(result.Result.Errors, "no matching mods to copy")
 		return result
 	}
 	mods := make([]storage.FavoriteMod, 0, len(preview.Matched))
 	for _, match := range preview.Matched {
 		mods = append(mods, match.Target)
 	}
-	result.Result = s.AddFavoriteModsToLists(FavoriteBulkAddRequest{
-		TargetListIDs: []string{preview.TargetListID},
-		Mods:          mods,
-	})
-	result.Result.Skipped += len(preview.Conflicts)
-	result.Applied = result.Result.Added > 0 || result.Result.Updated > 0
+	targetList, saved, err := storage.CreateFavoriteListWithModsForScope(
+		preview.TargetListName,
+		preview.MinecraftVersion,
+		preview.ModLoader,
+		mods,
+	)
+	if err != nil {
+		if errors.Is(err, storage.ErrFavoriteListNameConflict) {
+			result.Preview.NameConflict = true
+			result.Result.Errors = append(result.Result.Errors, "a favorite list with the same name already exists in the target scope")
+		} else {
+			logging.Error("cross-version favorite copy failed", "sourceListID", preview.SourceListID, "minecraftVersion", preview.MinecraftVersion, "modLoader", preview.ModLoader, "error", err)
+			result.Result.Errors = append(result.Result.Errors, err.Error())
+		}
+		result.Result.Skipped = len(preview.Matched) + len(preview.Conflicts)
+		return result
+	}
+	result.TargetList = targetList
+	result.Result.Added = len(saved)
+	result.Result.Skipped = len(preview.Conflicts)
+	result.Applied = result.Result.Added > 0
+	if result.Applied {
+		s.incrementUsageStat(storage.UsageStatFavoritesAdded, int64(result.Result.Added))
+	}
 	return result
 }
 
-func (s *Service) favoriteMigrationProject(mod storage.FavoriteMod, minecraftVersion, modLoader string) (models.ModProject, bool) {
+func (s *Service) favoriteCrossVersionCopyProject(mod storage.FavoriteMod, minecraftVersion, modLoader string) (models.ModProject, bool) {
 	platform := strings.TrimSpace(mod.Platform)
 	modID := strings.TrimSpace(mod.ModID)
 	slug := strings.TrimSpace(mod.Slug)
@@ -502,41 +540,41 @@ func (s *Service) favoriteMigrationProject(mod storage.FavoriteMod, minecraftVer
 	}
 	if modID != "" {
 		if project, ok := storage.GetModPlatform(platform, modID); ok {
-			return favoriteMigrationProjectWithID(project), true
+			return favoriteCrossVersionCopyProjectWithID(project), true
 		}
 		if project, ok := storage.GetModPlatformBySlug(platform, modID); ok {
-			return favoriteMigrationProjectWithID(project), true
+			return favoriteCrossVersionCopyProjectWithID(project), true
 		}
 	}
 	if slug != "" {
 		if project, ok := storage.GetModPlatformBySlug(platform, slug); ok {
-			return favoriteMigrationProjectWithID(project), true
+			return favoriteCrossVersionCopyProjectWithID(project), true
 		}
 		if project, ok := storage.GetModPlatform(platform, slug); ok {
-			return favoriteMigrationProjectWithID(project), true
+			return favoriteCrossVersionCopyProjectWithID(project), true
 		}
 	}
 	if modID != "" {
-		if project, ok := favoriteMigrationLookupProjectByID(platform, modID, minecraftVersion, modLoader); ok {
-			return favoriteMigrationProjectWithID(project), true
+		if project, ok := favoriteCrossVersionCopyLookupProjectByID(platform, modID, minecraftVersion, modLoader); ok {
+			return favoriteCrossVersionCopyProjectWithID(project), true
 		}
 	}
 	if slug != "" {
-		if project, ok := favoriteMigrationLookupProjectBySlug(platform, slug, minecraftVersion, modLoader); ok {
-			return favoriteMigrationProjectWithID(project), true
+		if project, ok := favoriteCrossVersionCopyLookupProjectBySlug(platform, slug, minecraftVersion, modLoader); ok {
+			return favoriteCrossVersionCopyProjectWithID(project), true
 		}
 	}
 	return models.ModProject{}, false
 }
 
-func favoriteMigrationProjectWithID(project models.ModProject) models.ModProject {
+func favoriteCrossVersionCopyProjectWithID(project models.ModProject) models.ModProject {
 	if strings.TrimSpace(project.ID) == "" {
 		project.ID = models.ProjectKey(project.Platform, project.ProjectID)
 	}
 	return project
 }
 
-func favoriteMigrationVersionID(version models.ModVersion) string {
+func favoriteCrossVersionCopyVersionID(version models.ModVersion) string {
 	if id := strings.TrimSpace(version.VersionID); id != "" {
 		return id
 	}

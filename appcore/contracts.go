@@ -139,38 +139,41 @@ type FavoriteBulkOperationResult struct {
 	Errors  []string `json:"errors,omitempty"`
 }
 
-type FavoriteMigrationRequest struct {
+type FavoriteCrossVersionCopyRequest struct {
 	SourceListID     string `json:"sourceListId"`
-	TargetListID     string `json:"targetListId"`
 	MinecraftVersion string `json:"minecraftVersion"`
 	ModLoader        string `json:"modLoader"`
 	IgnoreConflicts  bool   `json:"ignoreConflicts,omitempty"`
 }
 
-type FavoriteMigrationPreview struct {
-	SourceListID string                      `json:"sourceListId"`
-	TargetListID string                      `json:"targetListId"`
-	Matched      []FavoriteMigrationMatch    `json:"matched"`
-	Conflicts    []FavoriteMigrationConflict `json:"conflicts"`
-	Errors       []string                    `json:"errors,omitempty"`
+type FavoriteCrossVersionCopyPreview struct {
+	SourceListID     string                             `json:"sourceListId"`
+	TargetListName   string                             `json:"targetListName"`
+	MinecraftVersion string                             `json:"minecraftVersion"`
+	ModLoader        string                             `json:"modLoader"`
+	NameConflict     bool                               `json:"nameConflict"`
+	Matched          []FavoriteCrossVersionCopyMatch    `json:"matched"`
+	Conflicts        []FavoriteCrossVersionCopyConflict `json:"conflicts"`
+	Errors           []string                           `json:"errors,omitempty"`
 }
 
-type FavoriteMigrationMatch struct {
+type FavoriteCrossVersionCopyMatch struct {
 	Source  storage.FavoriteModEntry `json:"source"`
 	Target  storage.FavoriteMod      `json:"target"`
 	Project models.ModProject        `json:"project"`
 	Version models.ModVersion        `json:"version"`
 }
 
-type FavoriteMigrationConflict struct {
+type FavoriteCrossVersionCopyConflict struct {
 	Source storage.FavoriteModEntry `json:"source"`
 	Reason string                   `json:"reason"`
 }
 
-type FavoriteMigrationApplyResult struct {
-	Applied bool                        `json:"applied"`
-	Preview FavoriteMigrationPreview    `json:"preview"`
-	Result  FavoriteBulkOperationResult `json:"result"`
+type FavoriteCrossVersionCopyApplyResult struct {
+	Applied    bool                            `json:"applied"`
+	TargetList storage.FavoriteList            `json:"targetList"`
+	Preview    FavoriteCrossVersionCopyPreview `json:"preview"`
+	Result     FavoriteBulkOperationResult     `json:"result"`
 }
 
 type InstallWaitResult struct {
