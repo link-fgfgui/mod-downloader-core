@@ -323,7 +323,7 @@ func RetryDownload(ctx context.Context, id string, events ...Events) bool {
 	return true
 }
 
-func RemoveCanceledDownload(id string, events ...Events) bool {
+func RemoveDownload(id string, events ...Events) bool {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return false
@@ -331,21 +331,33 @@ func RemoveCanceledDownload(id string, events ...Events) bool {
 	eventSink := firstEvents(events)
 
 	downloadQueue.Lock()
-	index := -1
+	removed := false
 	for i, item := range downloadQueue.retryable {
-		if item.Job.ID == id && item.Status == "canceled" {
-			index = i
+		if item.Job.ID != id || (item.Status != "canceled" && item.Status != "failed") {
+			continue
+		}
+		downloadQueue.retryable = append(downloadQueue.retryable[:i], downloadQueue.retryable[i+1:]...)
+		removed = true
+		break
+	}
+	if !removed {
+		for i, job := range downloadQueue.pending {
+			if job.ID != id {
+				continue
+			}
+			downloadQueue.pending = append(downloadQueue.pending[:i], downloadQueue.pending[i+1:]...)
+			removed = true
 			break
 		}
 	}
-	if index < 0 {
-		downloadQueue.Unlock()
-		return false
+	if removed {
+		delete(downloadQueue.progress, id)
 	}
-	downloadQueue.retryable = append(downloadQueue.retryable[:index], downloadQueue.retryable[index+1:]...)
-	delete(downloadQueue.progress, id)
 	downloadQueue.Unlock()
 
+	if !removed {
+		return false
+	}
 	emitDownloadQueueState(eventSink)
 	return true
 }
