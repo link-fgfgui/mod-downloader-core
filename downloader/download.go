@@ -1304,7 +1304,7 @@ func upsertDownloadedMod(path string, job downloadJob) {
 		}
 	}
 	mods = modbridge.ApplyPlatformMetadataToModInfos(mods, job.Result, job.Version)
-	global.SetJarMetadata(sha1, mods)
+	global.SetJarMetadata(sha1, "loader:"+strings.ToLower(strings.TrimSpace(job.ModLoader)), mods)
 
 	relPath := path
 	if mcDir := global.GetMinecraftDir(); mcDir != "" {

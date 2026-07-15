@@ -13,16 +13,20 @@ var (
 	jarCache   = make(map[string][]structs.ModInfo)
 )
 
-// GetJarMetadata returns cached JAR mod metadata for the given file SHA1.
+func jarMetadataKey(sha1, scope string) string {
+	return strings.TrimSpace(sha1) + "\x00" + strings.ToLower(strings.TrimSpace(scope))
+}
+
+// GetJarMetadata returns cached JAR mod metadata for the given file SHA1 and parsing scope.
 // This is a purely in-memory cache for local JAR metadata (not persisted across sessions).
-func GetJarMetadata(sha1 string) ([]structs.ModInfo, bool) {
+func GetJarMetadata(sha1, scope string) ([]structs.ModInfo, bool) {
 	sha1 = strings.TrimSpace(sha1)
 	if sha1 == "" {
 		return nil, false
 	}
 	jarCacheMu.RLock()
 	defer jarCacheMu.RUnlock()
-	mods, ok := jarCache[sha1]
+	mods, ok := jarCache[jarMetadataKey(sha1, scope)]
 	if !ok || len(mods) == 0 {
 		return nil, false
 	}
@@ -31,9 +35,9 @@ func GetJarMetadata(sha1 string) ([]structs.ModInfo, bool) {
 	return out, true
 }
 
-// SetJarMetadata stores parsed JAR mod metadata for the given file SHA1.
+// SetJarMetadata stores parsed JAR mod metadata for the given file SHA1 and parsing scope.
 // This is a purely in-memory cache for local JAR metadata (not persisted across sessions).
-func SetJarMetadata(sha1 string, mods []structs.ModInfo) {
+func SetJarMetadata(sha1, scope string, mods []structs.ModInfo) {
 	sha1 = strings.TrimSpace(sha1)
 	if sha1 == "" || len(mods) == 0 {
 		return
@@ -61,8 +65,8 @@ func SetJarMetadata(sha1 string, mods []structs.ModInfo) {
 	defer jarCacheMu.Unlock()
 	out := make([]structs.ModInfo, len(filtered))
 	copy(out, filtered)
-	jarCache[sha1] = out
-	logging.Debug("jar metadata set in memory cache", "sha1", sha1, "modCount", len(filtered))
+	jarCache[jarMetadataKey(sha1, scope)] = out
+	logging.Debug("jar metadata set in memory cache", "sha1", sha1, "scope", scope, "modCount", len(filtered))
 }
 
 // ClearJarMetadata clears all in-memory JAR metadata cache.

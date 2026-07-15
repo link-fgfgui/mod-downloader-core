@@ -12,6 +12,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/link-fgfgui/mod-downloader-core/global"
 	structs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
 
@@ -331,6 +332,61 @@ modId="forgeonly"
 	got := modIDs(ParseModZipReader(testZipReader(t, jar), "forge-only.jar", "neoforge"))
 	if len(got) != 0 {
 		t.Fatalf("ParseModZipReader() ids = %#v, want none", got)
+	}
+}
+
+func TestParseLocalModZipReaderMergesLoadersForSameModID(t *testing.T) {
+	jar := testJar(t, map[string][]byte{
+		"fabric.mod.json": []byte(`{
+			"schemaVersion": 1,
+			"id": "example",
+			"name": "Fabric Name",
+			"version": "fabric-version"
+		}`),
+		"META-INF/neoforge.mods.toml": []byte(`
+license="MIT"
+
+[[mods]]
+modId="example"
+displayName="NeoForge Name"
+version="neoforge-version"
+`),
+	})
+
+	got := ParseLocalModZipReader(testZipReader(t, jar), "multi-loader.jar", "neoforge")
+	if len(got) != 1 {
+		t.Fatalf("ParseLocalModZipReader() returned %d mods, want 1: %#v", len(got), got)
+	}
+	if got[0].Name != "NeoForge Name" || got[0].Version != "neoforge-version" {
+		t.Fatalf("preferred metadata = %#v, want NeoForge values", got[0])
+	}
+	if want := []string{"neoforge", "fabric"}; !reflect.DeepEqual(got[0].Loaders, want) {
+		t.Fatalf("loaders = %#v, want %#v", got[0].Loaders, want)
+	}
+}
+
+func TestJarMetadataCacheSeparatesRequestedAndLocalParserScopes(t *testing.T) {
+	global.ClearJarMetadata()
+	t.Cleanup(global.ClearJarMetadata)
+
+	jar := testJar(t, map[string][]byte{
+		"fabric.mod.json":    []byte(`{"schemaVersion":1,"id":"fabricmod","version":"1.0.0"}`),
+		"META-INF/mods.toml": []byte("license=\"MIT\"\n[[mods]]\nmodId=\"forgemod\"\n"),
+	})
+	path := filepath.Join(t.TempDir(), "scoped.jar")
+	if err := os.WriteFile(path, jar, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sha := FileSHA1(path)
+
+	if got := modIDs(ParseModJarWithSHA1(path, sha, "forge")); !reflect.DeepEqual(got, []string{"forgemod"}) {
+		t.Fatalf("forge parse ids = %#v, want forge only", got)
+	}
+	local := ParseLocalModJarWithSHA1(path, sha, "forge")
+	got := modIDs(local)
+	want := []string{"forgemod", "fabricmod"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("local parse ids = %#v, want %#v", got, want)
 	}
 }
 

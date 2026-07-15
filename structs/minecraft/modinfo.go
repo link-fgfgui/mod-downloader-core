@@ -29,6 +29,7 @@ type ModInfo struct {
 	OnlineMetadataLoading bool                 `json:"onlineMetadataLoading,omitempty"`
 	IconURL               string               `json:"iconUrl,omitempty"`
 	Categories            []string             `json:"categories,omitempty"`
+	Loaders               []string             `json:"loaders,omitempty"`
 	Enabled               bool                 `json:"enabled"`
 	JijMods               []JijModInfo         `json:"jijMods,omitempty"`
 	Dependencies          []LocalModDependency `json:"dependencies,omitempty"`

@@ -16,9 +16,12 @@ type MinecraftVersion struct {
 
 // VersionInfo is a simplified structure returned to the frontend
 type VersionInfo struct {
-	Name             string    `json:"name"`
-	ID               string    `json:"id"`
-	MinecraftVersion string    `json:"minecraftVersion"`
-	ModLoader        string    `json:"modLoader"`
-	Mods             []ModInfo `json:"mods,omitempty"`
+	Name               string    `json:"name"`
+	ID                 string    `json:"id"`
+	MinecraftVersion   string    `json:"minecraftVersion"`
+	ModLoader          string    `json:"modLoader"`
+	ActualModLoader    string    `json:"actualModLoader,omitempty"`
+	ConnectorAvailable bool      `json:"connectorAvailable,omitempty"`
+	ConnectorVirtual   bool      `json:"connectorVirtual,omitempty"`
+	Mods               []ModInfo `json:"mods,omitempty"`
 }

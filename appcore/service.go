@@ -1088,6 +1088,7 @@ func (s *Service) SelectVersion(versionKey string) (structs.VersionInfo, error) 
 	}
 
 	if version, ok := global.GetVersionByKey(versionKey); ok {
+		version = resetConnectorVersion(version)
 		if !ValidMinecraftInstance(version) {
 			return structs.VersionInfo{}, errors.New("invalid minecraft version or mod loader")
 		}
@@ -1173,7 +1174,7 @@ func (s *Service) refreshChangedLocalMods(ops []localModFileOperation) structs.V
 			continue
 		}
 		if strings.HasSuffix(op.target, ".jar") {
-			minecraft.ScanModFile(op.target, instanceID, selected.MinecraftVersion, selected.ModLoader, mcDir)
+			minecraft.ScanModFile(op.target, instanceID, selected.MinecraftVersion, selected.ActualModLoader, mcDir)
 		}
 	}
 	mods := make([]structs.ModInfo, 0, len(selected.Mods))
@@ -1190,12 +1191,13 @@ func (s *Service) refreshChangedLocalMods(ops []localModFileOperation) structs.V
 		if op.action == LocalModBatchActionDelete || !strings.HasSuffix(op.target, ".jar") {
 			continue
 		}
-		fresh := minecraft.ScanModFile(op.target, instanceID, selected.MinecraftVersion, selected.ModLoader, mcDir)
+		fresh := minecraft.ScanModFile(op.target, instanceID, selected.MinecraftVersion, selected.ActualModLoader, mcDir)
 		mods = append(mods, fresh...)
 	}
 	enriched, missing := enrichModMetadata(mods)
 	setOnlineMetadataLoading(enriched, missing, true)
 	selected.Mods = enriched
+	selected = reconcileConnectorVersion(selected)
 	global.SetSelectedVersion(selected)
 	s.emit(EventSelectedVersionChanged, selected)
 	s.resolveMissingModMetadata(selected, missing)
@@ -1230,12 +1232,13 @@ func (s *Service) refreshChangedPaths(paths []string) {
 	}
 	for _, path := range paths {
 		if strings.HasSuffix(strings.ToLower(path), ".jar") {
-			mods = append(mods, minecraft.ScanModFile(path, instanceID, selected.MinecraftVersion, selected.ModLoader, mcDir)...)
+			mods = append(mods, minecraft.ScanModFile(path, instanceID, selected.MinecraftVersion, selected.ActualModLoader, mcDir)...)
 		}
 	}
 	enriched, missing := enrichModMetadata(mods)
 	setOnlineMetadataLoading(enriched, missing, true)
 	selected.Mods = enriched
+	selected = reconcileConnectorVersion(selected)
 	global.SetSelectedVersion(selected)
 	s.emit(EventSelectedVersionChanged, selected)
 	s.resolveMissingModMetadata(selected, missing)
@@ -1454,6 +1457,9 @@ func (s *Service) LoadVersionsFromDisk(mcDir string) []structs.VersionInfo {
 	}
 
 	infos := minecraft.LoadLauncherVersions(mcDir, loadMinecraftDirVersions)
+	for i := range infos {
+		infos[i] = resetConnectorVersion(infos[i])
+	}
 	global.SetVersionsForDir(mcDir, infos)
 	ensureSelectedVersion(infos)
 	generation := global.HardlinkIndexGeneration()
@@ -1732,14 +1738,15 @@ func ValidMinecraftInstance(version structs.VersionInfo) bool {
 }
 
 func ScanVersionMods(version structs.VersionInfo, mcDir string) structs.VersionInfo {
+	version = initializeActualModLoader(version)
 	versionDirName := versionInstanceDir(version)
 	if strings.TrimSpace(mcDir) == "" || strings.TrimSpace(versionDirName) == "" {
 		version.Mods = nil
-		return version
+		return reconcileConnectorVersion(version)
 	}
 	versionDir := minecraft.VersionDirPath(mcDir, version)
-	version.Mods = minecraft.ScanVersionMods(versionDir, versionDirName, version.MinecraftVersion, version.ModLoader, mcDir)
-	return version
+	version.Mods = minecraft.ScanVersionMods(versionDir, versionDirName, version.MinecraftVersion, version.ActualModLoader, mcDir)
+	return reconcileConnectorVersion(version)
 }
 
 func (s *Service) refreshAndSelectVersionMods(version structs.VersionInfo, mcDir string) structs.VersionInfo {

@@ -482,7 +482,7 @@ func ScanModsDir(modsDir string, instanceID string, minecraftVersion string, mod
 		jarPath := filepath.Join(modsDir, entry.Name())
 		hash, fingerprint := FileHashes(jarPath)
 		global.HardlinkIndexAdd(hash, jarPath)
-		mods := ParseModJarWithSHA1(jarPath, hash, modLoader)
+		mods := ParseLocalModJarWithSHA1(jarPath, hash, modLoader)
 		enabled := isJarEnabled(entry.Name())
 		baseName := StripJarSuffix(entry.Name())
 
@@ -517,7 +517,7 @@ func ScanModFile(jarPath, instanceID, minecraftVersion, modLoader, pathRoot stri
 	}
 	hash, fingerprint := FileHashes(jarPath)
 	global.HardlinkIndexAdd(hash, jarPath)
-	mods := ParseModJarWithSHA1(jarPath, hash, modLoader)
+	mods := ParseLocalModJarWithSHA1(jarPath, hash, modLoader)
 	if len(mods) == 0 {
 		return nil
 	}
@@ -541,7 +541,8 @@ func parseModJar(jarPath string, modLoader string) []structs.ModInfo {
 }
 
 func ParseModJarWithSHA1(jarPath string, sha1 string, modLoader string) []structs.ModInfo {
-	if mods, ok := global.GetJarMetadata(sha1); ok {
+	scope := "loader:" + normalizeModLoader(modLoader)
+	if mods, ok := global.GetJarMetadata(sha1, scope); ok {
 		return mods
 	}
 
@@ -553,7 +554,26 @@ func ParseModJarWithSHA1(jarPath string, sha1 string, modLoader string) []struct
 
 	mods := ParseModZipReader(&r.Reader, filepath.Base(jarPath), modLoader)
 	if len(mods) > 0 {
-		global.SetJarMetadata(sha1, mods)
+		global.SetJarMetadata(sha1, scope, mods)
+	}
+	return mods
+}
+
+func ParseLocalModJarWithSHA1(jarPath string, sha1 string, preferredLoader string) []structs.ModInfo {
+	scope := "local:" + normalizeModLoader(preferredLoader)
+	if mods, ok := global.GetJarMetadata(sha1, scope); ok {
+		return mods
+	}
+
+	r, err := zip.OpenReader(jarPath)
+	if err != nil {
+		return nil
+	}
+	defer r.Close()
+
+	mods := ParseLocalModZipReader(&r.Reader, filepath.Base(jarPath), preferredLoader)
+	if len(mods) > 0 {
+		global.SetJarMetadata(sha1, scope, mods)
 	}
 	return mods
 }
@@ -566,9 +586,19 @@ func ParseModZipReader(r *zip.Reader, sourceName string, modLoader string) []str
 	return uniqueModsByID(ctx.parseZipReader(r, sourceName, 0))
 }
 
+func ParseLocalModZipReader(r *zip.Reader, sourceName string, preferredLoader string) []structs.ModInfo {
+	ctx := modJarParseContext{
+		modLoader:  normalizeModLoader(preferredLoader),
+		allLoaders: true,
+		visited:    make(map[[32]byte]struct{}),
+	}
+	return uniqueModsByID(ctx.parseZipReader(r, sourceName, 0))
+}
+
 type modJarParseContext struct {
-	modLoader string
-	visited   map[[32]byte]struct{}
+	modLoader  string
+	allLoaders bool
+	visited    map[[32]byte]struct{}
 }
 
 func (ctx modJarParseContext) parseZipReader(r *zip.Reader, sourceName string, depth int) []structs.ModInfo {
@@ -605,6 +635,9 @@ func (ctx modJarParseContext) parseDeclaredMetadata(r *zip.Reader, sourceName st
 			logging.Warn("parse mod metadata failed", "sourceName", sourceName, "parser", parser.Name(), "error", err)
 			continue
 		}
+		for i := range metadata.Mods {
+			metadata.Mods[i].Loaders = appendUniqueLoader(metadata.Mods[i].Loaders, parser.Name())
+		}
 		out.Mods = append(out.Mods, metadata.Mods...)
 		out.NestedJars = append(out.NestedJars, metadata.NestedJars...)
 		if parser.Name() == loaderForge || parser.Name() == loaderNeoForge {
@@ -620,6 +653,23 @@ func (ctx modJarParseContext) parseDeclaredMetadata(r *zip.Reader, sourceName st
 }
 
 func (ctx modJarParseContext) parsers() []ModMetadataParser {
+	if ctx.allLoaders {
+		parsers := make([]ModMetadataParser, 0, len(modMetadataParsers))
+		if ctx.modLoader != "" {
+			for _, parser := range modMetadataParsers {
+				if parser.Name() == ctx.modLoader {
+					parsers = append(parsers, parser)
+					break
+				}
+			}
+		}
+		for _, parser := range modMetadataParsers {
+			if parser.Name() != ctx.modLoader {
+				parsers = append(parsers, parser)
+			}
+		}
+		return parsers
+	}
 	if ctx.modLoader == "" {
 		return modMetadataParsers
 	}
@@ -735,7 +785,7 @@ func uniqueNestedJarPaths(paths []string) []string {
 }
 
 func uniqueModsByID(mods []structs.ModInfo) []structs.ModInfo {
-	seen := make(map[string]struct{}, len(mods))
+	indexes := make(map[string]int, len(mods))
 	out := make([]structs.ModInfo, 0, len(mods))
 	for _, mod := range mods {
 		mod.ID = declaredModID(mod.ID)
@@ -743,13 +793,38 @@ func uniqueModsByID(mods []structs.ModInfo) []structs.ModInfo {
 			continue
 		}
 		key := strings.ToLower(mod.ID)
-		if _, ok := seen[key]; ok {
+		if index, ok := indexes[key]; ok {
+			for _, loader := range mod.Loaders {
+				out[index].Loaders = appendUniqueLoader(out[index].Loaders, loader)
+			}
 			continue
 		}
-		seen[key] = struct{}{}
+		indexes[key] = len(out)
+		mod.Loaders = uniqueLoaders(mod.Loaders)
 		out = append(out, mod)
 	}
 	return out
+}
+
+func appendUniqueLoader(loaders []string, loader string) []string {
+	loader = normalizeModLoader(loader)
+	if loader == "" {
+		return loaders
+	}
+	for _, existing := range loaders {
+		if normalizeModLoader(existing) == loader {
+			return loaders
+		}
+	}
+	return append(loaders, loader)
+}
+
+func uniqueLoaders(loaders []string) []string {
+	result := make([]string, 0, len(loaders))
+	for _, loader := range loaders {
+		result = appendUniqueLoader(result, loader)
+	}
+	return result
 }
 
 func uniqueJijModsByID(mods []structs.JijModInfo) []structs.JijModInfo {

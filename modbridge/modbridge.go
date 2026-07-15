@@ -867,7 +867,11 @@ func ensureInstanceModsScanned(selected mcstructs.VersionInfo) {
 	if versionDir == "" {
 		return
 	}
-	minecraft.ScanVersionMods(versionDir, instanceID, selected.MinecraftVersion, selected.ModLoader, mcDir)
+	modLoader := selected.ActualModLoader
+	if strings.TrimSpace(modLoader) == "" {
+		modLoader = selected.ModLoader
+	}
+	minecraft.ScanVersionMods(versionDir, instanceID, selected.MinecraftVersion, modLoader, mcDir)
 }
 
 func ensureTargetModsScanned(targetDir, instanceID, minecraftVersion, modLoader string) {
