@@ -979,6 +979,10 @@ func (s *Service) RetryDownload(id string) bool {
 	return downloader.RetryDownload(s.ctx, id, s.downloadEvents())
 }
 
+func (s *Service) RemoveDownload(id string) bool {
+	return downloader.RemoveDownload(id, s.downloadEvents())
+}
+
 func (s *Service) DismissOptionalDependencyReminder(id string) bool {
 	return downloader.DismissOptionalDependencyReminder(id, s.downloadEvents())
 }

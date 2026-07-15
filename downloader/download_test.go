@@ -641,6 +641,116 @@ func TestRetryDownloadRequeuesRetryableItemWithFreshID(t *testing.T) {
 	}
 }
 
+func TestRemoveDownloadRemovesFailedAndCanceledRetryableItems(t *testing.T) {
+	for _, status := range []string{"failed", "canceled"} {
+		t.Run(status, func(t *testing.T) {
+			resetDownloadQueueForTest(t)
+			downloadQueue.Lock()
+			downloadQueue.retryable = []retryableDownloadJob{
+				{Status: status, Job: downloadJob{ID: "download-target"}},
+				{Status: "failed", Job: downloadJob{ID: "download-other"}},
+			}
+			downloadQueue.progress = map[string]downloadProgress{
+				"download-target": {BytesComplete: 10, TotalBytes: 20},
+			}
+			downloadQueue.Unlock()
+
+			eventCount := 0
+			var emitted appstructs.DownloadQueueState
+			if !RemoveDownload(" download-target ", Events{OnQueueState: func(state appstructs.DownloadQueueState) {
+				eventCount++
+				emitted = state
+			}}) {
+				t.Fatal("RemoveDownload() = false, want true")
+			}
+			if eventCount != 1 {
+				t.Fatalf("queue event count = %d, want 1", eventCount)
+			}
+			if len(emitted.Items) != 1 || emitted.Items[0].ID != "download-other" {
+				t.Fatalf("emitted items = %#v", emitted.Items)
+			}
+			downloadQueue.Lock()
+			_, progressExists := downloadQueue.progress["download-target"]
+			downloadQueue.Unlock()
+			if progressExists {
+				t.Fatal("removed retryable item retained progress")
+			}
+		})
+	}
+}
+
+func TestRemoveDownloadRemovesPendingWithoutCreatingCanceledHistory(t *testing.T) {
+	resetDownloadQueueForTest(t)
+	downloadQueue.Lock()
+	downloadQueue.pending = []downloadJob{{ID: "download-target"}, {ID: "download-other"}}
+	downloadQueue.retryable = []retryableDownloadJob{{Status: "failed", Job: downloadJob{ID: "download-failed"}}}
+	downloadQueue.progress = map[string]downloadProgress{"download-target": {BytesComplete: 10}}
+	downloadQueue.Unlock()
+
+	eventCount := 0
+	var emitted appstructs.DownloadQueueState
+	if !RemoveDownload("download-target", Events{OnQueueState: func(state appstructs.DownloadQueueState) {
+		eventCount++
+		emitted = state
+	}}) {
+		t.Fatal("RemoveDownload() = false, want true")
+	}
+	if eventCount != 1 {
+		t.Fatalf("queue event count = %d, want 1", eventCount)
+	}
+	if emitted.Pending != 1 || len(emitted.Items) != 2 {
+		t.Fatalf("emitted state = %#v", emitted)
+	}
+	if emitted.Items[0].ID != "download-other" || emitted.Items[0].Status != "pending" || emitted.Items[1].ID != "download-failed" {
+		t.Fatalf("emitted items = %#v", emitted.Items)
+	}
+	downloadQueue.Lock()
+	_, progressExists := downloadQueue.progress["download-target"]
+	downloadQueue.Unlock()
+	if progressExists {
+		t.Fatal("removed pending item retained progress")
+	}
+}
+
+func TestRemoveDownloadRejectsInvalidOrRunningItems(t *testing.T) {
+	tests := []struct {
+		name string
+		id   string
+	}{
+		{name: "empty", id: "  "},
+		{name: "missing", id: "download-missing"},
+		{name: "unsupported retryable status", id: "download-paused"},
+		{name: "running", id: "download-running"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetDownloadQueueForTest(t)
+			downloadQueue.Lock()
+			downloadQueue.retryable = []retryableDownloadJob{{
+				Status: "paused",
+				Job:    downloadJob{ID: "download-paused"},
+			}}
+			downloadQueue.current = map[string]downloadJob{"download-running": {ID: "download-running"}}
+			downloadQueue.Unlock()
+
+			eventCount := 0
+			if RemoveDownload(tt.id, Events{OnQueueState: func(appstructs.DownloadQueueState) {
+				eventCount++
+			}}) {
+				t.Fatal("RemoveDownload() = true, want false")
+			}
+			if eventCount != 0 {
+				t.Fatalf("queue event count = %d, want 0", eventCount)
+			}
+			state := GetDownloadQueueState()
+			if len(state.Items) != 2 {
+				t.Fatalf("item count = %d, want 2", len(state.Items))
+			}
+		})
+	}
+}
+
 func TestRunningDownloadIsRetryableAndMarksRestartRequest(t *testing.T) {
 	resetDownloadQueueForTest(t)
 	canceled := false

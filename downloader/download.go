@@ -323,6 +323,45 @@ func RetryDownload(ctx context.Context, id string, events ...Events) bool {
 	return true
 }
 
+func RemoveDownload(id string, events ...Events) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	eventSink := firstEvents(events)
+
+	downloadQueue.Lock()
+	removed := false
+	for i, item := range downloadQueue.retryable {
+		if item.Job.ID != id || (item.Status != "canceled" && item.Status != "failed") {
+			continue
+		}
+		downloadQueue.retryable = append(downloadQueue.retryable[:i], downloadQueue.retryable[i+1:]...)
+		removed = true
+		break
+	}
+	if !removed {
+		for i, job := range downloadQueue.pending {
+			if job.ID != id {
+				continue
+			}
+			downloadQueue.pending = append(downloadQueue.pending[:i], downloadQueue.pending[i+1:]...)
+			removed = true
+			break
+		}
+	}
+	if removed {
+		delete(downloadQueue.progress, id)
+	}
+	downloadQueue.Unlock()
+
+	if !removed {
+		return false
+	}
+	emitDownloadQueueState(eventSink)
+	return true
+}
+
 func DismissOptionalDependencyReminder(id string, events ...Events) bool {
 	id = strings.TrimSpace(id)
 	if id == "" {
