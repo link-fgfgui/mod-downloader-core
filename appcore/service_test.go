@@ -912,6 +912,74 @@ func TestSaveMCIMSettingsPersistsAndReconfiguresProviders(t *testing.T) {
 	}
 }
 
+func TestDefaultCurseforgeAPIKeyFallback(t *testing.T) {
+	prevDefault := configs.DefaultCurseforgeAPIKey
+	t.Cleanup(func() {
+		configs.DefaultCurseforgeAPIKey = prevDefault
+		global.SetCurseForgeClient(nil)
+		global.SetModrinthClient(nil)
+	})
+	configs.DefaultCurseforgeAPIKey = "compiled-default-key"
+
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	appDir := t.TempDir()
+	if err := os.Chdir(appDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// Empty user config falls back to compiled default for settings and providers.
+	svc := New(Options{Config: &configs.Config{}})
+	svc.configureProviderClients()
+	sv := svc.GetSettings()
+	if !sv.HasCurseforgeKey {
+		t.Fatal("HasCurseforgeKey = false with compiled default, want true")
+	}
+	if sv.CurseforgeKeyMask != MaskKey("compiled-default-key") {
+		t.Fatalf("CurseforgeKeyMask = %q, want masked default", sv.CurseforgeKeyMask)
+	}
+	if global.GetCurseForgeClient() == nil {
+		t.Fatal("CurseForge client is nil with compiled default")
+	}
+	if got := svc.Config().Keys.CurseforgeApiKey; got != "" {
+		t.Fatalf("configured key = %q, want empty (default must not be written into config)", got)
+	}
+
+	// Explicit user key wins over compiled default.
+	svc.config.Keys.CurseforgeApiKey = "user-override-key"
+	svc.configureProviderClients()
+	sv = svc.GetSettings()
+	if sv.CurseforgeKeyMask != MaskKey("user-override-key") {
+		t.Fatalf("CurseforgeKeyMask = %q, want user mask", sv.CurseforgeKeyMask)
+	}
+
+	// Clear stores empty config and falls back to default again; default is not persisted.
+	sv = svc.SaveApiKeys(SaveApiKeysRequest{CurseforgeApiKey: ""})
+	if svc.Config().Keys.CurseforgeApiKey != "" {
+		t.Fatalf("configured key after clear = %q, want empty", svc.Config().Keys.CurseforgeApiKey)
+	}
+	if !sv.HasCurseforgeKey {
+		t.Fatal("HasCurseforgeKey = false after clear with default, want true")
+	}
+	if sv.CurseforgeKeyMask != MaskKey("compiled-default-key") {
+		t.Fatalf("CurseforgeKeyMask after clear = %q, want default mask", sv.CurseforgeKeyMask)
+	}
+	loaded, err := configs.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Keys.CurseforgeApiKey != "" {
+		t.Fatalf("persisted key = %q, want empty (must not write default into toml)", loaded.Keys.CurseforgeApiKey)
+	}
+}
+
 func TestSaveNetworkSettingsClampsAndPersists(t *testing.T) {
 	previousConfigure := configureRemoteModIDConcurrency
 	configured := make(chan int, 1)
