@@ -380,7 +380,7 @@ func TestNetworkConfigClampsOutOfRangeValues(t *testing.T) {
 		},
 		{
 			name:                "above maximum clamps",
-			config:              Config{Downloads: DownloadConfig{FileConcurrency: 100, ConcurrentDownloads: 100}, API: APIConfig{RequestsPerSecond: 101}},
+			config:              Config{Downloads: DownloadConfig{FileConcurrency: 100, ConcurrentDownloads: MaxConcurrentDownloads + 1}, API: APIConfig{RequestsPerSecond: 101}},
 			wantFileConcurrency: MaxFileConcurrency,
 			wantDownloads:       MaxConcurrentDownloads,
 			wantRPS:             MaxRequestsPerSecond,
