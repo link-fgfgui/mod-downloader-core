@@ -974,4 +974,22 @@ func TestSaveNetworkSettingsClampsAndPersists(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("remote mod ID concurrency was not configured after saving network settings")
 	}
+
+	view = svc.SaveNetworkSettings(SaveNetworkSettingsRequest{
+		FileConcurrency:         configs.DefaultFileConcurrency,
+		ConcurrentDownloads:     configs.DefaultConcurrentDownloads,
+		AdaptiveFileConcurrency: true,
+		TargetDownloadRateMiB:   1.1,
+		VerifySHA1:              true,
+	})
+	if view.TargetDownloadRateMiB != 1.1 {
+		t.Fatalf("decimal target download rate in settings view = %v, want 1.1", view.TargetDownloadRateMiB)
+	}
+	loaded, err = configs.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Downloads.TargetDownloadRateMiB != 1.1 {
+		t.Fatalf("persisted decimal target download rate = %v, want 1.1", loaded.Downloads.TargetDownloadRateMiB)
+	}
 }
