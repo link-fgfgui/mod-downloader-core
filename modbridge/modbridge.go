@@ -656,9 +656,10 @@ func VersionModIDs(version models.ModVersion, modLoader string) []string {
 		}
 	}
 
-	modIDs, err := cachedRemoteModIDs(version.DownloadURL, modLoader)
+	downloadURL := providers.EffectiveDownloadURL(version)
+	modIDs, err := cachedRemoteModIDs(downloadURL, modLoader)
 	if err != nil {
-		logging.Warn("remote jar parse failed for version mod IDs", "downloadURL", version.DownloadURL, "error", err)
+		logging.Warn("remote jar parse failed for version mod IDs", "downloadURL", downloadURL, "error", err)
 		return nil
 	}
 
@@ -753,10 +754,11 @@ func remoteModIDBackfillSuppressed(downloadURL, modLoader string) bool {
 }
 
 func remoteMetadataButtonStatus(version models.ModVersion, modLoader string) string {
-	if strings.TrimSpace(version.DownloadURL) == "" {
+	downloadURL := providers.EffectiveDownloadURL(version)
+	if strings.TrimSpace(downloadURL) == "" {
 		return BtnStatusMetadataFailed
 	}
-	key := remoteModIDCacheKey(version.DownloadURL, modLoader)
+	key := remoteModIDCacheKey(downloadURL, modLoader)
 	remoteModIDCache.Lock()
 	entry := remoteModIDCache.entries[key]
 	if entry != nil && !entry.loading && len(entry.modIDs) == 0 && time.Now().Before(entry.expiresAt) {

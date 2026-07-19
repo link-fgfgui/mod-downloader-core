@@ -768,6 +768,20 @@ func TestRemoteMetadataButtonStatusReflectsFailureTTL(t *testing.T) {
 	}
 }
 
+func TestRemoteMetadataButtonStatusUsesCurseForgeCDNFallback(t *testing.T) {
+	resetRemoteModIDCache()
+	t.Cleanup(resetRemoteModIDCache)
+
+	version := models.ModVersion{
+		Platform: "CurseForge",
+		ID:       "12345678",
+		FileName: "example.jar",
+	}
+	if got := remoteMetadataButtonStatus(version, "forge"); got != BtnStatusMetadataLoading {
+		t.Fatalf("fallback metadata status = %q, want %q", got, BtnStatusMetadataLoading)
+	}
+}
+
 func TestApplyButtonStatusStylesMetadataStatesAsRetryable(t *testing.T) {
 	for _, status := range []string{BtnStatusMetadataLoading, BtnStatusMetadataFailed} {
 		state := defaultDownloadButtonState(models.ModProject{})

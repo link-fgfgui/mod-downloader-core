@@ -26,6 +26,38 @@ func (fn providerRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, er
 	return fn(req)
 }
 
+func TestCurseForgeDownloadURL(t *testing.T) {
+	tests := []struct {
+		name string
+		id   string
+		file string
+		want string
+	}{
+		{name: "standard", id: "12345678", file: "example.jar", want: "https://edge.forgecdn.net/files/1234/5678/example.jar"},
+		{name: "escaped filename", id: "12345678", file: "example mod.jar", want: "https://edge.forgecdn.net/files/1234/5678/example%20mod.jar"},
+		{name: "invalid id", id: "12ab5678", file: "example.jar"},
+		{name: "short id", id: "1234", file: "example.jar"},
+		{name: "missing filename", id: "12345678"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CurseForgeDownloadURL(tt.id, tt.file); got != tt.want {
+				t.Fatalf("CurseForgeDownloadURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEffectiveDownloadURLPreservesProviderURL(t *testing.T) {
+	version := models.ModVersion{Platform: "CurseForge", DownloadURL: " https://cdn.example.test/mod.jar "}
+	if got := EffectiveDownloadURL(version); got != "https://cdn.example.test/mod.jar" {
+		t.Fatalf("EffectiveDownloadURL() = %q, want trimmed provider URL", got)
+	}
+	if got := EffectiveDownloadURL(models.ModVersion{Platform: "Modrinth", ID: "12345678", FileName: "mod.jar"}); got != "" {
+		t.Fatalf("EffectiveDownloadURL() for Modrinth = %q, want empty", got)
+	}
+}
+
 func TestResolveMetadataByLocalFilesFallsBackToCurseForgeFingerprint(t *testing.T) {
 	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)

@@ -195,7 +195,8 @@ func buildDownloadJob(req appstructs.ModDownloadRequest, curseForgeAPIKey string
 	if !ok {
 		return downloadJob{}, appstructs.ModDownloadResult{Skipped: true, Reason: "no matching version"}, false
 	}
-	if version.DownloadURL == "" {
+	version.DownloadURL = providers.EffectiveDownloadURL(version)
+	if strings.TrimSpace(version.DownloadURL) == "" {
 		return downloadJob{}, appstructs.ModDownloadResult{Skipped: true, Reason: "missing download url"}, false
 	}
 	if visited == nil {
