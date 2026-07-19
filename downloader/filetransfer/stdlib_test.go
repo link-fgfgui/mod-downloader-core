@@ -118,7 +118,7 @@ func TestStdlibBackendResumesLargeRangePartsInMD5TempDir(t *testing.T) {
 		ChunkSize:   32,
 		MemoryLimit: 16,
 	}
-	tempDir := rangedTempDir(request)
+	tempDir := rangedTempDir(request, int64(len(data)), int64(request.Concurrency))
 	if err := os.MkdirAll(tempDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -137,9 +137,67 @@ func TestStdlibBackendResumesLargeRangePartsInMD5TempDir(t *testing.T) {
 	if _, err := os.Stat(tempDir); !os.IsNotExist(err) {
 		t.Fatalf("temporary directory still exists: %v", err)
 	}
-	if !containsString(rangesSnapshot(ranges), "bytes=7-31") {
+	if !containsString(rangesSnapshot(ranges), "bytes=7-63") {
 		t.Fatalf("range requests = %#v, want resumed first part", rangesSnapshot(ranges))
 	}
+}
+
+func TestRangesForSegmentsBalancesAndCoversFile(t *testing.T) {
+	tests := []struct {
+		name  string
+		size  int64
+		count int64
+		want  []byteRange
+	}{
+		{name: "uneven", size: 10, count: 3, want: []byteRange{{0, 0, 3}, {1, 4, 6}, {2, 7, 9}}},
+		{name: "small file", size: 2, count: 5, want: []byteRange{{0, 0, 0}, {1, 1, 1}}},
+		{name: "single", size: 7, count: 1, want: []byteRange{{0, 0, 6}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := rangesForSegments(tt.size, tt.count); !equalByteRanges(got, tt.want) {
+				t.Fatalf("ranges = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+	if got := rangesForSegments(0, 3); got != nil {
+		t.Fatalf("zero-size ranges = %#v, want nil", got)
+	}
+	if got := rangesForSegments(10, 0); got != nil {
+		t.Fatalf("zero-count ranges = %#v, want nil", got)
+	}
+}
+
+func TestSegmentCountForRequestReservesAdaptivePool(t *testing.T) {
+	if got := segmentCountForRequest(Request{Concurrency: 3}); got != 3 {
+		t.Fatalf("non-adaptive segment count = %d, want 3", got)
+	}
+	if got := segmentCountForRequest(Request{Concurrency: 3, AdaptiveConcurrency: true}); got != 12 {
+		t.Fatalf("adaptive segment count = %d, want 12", got)
+	}
+}
+
+func TestRangedTempDirIncludesDynamicLayout(t *testing.T) {
+	request := Request{URL: "https://example.test/file", Destination: "/tmp/file", TempDir: t.TempDir()}
+	base := rangedTempDir(request, 128, 2)
+	if got := rangedTempDir(request, 128, 4); got == base {
+		t.Fatal("segment-count change reused ranged temp directory")
+	}
+	if got := rangedTempDir(request, 256, 2); got == base {
+		t.Fatal("file-size change reused ranged temp directory")
+	}
+}
+
+func equalByteRanges(left, right []byteRange) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestStdlibBackendFallsBackToDirectDownloadWithoutRanges(t *testing.T) {

@@ -74,24 +74,45 @@ type byteRange struct {
 	end   int64
 }
 
-func rangesForSize(size, chunkSize int64) []byteRange {
-	if size <= 0 || chunkSize <= 0 {
+const adaptiveSegmentMultiplier int64 = 4
+
+func rangesForSegments(size, segmentCount int64) []byteRange {
+	if size <= 0 || segmentCount <= 0 {
 		return nil
 	}
-	count := int((size + chunkSize - 1) / chunkSize)
+	if segmentCount > size {
+		segmentCount = size
+	}
+	chunkSize := size / segmentCount
+	remainder := size % segmentCount
+	count := int(segmentCount)
 	ranges := make([]byteRange, 0, count)
-	for start, index := int64(0), 0; start < size; start, index = start+chunkSize, index+1 {
-		end := start + chunkSize - 1
-		if end >= size {
-			end = size - 1
+	start := int64(0)
+	for index := 0; index < count; index++ {
+		partSize := chunkSize
+		if int64(index) < remainder {
+			partSize++
 		}
+		end := start + partSize - 1
 		ranges = append(ranges, byteRange{index: index, start: start, end: end})
+		start = end + 1
 	}
 	return ranges
 }
 
+func segmentCountForRequest(req Request) int64 {
+	count := int64(req.Concurrency)
+	if count <= 0 {
+		count = DefaultConcurrency
+	}
+	if req.AdaptiveConcurrency && count <= (int64(^uint64(0)>>1))/adaptiveSegmentMultiplier {
+		count *= adaptiveSegmentMultiplier
+	}
+	return count
+}
+
 func (b *StdlibBackend) downloadRangesToMemory(ctx context.Context, req Request, size int64, tracker *ProgressTracker) error {
-	ranges := rangesForSize(size, req.ChunkSize)
+	ranges := rangesForSegments(size, segmentCountForRequest(req))
 	chunks := make([][]byte, len(ranges))
 	err := runRequestRanges(ctx, ranges, req, tracker, func(ctx context.Context, part byteRange) error {
 		var buffer bytes.Buffer
@@ -115,8 +136,9 @@ func (b *StdlibBackend) downloadRangesToMemory(ctx context.Context, req Request,
 }
 
 func (b *StdlibBackend) downloadRangesToTemp(ctx context.Context, req Request, size int64, tracker *ProgressTracker) error {
-	ranges := rangesForSize(size, req.ChunkSize)
-	tempDir := rangedTempDir(req)
+	segmentCount := segmentCountForRequest(req)
+	ranges := rangesForSegments(size, segmentCount)
+	tempDir := rangedTempDir(req, size, segmentCount)
 	if err := os.MkdirAll(tempDir, 0o755); err != nil {
 		return err
 	}
@@ -390,12 +412,13 @@ func writeAtomic(destination string, overwrite bool, write func(*os.File) error)
 	return os.Rename(partPath, destination)
 }
 
-func rangedTempDir(req Request) string {
+func rangedTempDir(req Request, size, segmentCount int64) string {
 	root := req.TempDir
 	if root == "" {
 		root = os.TempDir()
 	}
-	sum := md5.Sum([]byte(req.URL + "|" + req.Destination))
+	layoutIdentity := fmt.Sprintf("v2|%s|%s|%d|%d", req.URL, req.Destination, size, segmentCount)
+	sum := md5.Sum([]byte(layoutIdentity))
 	return filepath.Join(root, "mod-downloader", hex.EncodeToString(sum[:]))
 }
 

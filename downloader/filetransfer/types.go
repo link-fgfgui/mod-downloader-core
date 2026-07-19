@@ -21,11 +21,14 @@ const (
 )
 
 type Request struct {
-	URL                  string
-	Destination          string
-	Headers              map[string]string
-	TempDir              string
-	Concurrency          int
+	URL         string
+	Destination string
+	Headers     map[string]string
+	TempDir     string
+	Concurrency int
+
+	// ChunkSize is retained for API compatibility. Ranged downloads derive
+	// balanced chunk sizes from the remote size and segment count.
 	ChunkSize            int64
 	MemoryLimit          int64
 	AdaptiveConcurrency  bool
