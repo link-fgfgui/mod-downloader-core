@@ -56,6 +56,51 @@ var remoteModIDCache = struct {
 }{entries: make(map[string]*remoteModIDCacheEntry)}
 
 var simpleMode atomic.Bool
+var preferredReleaseType atomic.Int32
+
+func init() {
+	preferredReleaseType.Store(1)
+}
+
+func ConfigurePreferredReleaseType(value string) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "alpha":
+		preferredReleaseType.Store(3)
+	case "beta":
+		preferredReleaseType.Store(2)
+	default:
+		preferredReleaseType.Store(1)
+	}
+}
+
+func preferredReleaseTypeMatches(version models.ModVersion) bool {
+	typeID := preferredReleaseType.Load()
+	value := strings.ToLower(strings.TrimSpace(version.ReleaseType))
+	if value == "" {
+		return typeID == 1
+	}
+	switch typeID {
+	case 3:
+		return value == "alpha"
+	case 2:
+		return value == "beta"
+	default:
+		return value == "release"
+	}
+}
+
+func preferredVersions(versions []models.ModVersion) []models.ModVersion {
+	filtered := make([]models.ModVersion, 0, len(versions))
+	for _, version := range versions {
+		if preferredReleaseTypeMatches(version) {
+			filtered = append(filtered, version)
+		}
+	}
+	if len(filtered) == 0 {
+		return versions
+	}
+	return filtered
+}
 
 var errSimpleMode = errors.New("remote mod ID resolution disabled by simple mode")
 
@@ -165,7 +210,7 @@ func ResolveVersions(req appstructs.ModDownloadRequest) []models.ModVersion {
 	}
 
 	versions := providers.ListMatchingProjectVersions(req.Result, req.MinecraftVersion, req.ModLoader)
-	return versions
+	return preferredVersions(versions)
 }
 
 // FindVersionByID returns a version by its platform version ID from a list of versions.

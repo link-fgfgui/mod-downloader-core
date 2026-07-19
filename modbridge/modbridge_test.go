@@ -839,3 +839,23 @@ func TestMarkBackfillSkipsEmptyVersionID(t *testing.T) {
 		t.Fatalf("drainPendingBackfills() returned %d entries, want 0 for empty version ID", len(pending))
 	}
 }
+
+func TestPreferredVersionsUsesFallbackWhenPreferredTypeUnavailable(t *testing.T) {
+	versions := []models.ModVersion{
+		{ID: "stable", ReleaseType: "release"},
+		{ID: "beta", ReleaseType: "beta"},
+	}
+
+	ConfigurePreferredReleaseType("beta")
+	got := preferredVersions(versions)
+	if len(got) != 1 || got[0].ID != "beta" {
+		t.Fatalf("preferred beta versions = %#v, want beta only", got)
+	}
+
+	ConfigurePreferredReleaseType("alpha")
+	got = preferredVersions(versions)
+	if len(got) != len(versions) {
+		t.Fatalf("missing preferred alpha fallback = %#v, want all versions", got)
+	}
+	ConfigurePreferredReleaseType("release")
+}
