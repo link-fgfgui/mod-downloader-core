@@ -163,7 +163,7 @@ const (
 	DefaultAnimationMode               = AnimationModeVuetify
 	DefaultAnimationsEnabled           = true
 	DefaultAnimationDurationMultiplier = 1.0
-	MinAnimationDurationMultiplier     = 0.25
+	MinAnimationDurationMultiplier     = 0.1
 	MaxAnimationDurationMultiplier     = 3.0
 	DefaultAutoScanUnusedDependencies  = false
 	DefaultPreferredReleaseType        = "release"

@@ -253,8 +253,9 @@ func TestPreferencesAnimationDefaultsAndNormalization(t *testing.T) {
 	tests := map[float64]float64{
 		-1:   DefaultAnimationDurationMultiplier,
 		0:    DefaultAnimationDurationMultiplier,
+		0.05: MinAnimationDurationMultiplier,
 		0.1:  MinAnimationDurationMultiplier,
-		0.25: MinAnimationDurationMultiplier,
+		0.25: 0.25,
 		1.5:  1.5,
 		5:    MaxAnimationDurationMultiplier,
 	}
