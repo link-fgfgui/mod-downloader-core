@@ -99,28 +99,36 @@ func TestApplyLocalModBatchOperationDisableEnableInvertDelete(t *testing.T) {
 	enabled := filepath.Join(modsDir, "enabled.jar")
 	disabled := filepath.Join(modsDir, "disabled.jar.disabled")
 	removed := filepath.Join(modsDir, "remove.jar")
-	writeFile(t, enabled)
-	writeFile(t, disabled)
+	writeFabricJar(t, enabled)
+	writeFabricJar(t, disabled)
 	writeFile(t, removed)
 
 	svc := New(Options{})
-	if _, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
+	version, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
 		Action: LocalModBatchActionDisable,
 		Paths:  []string{filepath.ToSlash(filepath.Join("versions", "test", "mods", "enabled.jar"))},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	assertMissing(t, enabled)
 	assertExists(t, enabled+".disabled")
+	if len(version.Mods) != 1 || version.Mods[0].Path != filepath.Join("versions", "test", "mods", "enabled.jar.disabled") || version.Mods[0].Enabled {
+		t.Fatalf("disable response mods = %#v, want disabled mod snapshot", version.Mods)
+	}
 
-	if _, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
+	version, err = svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
 		Action: LocalModBatchActionEnable,
 		Paths:  []string{filepath.Join(root, "versions", "test", "mods", "enabled.jar.disabled")},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	assertExists(t, enabled)
 	assertMissing(t, enabled+".disabled")
+	if len(version.Mods) != 1 || version.Mods[0].Path != filepath.Join("versions", "test", "mods", "enabled.jar") || !version.Mods[0].Enabled {
+		t.Fatalf("enable response mods = %#v, want enabled mod snapshot", version.Mods)
+	}
 
 	if _, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
 		Action: LocalModBatchActionInvert,

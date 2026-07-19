@@ -1193,7 +1193,7 @@ func (s *Service) refreshChangedLocalMods(ops []localModFileOperation) structs.V
 		}
 	}
 	for _, op := range ops {
-		if op.action == LocalModBatchActionDelete || !strings.HasSuffix(op.target, ".jar") {
+		if op.action == LocalModBatchActionDelete || !isLocalModJarPath(op.target) {
 			continue
 		}
 		fresh := minecraft.ScanModFile(op.target, instanceID, selected.MinecraftVersion, selected.ActualModLoader, mcDir)
@@ -1236,7 +1236,7 @@ func (s *Service) refreshChangedPaths(paths []string) {
 		}
 	}
 	for _, path := range paths {
-		if strings.HasSuffix(strings.ToLower(path), ".jar") {
+		if isLocalModJarPath(path) {
 			mods = append(mods, minecraft.ScanModFile(path, instanceID, selected.MinecraftVersion, selected.ActualModLoader, mcDir)...)
 		}
 	}
