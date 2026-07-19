@@ -156,6 +156,7 @@ type Preferences struct {
 	AnimationDurationMultiplier float64       `toml:"animation_duration_multiplier" json:"animation_duration_multiplier" env:"ANIMATION_DURATION_MULTIPLIER"`
 	AutoScanUnusedDependencies  *bool         `toml:"auto_scan_unused_dependencies" json:"auto_scan_unused_dependencies"`
 	MCIMEnabled                 bool          `toml:"mcim_enabled" json:"mcim_enabled" env:"MCIM_ENABLED"`
+	PreferredReleaseType        string        `toml:"preferred_release_type" json:"preferred_release_type" env:"PREFERRED_RELEASE_TYPE"`
 }
 
 const (
@@ -165,6 +166,7 @@ const (
 	MinAnimationDurationMultiplier     = 0.25
 	MaxAnimationDurationMultiplier     = 3.0
 	DefaultAutoScanUnusedDependencies  = false
+	DefaultPreferredReleaseType        = "release"
 )
 
 func BoolPtr(value bool) *bool {
@@ -204,6 +206,15 @@ func (p Preferences) AutoScanUnusedDependenciesValue() bool {
 
 func (p Preferences) MCIMEnabledValue() bool {
 	return p.MCIMEnabled
+}
+
+func (p Preferences) PreferredReleaseTypeValue() string {
+	switch strings.ToLower(strings.TrimSpace(p.PreferredReleaseType)) {
+	case "alpha", "beta", "release":
+		return strings.ToLower(strings.TrimSpace(p.PreferredReleaseType))
+	default:
+		return DefaultPreferredReleaseType
+	}
 }
 
 func NormalizeAnimationDurationMultiplier(value float64) float64 {

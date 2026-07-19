@@ -88,6 +88,7 @@ func (s *Service) Startup(ctx context.Context) error {
 		VerifySHA1:              s.config.Downloads.VerifySHA1,
 	})
 	configureSimpleMode(s.config.Prefers.SimpleMode)
+	modbridge.ConfigurePreferredReleaseType(s.config.Prefers.PreferredReleaseTypeValue())
 	configureRemoteModIDConcurrency(s.config.Downloads.ConcurrentDownloadsValue())
 	if minecraftDir := minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir); strings.TrimSpace(minecraftDir) != "" {
 		s.config.Prefers.MinecraftDir = minecraftDir
@@ -705,6 +706,7 @@ func (s *Service) GetSettings() SettingsView {
 		AnimationEnabled:            configs.DefaultAnimationsEnabled,
 		AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
 		AutoScanUnusedDependencies:  configs.DefaultAutoScanUnusedDependencies,
+		PreferredReleaseType:        configs.DefaultPreferredReleaseType,
 		FileConcurrency:             configs.DefaultFileConcurrency,
 		ConcurrentDownloads:         configs.DefaultConcurrentDownloads,
 		TargetDownloadRateMiB:       configs.DefaultTargetDownloadRateMiB,
@@ -719,6 +721,7 @@ func (s *Service) GetSettings() SettingsView {
 		sv.AnimationDurationMultiplier = s.config.Prefers.NormalizedAnimationDurationMultiplier()
 		sv.AutoScanUnusedDependencies = s.config.Prefers.AutoScanUnusedDependenciesValue()
 		sv.MCIMEnabled = s.config.Prefers.MCIMEnabledValue()
+		sv.PreferredReleaseType = s.config.Prefers.PreferredReleaseTypeValue()
 		sv.FileConcurrency = s.config.Downloads.FileConcurrencyValue()
 		sv.ConcurrentDownloads = s.config.Downloads.ConcurrentDownloadsValue()
 		sv.AdaptiveFileConcurrency = s.config.Downloads.AdaptiveFileConcurrency
@@ -835,6 +838,19 @@ func (s *Service) SaveMCIMSettings(req SaveMCIMSettingsRequest) SettingsView {
 		TargetDownloadRateMiB:   s.config.Downloads.TargetDownloadRateMiBValue(),
 		VerifySHA1:              s.config.Downloads.VerifySHA1,
 	})
+	return s.GetSettings()
+}
+
+func (s *Service) SavePreferredReleaseTypeSettings(req SavePreferredReleaseTypeSettingsRequest) SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	value := configs.Preferences{PreferredReleaseType: req.PreferredReleaseType}.PreferredReleaseTypeValue()
+	s.config.Prefers.PreferredReleaseType = value
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save preferred release type setting failed", "preferredReleaseType", value, "error", err)
+	}
+	modbridge.ConfigurePreferredReleaseType(value)
 	return s.GetSettings()
 }
 
