@@ -952,6 +952,7 @@ func (p curseForgeProvider) fileToModVersion(file cfSchema.File) models.ModVersi
 		VersionID:    strconv.Itoa(int(file.ID)),
 		Name:         file.DisplayName,
 		Version:      file.DisplayName,
+		ReleaseType:  strings.ToLower(file.ReleaseType.String()),
 		FileName:     file.FileName,
 		FileSize:     file.FileLength,
 		DownloadURL:  file.DownloadURL,
@@ -1055,6 +1056,9 @@ func (p modrinthProvider) versionToModVersion(version *modrinth.Version) models.
 	}
 	if version.VersionNumber != nil {
 		result.Version = *version.VersionNumber
+	}
+	if version.VersionType != nil {
+		result.ReleaseType = strings.ToLower(strings.TrimSpace(*version.VersionType))
 	}
 	if version.Downloads != nil {
 		result.Downloads = int64(*version.Downloads)

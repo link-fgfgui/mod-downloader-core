@@ -17,6 +17,7 @@ import (
 	curseforge "github.com/sjet47/go-curseforge"
 	cfAPI "github.com/sjet47/go-curseforge/api"
 	cfSchema "github.com/sjet47/go-curseforge/schema"
+	cfEnum "github.com/sjet47/go-curseforge/schema/enum"
 )
 
 type providerRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -287,6 +288,23 @@ func TestProviderVersionConvertersPreserveFileSize(t *testing.T) {
 	modrinthProvider{}.setModVersionFileFields(&modrinthVersion, &modrinth.File{})
 	if modrinthVersion.FileSize != 8192 {
 		t.Fatalf("missing Modrinth size replaced known value: %d", modrinthVersion.FileSize)
+	}
+}
+
+func TestProviderVersionConvertersPreserveReleaseType(t *testing.T) {
+	curseForgeVersion := curseForgeProvider{}.fileToModVersion(cfSchema.File{
+		ReleaseType: cfEnum.FileReleaseTypeBeta,
+	})
+	if curseForgeVersion.ReleaseType != "beta" {
+		t.Fatalf("CurseForge release type = %q, want beta", curseForgeVersion.ReleaseType)
+	}
+
+	versionType := "alpha"
+	modrinthVersion := modrinthProvider{}.versionToModVersion(&modrinth.Version{
+		VersionType: &versionType,
+	})
+	if modrinthVersion.ReleaseType != "alpha" {
+		t.Fatalf("Modrinth release type = %q, want alpha", modrinthVersion.ReleaseType)
 	}
 }
 

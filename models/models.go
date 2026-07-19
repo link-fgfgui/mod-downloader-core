@@ -28,6 +28,7 @@ type ModVersion struct {
 	VersionID    string          `json:"versionId"`    // Alias for ID (frontend compatibility)
 	Name         string          `json:"name"`         // Display name
 	Version      string          `json:"version"`      // Version number string
+	ReleaseType  string          `json:"releaseType"`  // "release" | "beta" | "alpha"
 	FileName     string          `json:"fileName"`     // JAR filename
 	FileSize     int64           `json:"fileSize"`     // File size in bytes when provider metadata includes it
 	DownloadURL  string          `json:"downloadUrl"`  // Direct download link
