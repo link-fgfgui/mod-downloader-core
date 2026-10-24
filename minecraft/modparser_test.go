@@ -80,6 +80,76 @@ func TestParseFabricNestedJarsRecursively(t *testing.T) {
 	}
 }
 
+func TestParseSkipsJijWhenDetectionDisabled(t *testing.T) {
+	child := testJar(t, map[string][]byte{
+		"fabric.mod.json": []byte(`{
+			"schemaVersion": 1,
+			"id": "nested-child",
+			"version": "1.0.0"
+		}`),
+	})
+	top := testJar(t, map[string][]byte{
+		"fabric.mod.json": []byte(`{
+			"schemaVersion": 1,
+			"id": "top-fabric",
+			"version": "1.0.0",
+			"jars": [{"file": "META-INF/jars/child.jar"}]
+		}`),
+		"META-INF/jars/child.jar": child,
+	})
+
+	SetJijDetectionEnabled(false)
+	t.Cleanup(func() { SetJijDetectionEnabled(true) })
+
+	mods := ParseModZipReader(testZipReader(t, top), "top.jar", "fabric")
+	if got := modIDs(mods); !reflect.DeepEqual(got, []string{"top-fabric"}) {
+		t.Fatalf("ids = %#v, want [top-fabric]", got)
+	}
+	if len(mods[0].JijMods) != 0 {
+		t.Fatalf("JijMods = %#v, want none when detection disabled", mods[0].JijMods)
+	}
+}
+
+func TestParseJijCacheScopeFollowsToggle(t *testing.T) {
+	child := testJar(t, map[string][]byte{
+		"fabric.mod.json": []byte(`{
+			"schemaVersion": 1,
+			"id": "cache-child",
+			"version": "1.0.0"
+		}`),
+	})
+	top := testJar(t, map[string][]byte{
+		"fabric.mod.json": []byte(`{
+			"schemaVersion": 1,
+			"id": "cache-top",
+			"version": "1.0.0",
+			"jars": [{"file": "META-INF/jars/child.jar"}]
+		}`),
+		"META-INF/jars/child.jar": child,
+	})
+	path := filepath.Join(t.TempDir(), "cache-top.jar")
+	if err := os.WriteFile(path, top, 0o644); err != nil {
+		t.Fatalf("write jar: %v", err)
+	}
+
+	SetJijDetectionEnabled(true)
+	t.Cleanup(func() { SetJijDetectionEnabled(true) })
+
+	on := ParseLocalModJarWithSHA1(path, "jij-cache-scope-toggle", "fabric")
+	if len(on) != 1 || len(on[0].JijMods) == 0 {
+		t.Fatalf("JijMods with detection enabled = %#v, want nested entries", on)
+	}
+
+	SetJijDetectionEnabled(false)
+	off := ParseLocalModJarWithSHA1(path, "jij-cache-scope-toggle", "fabric")
+	if len(off) != 1 {
+		t.Fatalf("mods with detection disabled = %#v, want one mod", off)
+	}
+	if len(off[0].JijMods) != 0 {
+		t.Fatalf("JijMods after toggle = %#v, want the cached JIJ result to be bypassed", off[0].JijMods)
+	}
+}
+
 func TestParseFabricRequiredDependencies(t *testing.T) {
 	jar := testJar(t, map[string][]byte{
 		"fabric.mod.json": []byte(`{

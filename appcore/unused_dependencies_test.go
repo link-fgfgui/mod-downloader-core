@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/link-fgfgui/mod-downloader-core/global"
+	"github.com/link-fgfgui/mod-downloader-core/minecraft"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 	structs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
@@ -167,6 +168,32 @@ func TestScanUnusedDependenciesTreatsEnabledJijAsProvider(t *testing.T) {
 	result = scanUnusedDependencies(mods, nil)
 	if len(result.Candidates) != 0 {
 		t.Fatalf("candidates with disabled JIJ host = %#v, want none", result.Candidates)
+	}
+}
+
+func TestScanUnusedDependenciesFailsClosedWhenJijDetectionDisabled(t *testing.T) {
+	setSelectedVersionForScanTest(t, structs.VersionInfo{
+		ID:   "jij-off",
+		Name: "jij-off",
+		Mods: []structs.ModInfo{
+			{
+				ID:         "lib-one",
+				Path:       "mods/lib-one.jar",
+				Enabled:    true,
+				Categories: []string{"library"},
+			},
+		},
+	})
+
+	minecraft.SetJijDetectionEnabled(false)
+	t.Cleanup(func() { minecraft.SetJijDetectionEnabled(true) })
+
+	result, err := New(Options{}).ScanUnusedDependencies(appstructs.UnusedDependencyScanRequest{})
+	if err != nil {
+		t.Fatalf("scan error = %v", err)
+	}
+	if len(result.Candidates) != 0 {
+		t.Fatalf("candidates = %#v, want none while JIJ detection is off", result.Candidates)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/logging"
@@ -21,6 +22,27 @@ import (
 
 	"github.com/BurntSushi/toml"
 )
+
+// jijDetectionEnabled controls recursive Jar-in-Jar scanning. It is process-wide
+// because the parser is called from several packages (local scan, downloader,
+// modbridge) that do not thread a config value through. Disabling skips nested
+// jar extraction entirely, which is the dominant cost when scanning large modpacks.
+var jijDetectionEnabled atomic.Bool
+
+func init() {
+	jijDetectionEnabled.Store(true)
+}
+
+// SetJijDetectionEnabled toggles recursive Jar-in-Jar scanning for subsequent
+// parses.
+func SetJijDetectionEnabled(enabled bool) {
+	jijDetectionEnabled.Store(enabled)
+}
+
+// JijDetectionEnabled reports whether nested Jar-in-Jar scanning is active.
+func JijDetectionEnabled() bool {
+	return jijDetectionEnabled.Load()
+}
 
 type ModMetadataParser interface {
 	Name() string
@@ -541,7 +563,10 @@ func parseModJar(jarPath string, modLoader string) []structs.ModInfo {
 }
 
 func ParseModJarWithSHA1(jarPath string, sha1 string, modLoader string) []structs.ModInfo {
-	scope := "loader:" + normalizeModLoader(modLoader)
+	// Capture the toggle once: the cache key and the parse must observe the same
+	// value even if the setting flips while a background scan is running.
+	jijEnabled := JijDetectionEnabled()
+	scope := "loader:" + normalizeModLoader(modLoader) + ":jij=" + jijScopeFlag(jijEnabled)
 	if mods, ok := global.GetJarMetadata(sha1, scope); ok {
 		return mods
 	}
@@ -552,7 +577,7 @@ func ParseModJarWithSHA1(jarPath string, sha1 string, modLoader string) []struct
 	}
 	defer r.Close()
 
-	mods := ParseModZipReader(&r.Reader, filepath.Base(jarPath), modLoader)
+	mods := parseModZipReader(&r.Reader, filepath.Base(jarPath), modLoader, jijEnabled)
 	if len(mods) > 0 {
 		global.SetJarMetadata(sha1, scope, mods)
 	}
@@ -560,7 +585,8 @@ func ParseModJarWithSHA1(jarPath string, sha1 string, modLoader string) []struct
 }
 
 func ParseLocalModJarWithSHA1(jarPath string, sha1 string, preferredLoader string) []structs.ModInfo {
-	scope := "local:" + normalizeModLoader(preferredLoader)
+	jijEnabled := JijDetectionEnabled()
+	scope := "local:" + normalizeModLoader(preferredLoader) + ":jij=" + jijScopeFlag(jijEnabled)
 	if mods, ok := global.GetJarMetadata(sha1, scope); ok {
 		return mods
 	}
@@ -571,26 +597,43 @@ func ParseLocalModJarWithSHA1(jarPath string, sha1 string, preferredLoader strin
 	}
 	defer r.Close()
 
-	mods := ParseLocalModZipReader(&r.Reader, filepath.Base(jarPath), preferredLoader)
+	mods := parseLocalModZipReader(&r.Reader, filepath.Base(jarPath), preferredLoader, jijEnabled)
 	if len(mods) > 0 {
 		global.SetJarMetadata(sha1, scope, mods)
 	}
 	return mods
 }
 
+func jijScopeFlag(enabled bool) string {
+	if enabled {
+		return "1"
+	}
+	return "0"
+}
+
 func ParseModZipReader(r *zip.Reader, sourceName string, modLoader string) []structs.ModInfo {
+	return parseModZipReader(r, sourceName, modLoader, JijDetectionEnabled())
+}
+
+func parseModZipReader(r *zip.Reader, sourceName string, modLoader string, jijEnabled bool) []structs.ModInfo {
 	ctx := modJarParseContext{
-		modLoader: normalizeModLoader(modLoader),
-		visited:   make(map[[32]byte]struct{}),
+		modLoader:  normalizeModLoader(modLoader),
+		visited:    make(map[[32]byte]struct{}),
+		jijEnabled: jijEnabled,
 	}
 	return uniqueModsByID(ctx.parseZipReader(r, sourceName, 0))
 }
 
 func ParseLocalModZipReader(r *zip.Reader, sourceName string, preferredLoader string) []structs.ModInfo {
+	return parseLocalModZipReader(r, sourceName, preferredLoader, JijDetectionEnabled())
+}
+
+func parseLocalModZipReader(r *zip.Reader, sourceName string, preferredLoader string, jijEnabled bool) []structs.ModInfo {
 	ctx := modJarParseContext{
 		modLoader:  normalizeModLoader(preferredLoader),
 		allLoaders: true,
 		visited:    make(map[[32]byte]struct{}),
+		jijEnabled: jijEnabled,
 	}
 	return uniqueModsByID(ctx.parseZipReader(r, sourceName, 0))
 }
@@ -598,6 +641,7 @@ func ParseLocalModZipReader(r *zip.Reader, sourceName string, preferredLoader st
 type modJarParseContext struct {
 	modLoader  string
 	allLoaders bool
+	jijEnabled bool
 	visited    map[[32]byte]struct{}
 }
 
@@ -610,6 +654,13 @@ func (ctx modJarParseContext) parseZipReader(r *zip.Reader, sourceName string, d
 	metadata := ctx.parseDeclaredMetadata(r, sourceName)
 	mods := make([]structs.ModInfo, 0, len(metadata.Mods))
 	mods = append(mods, metadata.Mods...)
+
+	// Jar-in-Jar detection can be disabled to skip nested jar extraction. This
+	// is the expensive part of scanning large modpacks and only affects whether
+	// JijMods metadata is collected, never the top-level mod list.
+	if !ctx.jijEnabled {
+		return mods
+	}
 
 	jijMods := make([]structs.JijModInfo, 0)
 	for _, nestedPath := range uniqueNestedJarPaths(metadata.NestedJars) {
@@ -640,7 +691,7 @@ func (ctx modJarParseContext) parseDeclaredMetadata(r *zip.Reader, sourceName st
 		}
 		out.Mods = append(out.Mods, metadata.Mods...)
 		out.NestedJars = append(out.NestedJars, metadata.NestedJars...)
-		if parser.Name() == loaderForge || parser.Name() == loaderNeoForge {
+		if (parser.Name() == loaderForge || parser.Name() == loaderNeoForge) && ctx.jijEnabled {
 			paths, err := parseJarJarNestedPaths(r)
 			if err != nil {
 				logging.Warn("parse jarjar metadata failed", "sourceName", sourceName, "parser", parser.Name(), "error", err)

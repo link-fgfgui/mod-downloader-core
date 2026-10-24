@@ -89,6 +89,7 @@ func (s *Service) Startup(ctx context.Context) error {
 	})
 	configureSimpleMode(s.config.Prefers.SimpleMode)
 	modbridge.ConfigurePreferredReleaseType(s.config.Prefers.PreferredReleaseTypeValue())
+	minecraft.SetJijDetectionEnabled(s.config.Prefers.EnableJijDetectionValue())
 	configureRemoteModIDConcurrency(s.config.Downloads.ConcurrentDownloadsValue())
 	if minecraftDir := minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir); strings.TrimSpace(minecraftDir) != "" {
 		s.config.Prefers.MinecraftDir = minecraftDir
@@ -706,6 +707,7 @@ func (s *Service) GetSettings() SettingsView {
 		AnimationEnabled:            configs.DefaultAnimationsEnabled,
 		AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
 		AutoScanUnusedDependencies:  configs.DefaultAutoScanUnusedDependencies,
+		EnableJijDetection:          configs.DefaultEnableJijDetection,
 		PreferredReleaseType:        configs.DefaultPreferredReleaseType,
 		FileConcurrency:             configs.DefaultFileConcurrency,
 		ConcurrentDownloads:         configs.DefaultConcurrentDownloads,
@@ -721,6 +723,7 @@ func (s *Service) GetSettings() SettingsView {
 		sv.AnimationDurationMultiplier = s.config.Prefers.NormalizedAnimationDurationMultiplier()
 		sv.AutoScanUnusedDependencies = s.config.Prefers.AutoScanUnusedDependenciesValue()
 		sv.MCIMEnabled = s.config.Prefers.MCIMEnabledValue()
+		sv.EnableJijDetection = s.config.Prefers.EnableJijDetectionValue()
 		sv.PreferredReleaseType = s.config.Prefers.PreferredReleaseTypeValue()
 		sv.FileConcurrency = s.config.Downloads.FileConcurrencyValue()
 		sv.ConcurrentDownloads = s.config.Downloads.ConcurrentDownloadsValue()
@@ -838,6 +841,18 @@ func (s *Service) SaveMCIMSettings(req SaveMCIMSettingsRequest) SettingsView {
 		TargetDownloadRateMiB:   s.config.Downloads.TargetDownloadRateMiBValue(),
 		VerifySHA1:              s.config.Downloads.VerifySHA1,
 	})
+	return s.GetSettings()
+}
+
+func (s *Service) SaveJijDetectionSettings(req SaveJijDetectionSettingsRequest) SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	s.config.Prefers.EnableJijDetection = configs.BoolPtr(req.EnableJijDetection)
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save JIJ detection setting failed", "enableJijDetection", req.EnableJijDetection, "error", err)
+	}
+	minecraft.SetJijDetectionEnabled(req.EnableJijDetection)
 	return s.GetSettings()
 }
 

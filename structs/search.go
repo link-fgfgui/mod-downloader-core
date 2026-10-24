@@ -114,6 +114,39 @@ type IncompatibleConflict struct {
 	Paths                  []IncompatibleLocalMod `json:"paths,omitempty"`
 }
 
+// DependencyPreflightRequest asks for a local dependency-fulfillment snapshot
+// before a mod is installed.
+type DependencyPreflightRequest struct {
+	ProjectID        string            `json:"projectId"`
+	Result           models.ModProject `json:"result"`
+	MinecraftVersion string            `json:"minecraftVersion"`
+	ModLoader        string            `json:"modLoader"`
+	VersionID        string            `json:"versionId,omitempty"`
+}
+
+// DependencyPreflightStatus values describe how a required dependency resolves.
+const (
+	DependencyPreflightFulfilled = "fulfilled"
+	DependencyPreflightMissing   = "missing"
+	DependencyPreflightConflict  = "conflict"
+)
+
+type DependencyPreflightEntry struct {
+	ProjectID       string `json:"projectId"`
+	Title           string `json:"title"`
+	Status          string `json:"status"`
+	RequiredVersion string `json:"requiredVersion,omitempty"`
+	LocalName       string `json:"localName,omitempty"`
+	LocalVersion    string `json:"localVersion,omitempty"`
+}
+
+type DependencyPreflightResult struct {
+	Entries   []DependencyPreflightEntry `json:"entries"`
+	Fulfilled int                        `json:"fulfilled"`
+	Missing   int                        `json:"missing"`
+	Conflicts int                        `json:"conflicts"`
+}
+
 type BatchDownloadRequest struct {
 	Results          []models.ModProject `json:"results"`
 	MinecraftVersion string              `json:"minecraftVersion"`

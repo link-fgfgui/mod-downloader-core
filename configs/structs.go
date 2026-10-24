@@ -157,6 +157,7 @@ type Preferences struct {
 	AutoScanUnusedDependencies  *bool         `toml:"auto_scan_unused_dependencies" json:"auto_scan_unused_dependencies"`
 	MCIMEnabled                 bool          `toml:"mcim_enabled" json:"mcim_enabled" env:"MCIM_ENABLED"`
 	PreferredReleaseType        string        `toml:"preferred_release_type" json:"preferred_release_type" env:"PREFERRED_RELEASE_TYPE"`
+	EnableJijDetection          *bool         `toml:"enable_jij_detection" json:"enable_jij_detection"`
 }
 
 const (
@@ -167,6 +168,7 @@ const (
 	MaxAnimationDurationMultiplier     = 3.0
 	DefaultAutoScanUnusedDependencies  = false
 	DefaultPreferredReleaseType        = "release"
+	DefaultEnableJijDetection          = true
 )
 
 func BoolPtr(value bool) *bool {
@@ -215,6 +217,13 @@ func (p Preferences) PreferredReleaseTypeValue() string {
 	default:
 		return DefaultPreferredReleaseType
 	}
+}
+
+func (p Preferences) EnableJijDetectionValue() bool {
+	if p.EnableJijDetection == nil {
+		return DefaultEnableJijDetection
+	}
+	return *p.EnableJijDetection
 }
 
 func NormalizeAnimationDurationMultiplier(value float64) float64 {

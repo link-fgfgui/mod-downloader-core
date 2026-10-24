@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/link-fgfgui/mod-downloader-core/global"
+	"github.com/link-fgfgui/mod-downloader-core/minecraft"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 	mcstructs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
 )
@@ -34,6 +35,12 @@ func (s *Service) ScanUnusedDependencies(req appstructs.UnusedDependencyScanRequ
 	selected := global.GetSelectedVersion()
 	if selected.ID == "" && selected.Name == "" {
 		return appstructs.UnusedDependencyScanResult{}, errors.New("no selected version")
+	}
+	if !minecraft.JijDetectionEnabled() {
+		// Fail closed: without nested-jar metadata the provider index cannot see
+		// IDs supplied by Jar-in-Jar children, so a jar could be reported as
+		// unused while another mod still requires the bundled dependency.
+		return appstructs.UnusedDependencyScanResult{}, nil
 	}
 	return scanUnusedDependencies(selected.Mods, req.ExcludedPaths), nil
 }
