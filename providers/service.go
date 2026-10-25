@@ -22,6 +22,7 @@ var providerBackground = struct {
 	lifecycle sync.Mutex
 	mu        sync.Mutex
 	accepting bool
+	starts    int
 	wg        sync.WaitGroup
 }{accepting: true}
 
@@ -364,21 +365,53 @@ func RefreshMatchingProjectVersions(result models.ModProject, minecraftVersion s
 	return filterProjectVersionsForFilter(versions, filter)
 }
 
+// StartBackgroundTasks marks background work as accepting and takes one
+// reference. Every Start must be paired with a Stop; the last Stop waits for
+// in-flight work and rejects new tasks.
 func StartBackgroundTasks() {
 	providerBackground.lifecycle.Lock()
+	defer providerBackground.lifecycle.Unlock()
 	providerBackground.mu.Lock()
+	providerBackground.starts++
 	providerBackground.accepting = true
 	providerBackground.mu.Unlock()
-	providerBackground.lifecycle.Unlock()
 }
 
+// StopBackgroundTasks releases one reference. Once the last reference is
+// released it waits for in-flight tasks and disables background work.
 func StopBackgroundTasks() {
 	providerBackground.lifecycle.Lock()
+	defer providerBackground.lifecycle.Unlock()
 	providerBackground.mu.Lock()
+	if providerBackground.starts > 0 {
+		providerBackground.starts--
+	}
+	if providerBackground.starts > 0 {
+		providerBackground.mu.Unlock()
+		return
+	}
 	providerBackground.accepting = false
 	providerBackground.mu.Unlock()
 	providerBackground.wg.Wait()
-	providerBackground.lifecycle.Unlock()
+}
+
+// DrainBackgroundTasks waits for in-flight background work while preserving
+// the current accepting state and reference count. It is useful before closing
+// shared resources such as storage without permanently disabling refreshes.
+func DrainBackgroundTasks() {
+	providerBackground.lifecycle.Lock()
+	defer providerBackground.lifecycle.Unlock()
+	providerBackground.mu.Lock()
+	wasAccepting := providerBackground.accepting
+	providerBackground.accepting = false
+	providerBackground.mu.Unlock()
+	providerBackground.wg.Wait()
+	if !wasAccepting {
+		return
+	}
+	providerBackground.mu.Lock()
+	providerBackground.accepting = true
+	providerBackground.mu.Unlock()
 }
 
 func startBackgroundTask(task func()) {

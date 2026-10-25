@@ -113,9 +113,29 @@ func TestResolveMetadataByLocalFilesFallsBackToCurseForgeFingerprint(t *testing.
 	}
 }
 
+// resetProviderBackgroundForTest isolates background-task reference counts and
+// acceptance between tests, including repeated -count runs.
+func resetProviderBackgroundForTest(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		providerBackground.lifecycle.Lock()
+		providerBackground.mu.Lock()
+		providerBackground.starts = 0
+		providerBackground.accepting = false
+		providerBackground.mu.Unlock()
+		providerBackground.wg.Wait()
+		providerBackground.mu.Lock()
+		providerBackground.accepting = true
+		providerBackground.mu.Unlock()
+		providerBackground.lifecycle.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
+}
+
 func TestStopBackgroundTasksWaitsAndRejectsNewWork(t *testing.T) {
+	resetProviderBackgroundForTest(t)
 	StartBackgroundTasks()
-	t.Cleanup(StartBackgroundTasks)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	finished := make(chan struct{})
@@ -145,6 +165,41 @@ func TestStopBackgroundTasksWaitsAndRejectsNewWork(t *testing.T) {
 	case <-rejected:
 		t.Fatal("background work accepted after stop")
 	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestDrainBackgroundTasksWaitsAndKeepsAccepting(t *testing.T) {
+	resetProviderBackgroundForTest(t)
+	StartBackgroundTasks()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	startBackgroundTask(func() {
+		close(started)
+		<-release
+	})
+	<-started
+	go func() {
+		DrainBackgroundTasks()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+		t.Fatal("drain returned before task completion")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("drain did not return")
+	}
+	ran := make(chan struct{}, 1)
+	startBackgroundTask(func() { ran <- struct{}{} })
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("background work rejected after drain")
 	}
 }
 

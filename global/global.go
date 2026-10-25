@@ -97,7 +97,7 @@ func setVersionsLocked(dir string, v []structs.VersionInfo) {
 			selectedVersionKey = ""
 		}
 	}
-	logging.Info("global versions cache set", "minecraftDir", dir, "versionCount", len(v), "keyCount", len(versionMap))
+	logging.Debug("global versions cache set", "minecraftDir", dir, "versionCount", len(v), "keyCount", len(versionMap))
 }
 
 func versionKey(version structs.VersionInfo) string {
@@ -162,7 +162,7 @@ func SetSelectedVersion(version structs.VersionInfo) {
 			versionMap[version.ID] = version
 		}
 	}
-	logging.Info("global selected version set", "previousKey", previousKey, "key", selectedVersionKey, "minecraftDir", selectedVersionDir)
+	logging.Debug("global selected version set", "previousKey", previousKey, "key", selectedVersionKey, "minecraftDir", selectedVersionDir)
 }
 
 // GetMinecraftReleaseVersions returns the cached official Minecraft release ids.

@@ -12,6 +12,7 @@ import (
 
 	"github.com/link-fgfgui/mod-downloader-core/global"
 	"github.com/link-fgfgui/mod-downloader-core/models"
+	"github.com/link-fgfgui/mod-downloader-core/providers"
 	"github.com/link-fgfgui/mod-downloader-core/storage"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 	mcstructs "github.com/link-fgfgui/mod-downloader-core/structs/minecraft"
@@ -24,6 +25,9 @@ func openModbridgeTestDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(storage.Close)
+	// Provider refreshes run in the background; drain them before closing the
+	// DB.
+	t.Cleanup(providers.DrainBackgroundTasks)
 }
 
 func TestFindVersionByID(t *testing.T) {

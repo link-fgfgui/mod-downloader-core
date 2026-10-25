@@ -426,6 +426,32 @@ force_file = true
 	}
 }
 
+func TestLoggingConfigRotationAndFileFields(t *testing.T) {
+	var cfg LoggingConfig
+	if _, err := toml.Decode(`
+file = "/tmp/custom.log"
+max_size_mb = 12
+max_backups = 4
+`, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	canonical := cfg.Canonical()
+	if canonical.File != "/tmp/custom.log" || canonical.MaxSizeMB != 12 || canonical.MaxBackups != 4 {
+		t.Fatalf("canonical logging = %#v", canonical)
+	}
+
+	t.Setenv("LOGGING_FILE", "/tmp/from-env.log")
+	t.Setenv("LOGGING_MAX_SIZE_MB", "9")
+	t.Setenv("LOGGING_MAX_BACKUPS", "3")
+	var env Config
+	if err := readEnv(&env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Logging.File != "/tmp/from-env.log" || env.Logging.MaxSizeMB != 9 || env.Logging.MaxBackups != 3 {
+		t.Fatalf("logging env = %#v", env.Logging)
+	}
+}
+
 func TestLoggingEnabledTakesPrecedenceOverLegacyDisabled(t *testing.T) {
 	var cfg Config
 	if _, err := toml.Decode(`

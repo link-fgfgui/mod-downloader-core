@@ -159,6 +159,7 @@ func TestSelectVersionDetectsConnectorAndResetsVirtualView(t *testing.T) {
 
 	svc := New(Options{})
 	t.Cleanup(svc.stopModsWatcher)
+	t.Cleanup(svc.stopServiceBackground)
 	selected, err := svc.SelectVersion("test")
 	if err != nil {
 		t.Fatal(err)

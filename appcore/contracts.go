@@ -203,11 +203,28 @@ type InstallToDirRequest struct {
 }
 
 // Service is the adapter-neutral workflow coordinator shared by Wails and CLI.
+// The current implementation owns process-wide resources (providers, storage,
+// logging), so a process must only run one Service at a time.
 type Service struct {
-	ctx             context.Context
-	config          *configs.Config
-	options         Options
-	modsWatchMu     sync.Mutex
-	modsWatchCancel context.CancelFunc
-	modsWatchDir    string
+	ctx                context.Context
+	config             *configs.Config
+	options            Options
+	modsWatchMu        sync.Mutex
+	modsWatchRestartMu sync.Mutex
+	modsWatchCancel    context.CancelFunc
+	modsWatchDir       string
+	modsWatchDone      chan struct{}
+	lifecycleMu        sync.Mutex
+	lifecycleState     serviceLifecycleState
+	backgroundMu       sync.Mutex
+	backgroundWG       sync.WaitGroup
+	backgroundDone     bool
 }
+
+type serviceLifecycleState uint8
+
+const (
+	serviceStateIdle serviceLifecycleState = iota
+	serviceStateStarting
+	serviceStateStarted
+)
