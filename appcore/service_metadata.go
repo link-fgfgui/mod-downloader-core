@@ -14,7 +14,7 @@ func (s *Service) resolveMissingModMetadata(refreshed structs.VersionInfo, missi
 	if len(missingFiles) == 0 {
 		return
 	}
-	go func() {
+	s.startServiceBackground(func() {
 		projects, versions := providers.ResolveMetadataByLocalFiles(missingFiles)
 		updated := global.GetSelectedVersion()
 		if updated.ID != refreshed.ID || updated.Name != refreshed.Name {
@@ -27,7 +27,7 @@ func (s *Service) resolveMissingModMetadata(refreshed structs.VersionInfo, missi
 		updated.Mods = mods
 		global.SetSelectedVersion(updated)
 		s.emit(EventSelectedVersionChanged, updated)
-	}()
+	})
 }
 
 func applyResolvedModMetadata(mods []structs.ModInfo, missingFiles map[string]uint32, projects map[string]models.ModProject, versions map[string]models.ModVersion) ([]structs.ModInfo, bool) {

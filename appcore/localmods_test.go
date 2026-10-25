@@ -53,6 +53,8 @@ func TestLocalModsInDirScansExplicitModsDir(t *testing.T) {
 func TestRefreshSelectedVersionModsPersistsRefreshedSnapshot(t *testing.T) {
 	_, modsDir := setupSelectedLocalModInstance(t)
 	svc := New(Options{})
+	t.Cleanup(svc.stopModsWatcher)
+	t.Cleanup(svc.stopServiceBackground)
 	if got := svc.RefreshSelectedVersionMods(); len(got.Mods) != 0 {
 		t.Fatalf("initial mods = %#v, want none", got.Mods)
 	}
@@ -104,6 +106,7 @@ func TestApplyLocalModBatchOperationDisableEnableInvertDelete(t *testing.T) {
 	writeFile(t, removed)
 
 	svc := New(Options{})
+	t.Cleanup(svc.stopServiceBackground)
 	version, err := svc.ApplyLocalModBatchOperation(appstructs.LocalModBatchOperationRequest{
 		Action: LocalModBatchActionDisable,
 		Paths:  []string{filepath.ToSlash(filepath.Join("versions", "test", "mods", "enabled.jar"))},
@@ -165,6 +168,7 @@ func TestApplyLocalModBatchOperationDeleteClearsRelativeLocalIndex(t *testing.T)
 	modPath := filepath.Join(modsDir, "remove.jar")
 	writeFabricJar(t, modPath)
 	svc := New(Options{})
+	t.Cleanup(svc.stopServiceBackground)
 	if got := svc.RefreshSelectedVersionMods(); len(got.Mods) != 1 {
 		t.Fatalf("initial mods = %#v, want one mod", got.Mods)
 	}
@@ -193,6 +197,7 @@ func TestRefreshChangedPathsClearsRelativeLocalIndex(t *testing.T) {
 	modPath := filepath.Join(modsDir, "watched.jar")
 	writeFabricJar(t, modPath)
 	svc := New(Options{})
+	t.Cleanup(svc.stopServiceBackground)
 	if got := svc.RefreshSelectedVersionMods(); len(got.Mods) != 1 {
 		t.Fatalf("initial mods = %#v, want one mod", got.Mods)
 	}

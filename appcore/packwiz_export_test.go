@@ -39,6 +39,7 @@ func TestExportFavoriteListPackwizZipRejectsEmptyList(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(storage.Close)
+	waitProviderBackgroundTasks(t)
 
 	svc := New(Options{})
 	list := svc.CreateFavoriteList("Empty")
@@ -53,6 +54,7 @@ func TestExportFavoriteListPackwizZipWritesPack(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(storage.Close)
+	waitProviderBackgroundTasks(t)
 
 	storeFavoritePackwizVersion(t, "modrinth", "sodium", "version-1", "1.21.1", "fabric", "sodium.jar")
 
@@ -96,6 +98,7 @@ func TestExportFavoriteListPackwizZipForScopeFiltersItems(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(storage.Close)
+	waitProviderBackgroundTasks(t)
 
 	storeFavoritePackwizVersion(t, "modrinth", "sodium", "version-1", "1.21.1", "fabric", "sodium.jar")
 
@@ -125,6 +128,7 @@ func TestExportFavoriteListPackwizZipIncludesRecursiveReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(storage.Close)
+	waitProviderBackgroundTasks(t)
 
 	for _, modID := range []string{"sodium", "lithium", "ferrite-core"} {
 		storeFavoritePackwizVersion(t, "modrinth", modID, modID+"-version", "1.21.1", "fabric", modID+".jar")

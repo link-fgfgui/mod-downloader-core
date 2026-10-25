@@ -59,12 +59,39 @@ func (s *Service) UserAgent() string {
 }
 
 func (s *Service) Startup(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.lifecycleState == serviceStateStarted {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.backgroundMu.Lock()
+	s.backgroundDone = false
+	s.backgroundMu.Unlock()
 	s.ctx = ctx
+	s.lifecycleState = serviceStateStarting
+	if err := s.startup(); err != nil {
+		// Startup can fail after providers, storage and logging have been
+		// initialized. Tear those down before returning so callers never see a
+		// half-started service.
+		s.stop(false)
+		s.lifecycleState = serviceStateIdle
+		return err
+	}
+	s.lifecycleState = serviceStateStarted
+	return nil
+}
+
+func (s *Service) startup() error {
 	providers.StartBackgroundTasks()
 	if s.config != nil {
 		s.configureLoggingConfig(s.config.Logging)
-	} else if bootstrapLogging, err := configs.LoadLogging(); err == nil {
-		s.configureLoggingConfig(bootstrapLogging)
+	} else if !s.options.Runtime.NoConfigFile {
+		if bootstrapLogging, err := configs.LoadLogging(); err == nil {
+			s.configureLoggingConfig(bootstrapLogging)
+		}
 	}
 	if s.config == nil {
 		cfg, err := s.loadConfig()
@@ -142,24 +169,23 @@ func loadMinecraftReleaseVersions() error {
 }
 
 func (s *Service) Shutdown() {
-	s.stopModsWatcher()
-	if s.config == nil {
-		s.config = &configs.Config{}
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.lifecycleState != serviceStateStarted {
+		return
 	}
-	s.config.Prefers.MinecraftDir = global.GetMinecraftDir()
-	if err := configs.Save(s.config); err != nil {
-		logging.Error("save config failed", "error", err)
-	}
-	providers.StopBackgroundTasks()
-	storage.Close()
-	logging.Close()
+	s.stop(true)
+	s.lifecycleState = serviceStateIdle
 }
 
 func (s *Service) Close() {
-	s.stopModsWatcher()
-	providers.StopBackgroundTasks()
-	storage.Close()
-	logging.Close()
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.lifecycleState != serviceStateStarted {
+		return
+	}
+	s.stop(false)
+	s.lifecycleState = serviceStateIdle
 }
 
 func (s *Service) Config() *configs.Config {
@@ -314,14 +340,25 @@ func (s *Service) configureLogging() {
 }
 
 func (s *Service) configureLoggingConfig(config configs.LoggingConfig) {
-	path := logging.DefaultFileName
-	if workDir := strings.TrimSpace(s.options.Runtime.WorkDir); workDir != "" {
-		path = filepath.Join(workDir, logging.DefaultFileName)
+	path := strings.TrimSpace(config.File)
+	if path == "" {
+		path = logging.DefaultPath()
+	} else {
+		path = minecraft.ExpandPathWithEnv(path)
+	}
+	maxSizeBytes := int64(config.MaxSizeMB) * 1024 * 1024
+	maxBackups := config.MaxBackups
+	if maxBackups == 0 {
+		maxBackups = logging.DefaultMaxBackups
 	}
 	if err := logging.Configure(logging.Options{
-		Disabled:  !config.EnabledValue(),
-		ForceFile: config.ForceFile,
-		FilePath:  path,
+		Disabled:     !config.EnabledValue(),
+		ForceFile:    config.ForceFile,
+		FilePath:     path,
+		Level:        s.options.LogLevel,
+		NoStderr:     s.options.LogToFileOnly,
+		MaxSizeBytes: maxSizeBytes,
+		MaxBackups:   maxBackups,
 	}); err != nil {
 		logging.Error("configure logging failed", "path", path, "error", err)
 	}
@@ -457,13 +494,21 @@ func (s *Service) refreshAndSelectVersionMods(version structs.VersionInfo, mcDir
 }
 
 func (s *Service) stopModsWatcher() {
+	s.modsWatchRestartMu.Lock()
+	defer s.modsWatchRestartMu.Unlock()
 	s.modsWatchMu.Lock()
-	defer s.modsWatchMu.Unlock()
-	if s.modsWatchCancel != nil {
-		s.modsWatchCancel()
-		s.modsWatchCancel = nil
-	}
+	cancel := s.modsWatchCancel
+	done := s.modsWatchDone
+	s.modsWatchCancel = nil
+	s.modsWatchDone = nil
 	s.modsWatchDir = ""
+	s.modsWatchMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
 }
 
 func (s *Service) ensureModsWatcher(version structs.VersionInfo) {
@@ -472,19 +517,46 @@ func (s *Service) ensureModsWatcher(version structs.VersionInfo) {
 	if err != nil || strings.TrimSpace(dir) == "" {
 		return
 	}
+	// Serialize replacement so concurrent refreshes cannot leave two watchers
+	// running, and refuse to start one after shutdown has begun.
+	s.modsWatchRestartMu.Lock()
+	defer s.modsWatchRestartMu.Unlock()
+	s.backgroundMu.Lock()
+	ending := s.backgroundDone
+	s.backgroundMu.Unlock()
+	if ending {
+		return
+	}
 	s.modsWatchMu.Lock()
 	if s.modsWatchDir == dir && s.modsWatchCancel != nil {
 		s.modsWatchMu.Unlock()
 		return
 	}
-	if s.modsWatchCancel != nil {
-		s.modsWatchCancel()
+	previousCancel := s.modsWatchCancel
+	previousDone := s.modsWatchDone
+	s.modsWatchCancel = nil
+	s.modsWatchDone = nil
+	s.modsWatchDir = ""
+	s.modsWatchMu.Unlock()
+	// Stop the previous watcher before replacing it, otherwise two watchers can
+	// briefly refresh the same directory concurrently.
+	if previousCancel != nil {
+		previousCancel()
+	}
+	if previousDone != nil {
+		<-previousDone
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	s.modsWatchMu.Lock()
 	s.modsWatchCancel = cancel
 	s.modsWatchDir = dir
+	s.modsWatchDone = done
 	s.modsWatchMu.Unlock()
-	go s.watchModsDir(ctx, dir, version.ID, version.Name)
+	go func() {
+		defer close(done)
+		s.watchModsDir(ctx, dir, version.ID, version.Name)
+	}()
 }
 
 func (s *Service) watchModsDir(ctx context.Context, dir, versionID, versionName string) {
@@ -530,7 +602,9 @@ func (s *Service) watchModsDir(ctx context.Context, dir, versionID, versionName 
 			}
 			pending = make(map[string]bool)
 			pendingMu.Unlock()
-			s.refreshChangedPaths(paths)
+			s.startServiceBackground(func() {
+				s.refreshChangedPaths(paths)
+			})
 		})
 	}
 	defer func() {
@@ -568,4 +642,42 @@ func ScanAllModDirsForHardlinkIndex(mcDir string, versions []structs.VersionInfo
 		}
 		return global.HardlinkIndexAddForGeneration(sha1, path, generation)
 	})
+}
+
+func (s *Service) stop(saveConfig bool) {
+	s.stopServiceBackground()
+	s.stopModsWatcher()
+	if saveConfig {
+		if s.config == nil {
+			s.config = &configs.Config{}
+		}
+		s.config.Prefers.MinecraftDir = global.GetMinecraftDir()
+		if err := configs.Save(s.config); err != nil {
+			logging.Error("save config failed", "error", err)
+		}
+	}
+	providers.StopBackgroundTasks()
+	storage.Close()
+	logging.Close()
+}
+
+func (s *Service) startServiceBackground(task func()) {
+	s.backgroundMu.Lock()
+	if s.backgroundDone {
+		s.backgroundMu.Unlock()
+		return
+	}
+	s.backgroundWG.Add(1)
+	s.backgroundMu.Unlock()
+	go func() {
+		defer s.backgroundWG.Done()
+		task()
+	}()
+}
+
+func (s *Service) stopServiceBackground() {
+	s.backgroundMu.Lock()
+	s.backgroundDone = true
+	s.backgroundMu.Unlock()
+	s.backgroundWG.Wait()
 }

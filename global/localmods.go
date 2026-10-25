@@ -221,7 +221,7 @@ func ClearLocalModsByInstance(instanceID string) {
 			deleted++
 		}
 	}
-	logging.Info("local mods cleared by instance", "instanceID", instanceID, "deletedPathCount", deleted)
+	logging.Debug("local mods cleared by instance", "instanceID", instanceID, "deletedPathCount", deleted)
 }
 
 func ClearLocalMods() {

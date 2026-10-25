@@ -58,6 +58,7 @@ type DownloadQueueState struct {
 
 type DownloadQueueItem struct {
 	ID               string `json:"id"`
+	ProjectID        string `json:"projectId,omitempty"`
 	Status           string `json:"status"`
 	Title            string `json:"title"`
 	FileName         string `json:"fileName"`

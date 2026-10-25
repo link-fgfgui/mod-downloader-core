@@ -117,6 +117,9 @@ func openDownloadTestDatabase(t *testing.T) {
 		t.Fatalf("storage.OpenAt() error = %v", err)
 	}
 	t.Cleanup(storage.Close)
+	// Provider refreshes run in the background; drain them before closing the
+	// DB.
+	t.Cleanup(providers.DrainBackgroundTasks)
 }
 
 func seedDownloadProjectVersion(t *testing.T, projectID string, version models.ModVersion) models.ModProject {

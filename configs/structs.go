@@ -308,6 +308,14 @@ type LoggingConfig struct {
 	Enabled   *bool `toml:"enabled,omitempty" json:"enabled,omitempty" env:"-"`
 	Disabled  *bool `toml:"disabled,omitempty" json:"-" env:"-"`
 	ForceFile bool  `toml:"force_file" json:"forceFile" env:"FORCE_FILE"`
+	// File overrides the log file path. An empty value uses the per-user cache
+	// directory (see logging.DefaultPath).
+	File string `toml:"file,omitempty" json:"file,omitempty" env:"FILE"`
+	// MaxSizeMB is the rotation threshold in MiB. Zero uses the default (6 MiB).
+	MaxSizeMB int `toml:"max_size_mb,omitempty" json:"maxSizeMb,omitempty" env:"MAX_SIZE_MB"`
+	// MaxBackups is the number of historical files to keep. Zero uses the
+	// default (2); a negative value disables backups.
+	MaxBackups int `toml:"max_backups,omitempty" json:"maxBackups,omitempty" env:"MAX_BACKUPS"`
 }
 
 func (c LoggingConfig) EnabledValue() bool {
@@ -321,7 +329,13 @@ func (c LoggingConfig) EnabledValue() bool {
 }
 
 func (c LoggingConfig) Canonical() LoggingConfig {
-	return LoggingConfig{Enabled: BoolPtr(c.EnabledValue()), ForceFile: c.ForceFile}
+	return LoggingConfig{
+		Enabled:    BoolPtr(c.EnabledValue()),
+		ForceFile:  c.ForceFile,
+		File:       strings.TrimSpace(c.File),
+		MaxSizeMB:  c.MaxSizeMB,
+		MaxBackups: c.MaxBackups,
+	}
 }
 
 func (c APIConfig) RequestsPerSecondValue() int {

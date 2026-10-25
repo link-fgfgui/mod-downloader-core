@@ -3,6 +3,7 @@ package appcore
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,16 @@ import (
 	"github.com/link-fgfgui/mod-downloader-core/storage"
 	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 )
+
+func TestMain(m *testing.M) {
+	// Direct service-method tests run without Startup, but they still rely on
+	// provider refreshes being accepted. Keep one process-wide reference so a
+	// per-test Service close does not disable them for the rest of the suite.
+	providers.StartBackgroundTasks()
+	code := m.Run()
+	providers.StopBackgroundTasks()
+	os.Exit(code)
+}
 
 func TestLoadMinecraftReleaseVersionsUsesFreshCache(t *testing.T) {
 	t.Cleanup(func() { global.SetMinecraftReleaseVersions(nil) })
@@ -96,20 +107,25 @@ func TestStartupBootstrapsForcedFileLogging(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	logPath := filepath.Join(dir, "service.log")
 	if err := os.WriteFile(filepath.Join(dir, "mod-downloader.toml"), []byte(`
 [logging]
 force_file = true
+file = "`+filepath.ToSlash(logPath)+`"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	svc := New(Options{Runtime: RuntimeOptions{WorkDir: dir, CachePath: filepath.Join(dir, storage.CacheFileName)}})
+	svc := New(Options{
+		Runtime:  RuntimeOptions{WorkDir: dir, CachePath: filepath.Join(dir, storage.CacheFileName)},
+		LogLevel: slog.LevelDebug,
+	})
 	if err := svc.Startup(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	logging.Info("bootstrap file marker")
 	svc.Close()
-	data, err := os.ReadFile(filepath.Join(dir, logging.DefaultFileName))
+	data, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,6 +194,7 @@ func TestStartupBootstrapsDisabledLoggingWithoutCreatingFile(t *testing.T) {
 [logging]
 disabled = true
 force_file = true
+file = "`+filepath.ToSlash(filepath.Join(dir, "disabled.log"))+`"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -188,9 +205,149 @@ force_file = true
 	}
 	logging.Error("hidden bootstrap marker")
 	svc.Close()
-	if _, err := os.Stat(filepath.Join(dir, logging.DefaultFileName)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(dir, "disabled.log")); !os.IsNotExist(err) {
 		t.Fatalf("disabled bootstrap log stat error = %v, want not exist", err)
 	}
+}
+
+func TestServiceStartupShutdownIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	svc := New(Options{
+		Config:  disabledLoggingConfig(),
+		Runtime: RuntimeOptions{CachePath: filepath.Join(dir, storage.CacheFileName)},
+	})
+	ctx := context.Background()
+	if err := svc.Startup(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Startup(ctx); err != nil {
+		t.Fatalf("second Startup: %v", err)
+	}
+	svc.Shutdown()
+	svc.Shutdown()
+	svc.Close()
+}
+
+func TestStartupWritesDefaultLogOutsideWorkDir(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cacheDir)
+	t.Setenv("HOME", cacheDir)
+	t.Setenv("LOCALAPPDATA", cacheDir)
+	dir := t.TempDir()
+	t.Chdir(dir)
+	workDir := filepath.Join(dir, "mods")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	svc := New(Options{
+		Config: &configs.Config{Logging: configs.LoggingConfig{
+			Enabled:   &enabled,
+			ForceFile: true,
+		}},
+		Runtime: RuntimeOptions{
+			WorkDir:   workDir,
+			CachePath: filepath.Join(dir, storage.CacheFileName),
+		},
+	})
+	t.Cleanup(func() {
+		logging.Close()
+		storage.Close()
+	})
+	if err := svc.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	logging.Info("default path marker")
+	svc.Close()
+
+	logPath := filepath.Join(cacheDir, "mod-downloader", "logs", logging.DefaultFileName)
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read default log: %v", err)
+	}
+	if !strings.Contains(string(data), "default path marker") {
+		t.Fatalf("default log = %q", data)
+	}
+	if _, err := os.Stat(filepath.Join(workDir, logging.DefaultFileName)); !os.IsNotExist(err) {
+		t.Fatalf("work dir log stat error = %v, want not exist", err)
+	}
+}
+
+func TestServiceCloseAfterStartupFailure(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	previousFetch := fetchMinecraftReleaseVersions
+	t.Cleanup(func() { fetchMinecraftReleaseVersions = previousFetch })
+	fetchMinecraftReleaseVersions = func() ([]string, error) {
+		return nil, errors.New("manifest unavailable")
+	}
+
+	svc := New(Options{
+		Config:                disabledLoggingConfig(),
+		Runtime:               RuntimeOptions{CachePath: filepath.Join(dir, storage.CacheFileName)},
+		LoadMinecraftReleases: true,
+	})
+	if err := svc.Startup(context.Background()); err == nil {
+		t.Fatal("Startup succeeded with a failing manifest fetch")
+	}
+	// Failure must leave no open files or background tasks behind; Close is
+	// idempotent and must be safe after the internal cleanup.
+	svc.Close()
+	svc.Close()
+
+	fetchMinecraftReleaseVersions = func() ([]string, error) { return []string{"1.21.1"}, nil }
+	if err := svc.Startup(context.Background()); err != nil {
+		t.Fatalf("retry after failed startup: %v", err)
+	}
+	svc.Close()
+}
+
+func TestServiceBackgroundTasksDrainBeforeStop(t *testing.T) {
+	svc := New(Options{})
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	svc.startServiceBackground(func() {
+		close(started)
+		<-release
+	})
+	<-started
+	go func() {
+		svc.stopServiceBackground()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("stop returned before service background task finished")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stop did not return after service background task finished")
+	}
+	rejected := make(chan struct{}, 1)
+	svc.startServiceBackground(func() { rejected <- struct{}{} })
+	select {
+	case <-rejected:
+		t.Fatal("service background task accepted after stop")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func disabledLoggingConfig() *configs.Config {
+	enabled := false
+	return &configs.Config{Logging: configs.LoggingConfig{Enabled: &enabled}}
+}
+
+// waitProviderBackgroundTasks drains provider work before a test closes
+// storage, then restores the previous accepting state. Register it after the
+// storage cleanup so it runs first (t.Cleanup is LIFO).
+func waitProviderBackgroundTasks(t *testing.T) {
+	t.Helper()
+	t.Cleanup(providers.DrainBackgroundTasks)
 }
 
 func TestLoadMinecraftReleaseVersionsRefreshesExpiredCacheAndFallsBackOnError(t *testing.T) {
@@ -681,14 +838,12 @@ func TestFavoriteCrossVersionCopyRejectsSourceScope(t *testing.T) {
 
 func openFavoriteCrossVersionCopyService(t *testing.T) *Service {
 	t.Helper()
-	providers.StartBackgroundTasks()
 	if err := storage.OpenAt(filepath.Join(t.TempDir(), storage.CacheFileName)); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		providers.StopBackgroundTasks()
+		providers.DrainBackgroundTasks()
 		storage.Close()
-		providers.StartBackgroundTasks()
 	})
 	return New(Options{})
 }
@@ -765,6 +920,7 @@ func TestSaveCacheDirPreferencePersistsAndReopensDatabase(t *testing.T) {
 	if err := svc.Startup(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(svc.Close)
 
 	nextDir := filepath.Join(t.TempDir(), "custom-cache")
 	view := svc.SaveCacheDirPreference(nextDir)

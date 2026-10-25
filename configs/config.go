@@ -150,6 +150,6 @@ func Save(cfg *Config) error {
 		return fmt.Errorf("encode config: %w", err)
 	}
 
-	logging.Info("config saved", "path", path, "hasCurseforgeKey", cfg.Keys.CurseforgeApiKey != "", "hasModrinthKey", cfg.Keys.ModrinthApiKey != "", "minecraftDir", cfg.Prefers.MinecraftDir)
+	logging.Debug("config saved", "path", path, "hasCurseforgeKey", cfg.Keys.CurseforgeApiKey != "", "hasModrinthKey", cfg.Keys.ModrinthApiKey != "", "minecraftDir", cfg.Prefers.MinecraftDir)
 	return nil
 }
