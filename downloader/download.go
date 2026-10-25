@@ -1475,6 +1475,7 @@ func downloadQueueItemFromJob(job downloadJob, status string, cancelable bool) a
 	}
 	return appstructs.DownloadQueueItem{
 		ID:               job.ID,
+		ProjectID:        job.ProjectID,
 		Status:           status,
 		Title:            title,
 		FileName:         job.Version.FileName,

@@ -2,6 +2,7 @@ package appcore
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
 	"github.com/link-fgfgui/mod-downloader-core/configs"
@@ -36,6 +37,11 @@ type Options struct {
 	Version               string
 	LoadMinecraftReleases bool
 	OnEvent               func(Event)
+	// LogLevel is the minimum level emitted by the core logger. The zero value
+	// is slog.LevelInfo.
+	LogLevel slog.Level
+	// LogToFileOnly keeps core logs out of stderr (the TUI owns the terminal).
+	LogToFileOnly bool
 }
 
 type RuntimeOptions struct {

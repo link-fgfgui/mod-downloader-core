@@ -3,6 +3,7 @@ package appcore
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,7 +103,10 @@ force_file = true
 		t.Fatal(err)
 	}
 
-	svc := New(Options{Runtime: RuntimeOptions{WorkDir: dir, CachePath: filepath.Join(dir, storage.CacheFileName)}})
+	svc := New(Options{
+		Runtime:  RuntimeOptions{WorkDir: dir, CachePath: filepath.Join(dir, storage.CacheFileName)},
+		LogLevel: slog.LevelDebug,
+	})
 	if err := svc.Startup(context.Background()); err != nil {
 		t.Fatal(err)
 	}

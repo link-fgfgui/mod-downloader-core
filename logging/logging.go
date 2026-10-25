@@ -11,14 +11,22 @@ import (
 const DefaultFileName = "mod-downloader.log"
 
 type Options struct {
-	Disabled  bool
+	Disabled bool
+	// ForceFile mirrors the config's force_file setting: write to the file and
+	// also mirror to stderr when it is usable.
 	ForceFile bool
 	FilePath  string
+	// Level is the minimum level to emit. The zero value is slog.LevelInfo.
+	Level slog.Level
+	// NoStderr treats stderr as unavailable even when it is a terminal. The TUI
+	// uses this so log lines never corrupt the full-screen program; output goes
+	// to FilePath only.
+	NoStderr bool
 }
 
 var (
 	loggerMu sync.RWMutex
-	logger   = newLogger(os.Stderr)
+	logger   = newLogger(os.Stderr, slog.LevelInfo)
 	logFile  *os.File
 )
 
@@ -27,14 +35,16 @@ func init() {
 }
 
 func Configure(options Options) error {
-	return configure(options, os.Stderr, stderrAvailable(os.Stderr))
+	usable := !options.NoStderr && stderrAvailable(os.Stderr)
+	return configure(options, os.Stderr, usable)
 }
 
 func configure(options Options, stderr io.Writer, stderrUsable bool) error {
 	var output io.Writer = io.Discard
 	var nextFile *os.File
 	if !options.Disabled {
-		if options.ForceFile || !stderrUsable {
+		fileOnly := options.NoStderr
+		if options.ForceFile || fileOnly || !stderrUsable {
 			path := strings.TrimSpace(options.FilePath)
 			if path == "" {
 				path = DefaultFileName
@@ -45,7 +55,7 @@ func configure(options Options, stderr io.Writer, stderrUsable bool) error {
 			}
 			nextFile = file
 			output = file
-			if stderrUsable && stderr != nil {
+			if !fileOnly && stderrUsable && stderr != nil {
 				output = io.MultiWriter(stderr, file)
 			}
 		} else if stderr != nil {
@@ -53,7 +63,7 @@ func configure(options Options, stderr io.Writer, stderrUsable bool) error {
 		}
 	}
 
-	nextLogger := newLogger(output)
+	nextLogger := newLogger(output, options.Level)
 	loggerMu.Lock()
 	previousFile := logFile
 	logger = nextLogger
@@ -69,7 +79,7 @@ func configure(options Options, stderr io.Writer, stderrUsable bool) error {
 func Close() {
 	loggerMu.Lock()
 	previousFile := logFile
-	logger = newLogger(io.Discard)
+	logger = newLogger(io.Discard, slog.LevelInfo)
 	logFile = nil
 	slog.SetDefault(logger)
 	if previousFile != nil {
@@ -78,8 +88,8 @@ func Close() {
 	loggerMu.Unlock()
 }
 
-func newLogger(output io.Writer) *slog.Logger {
-	return slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+func newLogger(output io.Writer, level slog.Level) *slog.Logger {
+	return slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: level}))
 }
 
 func stderrAvailable(stderr *os.File) bool {

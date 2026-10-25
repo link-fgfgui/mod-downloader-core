@@ -1654,6 +1654,8 @@ func (s *Service) configureLoggingConfig(config configs.LoggingConfig) {
 		Disabled:  !config.EnabledValue(),
 		ForceFile: config.ForceFile,
 		FilePath:  path,
+		Level:     s.options.LogLevel,
+		NoStderr:  s.options.LogToFileOnly,
 	}); err != nil {
 		logging.Error("configure logging failed", "path", path, "error", err)
 	}
