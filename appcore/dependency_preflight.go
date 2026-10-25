@@ -47,12 +47,29 @@ func (s *Service) CheckDependencyFulfillment(req appstructs.DependencyPreflightR
 	target = hydratePreflightDependencies(downloadReq, target)
 
 	local := localModsByOnlineProject(selected.Mods)
+	entries := buildPreflightEntries(target, downloadReq, local, modbridge.InstallStatusPrecise)
+	return preflightResultFromEntries(entries)
+}
+
+type preflightStatusClassifier func(appstructs.ModDownloadRequest) string
+
+// buildPreflightEntries classifies the required dependencies of a resolved
+// target version. Optional/incompatible declarations are ignored because the
+// downloader only queues required dependencies. The classifier is injectable so
+// the status mapping and required-only filter can be unit tested without
+// network/provider state.
+func buildPreflightEntries(
+	target models.ModVersion,
+	parent appstructs.ModDownloadRequest,
+	local map[string]mcstructs.ModInfo,
+	classify preflightStatusClassifier,
+) []appstructs.DependencyPreflightEntry {
 	entries := make([]appstructs.DependencyPreflightEntry, 0, len(target.Dependencies))
 	for _, dep := range target.Dependencies {
 		if !modbridge.IsDependencyType(dep, "required") {
 			continue
 		}
-		depReq, ok := modbridge.DependencyDownloadRequest(target.Platform, dep, downloadReq)
+		depReq, ok := modbridge.DependencyDownloadRequest(target.Platform, dep, parent)
 		if !ok {
 			continue
 		}
@@ -64,7 +81,7 @@ func (s *Service) CheckDependencyFulfillment(req appstructs.DependencyPreflightR
 		if entry.Title == "" {
 			entry.Title = entry.ProjectID
 		}
-		switch modbridge.InstallStatusPrecise(depReq) {
+		switch classify(depReq) {
 		case modbridge.BtnStatusNew:
 			entry.Status = appstructs.DependencyPreflightMissing
 		case modbridge.BtnStatusInstalled:
@@ -90,7 +107,10 @@ func (s *Service) CheckDependencyFulfillment(req appstructs.DependencyPreflightR
 		}
 		return strings.ToLower(entries[i].Title) < strings.ToLower(entries[j].Title)
 	})
+	return entries
+}
 
+func preflightResultFromEntries(entries []appstructs.DependencyPreflightEntry) appstructs.DependencyPreflightResult {
 	result := appstructs.DependencyPreflightResult{Entries: entries}
 	for _, entry := range entries {
 		switch entry.Status {

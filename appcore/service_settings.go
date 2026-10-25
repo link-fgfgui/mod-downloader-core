@@ -1,0 +1,262 @@
+package appcore
+
+import (
+	"strings"
+
+	"github.com/link-fgfgui/mod-downloader-core/configs"
+	"github.com/link-fgfgui/mod-downloader-core/global"
+	"github.com/link-fgfgui/mod-downloader-core/logging"
+	"github.com/link-fgfgui/mod-downloader-core/minecraft"
+	"github.com/link-fgfgui/mod-downloader-core/storage"
+	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
+)
+
+func (s *Service) GetPreferences() appstructs.AppPreferences {
+	if s.config == nil {
+		return appstructs.AppPreferences{
+			Theme:                       configs.ThemeDark.String(),
+			Language:                    configs.LanguageSystem.String(),
+			AnimationMode:               configs.DefaultAnimationMode.String(),
+			AnimationEnabled:            configs.DefaultAnimationsEnabled,
+			AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
+		}
+	}
+	animationMode := s.config.Prefers.AnimationModeValue()
+	return appstructs.AppPreferences{
+		Theme:                       s.config.Prefers.Theme.Normalized().String(),
+		Language:                    s.config.Prefers.Language.Normalized().String(),
+		AnimationMode:               animationMode.String(),
+		AnimationEnabled:            animationMode != configs.AnimationModeOff,
+		AnimationDurationMultiplier: s.config.Prefers.NormalizedAnimationDurationMultiplier(),
+	}
+}
+
+func (s *Service) GetSettings() appstructs.SettingsView {
+	sv := appstructs.SettingsView{
+		Theme:                       configs.ThemeDark.String(),
+		Language:                    configs.LanguageSystem.String(),
+		SimpleMode:                  false,
+		AnimationMode:               configs.DefaultAnimationMode.String(),
+		AnimationEnabled:            configs.DefaultAnimationsEnabled,
+		AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
+		AutoScanUnusedDependencies:  configs.DefaultAutoScanUnusedDependencies,
+		EnableJijDetection:          configs.DefaultEnableJijDetection,
+		PreferredReleaseType:        configs.DefaultPreferredReleaseType,
+		FileConcurrency:             configs.DefaultFileConcurrency,
+		ConcurrentDownloads:         configs.DefaultConcurrentDownloads,
+		TargetDownloadRateMiB:       configs.DefaultTargetDownloadRateMiB,
+	}
+	if s.config != nil {
+		animationMode := s.config.Prefers.AnimationModeValue()
+		sv.Theme = s.config.Prefers.Theme.Normalized().String()
+		sv.Language = s.config.Prefers.Language.Normalized().String()
+		sv.SimpleMode = s.config.Prefers.SimpleMode
+		sv.AnimationMode = animationMode.String()
+		sv.AnimationEnabled = animationMode != configs.AnimationModeOff
+		sv.AnimationDurationMultiplier = s.config.Prefers.NormalizedAnimationDurationMultiplier()
+		sv.AutoScanUnusedDependencies = s.config.Prefers.AutoScanUnusedDependenciesValue()
+		sv.MCIMEnabled = s.config.Prefers.MCIMEnabledValue()
+		sv.EnableJijDetection = s.config.Prefers.EnableJijDetectionValue()
+		sv.PreferredReleaseType = s.config.Prefers.PreferredReleaseTypeValue()
+		sv.FileConcurrency = s.config.Downloads.FileConcurrencyValue()
+		sv.ConcurrentDownloads = s.config.Downloads.ConcurrentDownloadsValue()
+		sv.AdaptiveFileConcurrency = s.config.Downloads.AdaptiveFileConcurrency
+		sv.TargetDownloadRateMiB = s.config.Downloads.TargetDownloadRateMiBValue()
+		sv.VerifySHA1 = s.config.Downloads.VerifySHA1
+		sv.RequestsPerSecond = s.config.API.RequestsPerSecondValue()
+		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir))
+		sv.CacheDir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(s.config.Runtime.CacheDir))
+		sv.HasModrinthKey = strings.TrimSpace(s.config.Keys.ModrinthApiKey) != ""
+		sv.ModrinthKeyMask = MaskKey(s.config.Keys.ModrinthApiKey)
+	}
+	effectiveCFKey := s.effectiveCurseforgeAPIKey()
+	sv.HasCurseforgeKey = effectiveCFKey != ""
+	sv.CurseforgeKeyMask = MaskKey(effectiveCFKey)
+	if sv.MinecraftDir == "" {
+		sv.MinecraftDir = minecraft.SimplifyPathWithEnv(global.GetMinecraftDir())
+	}
+	if path, err := s.cachePath(); err == nil {
+		sv.CachePath = minecraft.SimplifyPathWithEnv(path)
+	}
+	return sv
+}
+
+func (s *Service) SaveTheme(theme string) string {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	parsed := configs.ParseTheme(theme)
+	if parsed == "" {
+		parsed = configs.ThemeDark
+	}
+	s.config.Prefers.Theme = parsed
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save theme failed", "theme", parsed, "error", err)
+	}
+	return parsed.String()
+}
+
+func (s *Service) SaveLanguage(language string) string {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	parsed := configs.ParseLanguage(language)
+	if parsed == "" {
+		parsed = configs.LanguageSystem
+	}
+	s.config.Prefers.Language = parsed
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save language failed", "language", parsed, "error", err)
+	}
+	return parsed.String()
+}
+
+func (s *Service) SaveAnimationSettings(req appstructs.SaveAnimationSettingsRequest) appstructs.SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	var animationMode configs.AnimationMode
+	if strings.TrimSpace(req.AnimationMode) != "" {
+		animationMode = configs.ParseAnimationMode(req.AnimationMode)
+	}
+	if animationMode == "" {
+		if req.AnimationEnabled {
+			animationMode = configs.AnimationModeVuetify
+		} else {
+			animationMode = configs.AnimationModeOff
+		}
+	}
+	s.config.Prefers.AnimationMode = animationMode
+	s.config.Prefers.AnimationsEnabled = configs.BoolPtr(animationMode != configs.AnimationModeOff)
+	s.config.Prefers.AnimationDurationMultiplier = configs.NormalizeAnimationDurationMultiplier(req.AnimationDurationMultiplier)
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save animation settings failed", "animationMode", animationMode, "animationDurationMultiplier", req.AnimationDurationMultiplier, "error", err)
+	}
+	return s.GetSettings()
+}
+
+func (s *Service) SaveSimpleModeSettings(req appstructs.SaveSimpleModeSettingsRequest) appstructs.SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	s.config.Prefers.SimpleMode = req.SimpleMode
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save simple mode setting failed", "simpleMode", req.SimpleMode, "error", err)
+	}
+	s.applyRuntimeConfig(s.downloadEvents())
+	return s.GetSettings()
+}
+
+func (s *Service) SaveUnusedDependencyCleanupSettings(req appstructs.SaveUnusedDependencyCleanupSettingsRequest) appstructs.SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	s.config.Prefers.AutoScanUnusedDependencies = configs.BoolPtr(req.AutoScanUnusedDependencies)
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save unused dependency cleanup settings failed", "autoScanUnusedDependencies", req.AutoScanUnusedDependencies, "error", err)
+	}
+	return s.GetSettings()
+}
+
+func (s *Service) SaveMCIMSettings(req appstructs.SaveMCIMSettingsRequest) appstructs.SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	s.config.Prefers.MCIMEnabled = req.MCIMEnabled
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save MCIM settings failed", "mcimEnabled", req.MCIMEnabled, "error", err)
+	}
+	s.applyRuntimeConfig(s.downloadEvents())
+	return s.GetSettings()
+}
+
+func (s *Service) SaveJijDetectionSettings(req appstructs.SaveJijDetectionSettingsRequest) appstructs.SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	s.config.Prefers.EnableJijDetection = configs.BoolPtr(req.EnableJijDetection)
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save JIJ detection setting failed", "enableJijDetection", req.EnableJijDetection, "error", err)
+	}
+	s.applyRuntimeConfig(s.downloadEvents())
+	return s.GetSettings()
+}
+
+func (s *Service) SavePreferredReleaseTypeSettings(req appstructs.SavePreferredReleaseTypeSettingsRequest) appstructs.SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	value := configs.Preferences{PreferredReleaseType: req.PreferredReleaseType}.PreferredReleaseTypeValue()
+	s.config.Prefers.PreferredReleaseType = value
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save preferred release type setting failed", "preferredReleaseType", value, "error", err)
+	}
+	s.applyRuntimeConfig(s.downloadEvents())
+	return s.GetSettings()
+}
+
+func (s *Service) SaveNetworkSettings(req appstructs.SaveNetworkSettingsRequest) appstructs.SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	s.config.Downloads.FileConcurrency = configs.DownloadConfig{FileConcurrency: req.FileConcurrency}.FileConcurrencyValue()
+	s.config.Downloads.ConcurrentDownloads = configs.DownloadConfig{ConcurrentDownloads: req.ConcurrentDownloads}.ConcurrentDownloadsValue()
+	s.config.Downloads.AdaptiveFileConcurrency = req.AdaptiveFileConcurrency
+	s.config.Downloads.TargetDownloadRateMiB = configs.DownloadConfig{TargetDownloadRateMiB: req.TargetDownloadRateMiB}.TargetDownloadRateMiBValue()
+	s.config.Downloads.VerifySHA1 = req.VerifySHA1
+	s.config.API.RequestsPerSecond = configs.APIConfig{RequestsPerSecond: req.RequestsPerSecond}.RequestsPerSecondValue()
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save network settings failed", "error", err)
+	}
+	s.applyRuntimeConfig(s.downloadEvents())
+	return s.GetSettings()
+}
+
+func (s *Service) SaveMinecraftDirPreference(dir string) string {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	s.config.Prefers.MinecraftDir = strings.TrimSpace(dir)
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save minecraft dir preference failed", "minecraftDir", dir, "error", err)
+	}
+	global.SetMinecraftDir(minecraft.ExpandPathWithEnv(s.config.Prefers.MinecraftDir))
+	return s.config.Prefers.MinecraftDir
+}
+
+func (s *Service) SaveCacheDirPreference(dir string) appstructs.SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	dir = strings.TrimSpace(dir)
+	if dir != "" {
+		dir = minecraft.SimplifyPathWithEnv(minecraft.ExpandPathWithEnv(dir))
+	}
+	s.config.Runtime.CacheDir = dir
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save cache dir preference failed", "cacheDir", dir, "error", err)
+	}
+	if cachePath, err := s.cachePath(); err != nil {
+		logging.Error("resolve database cache path after cache dir save failed", "cacheDir", dir, "error", err)
+	} else if err := storage.OpenAt(cachePath); err != nil {
+		logging.Error("reopen database after cache dir save failed", "cachePath", cachePath, "error", err)
+	}
+	return s.GetSettings()
+}
+
+func (s *Service) SaveApiKeys(req appstructs.SaveApiKeysRequest) appstructs.SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	if req.CurseforgeApiKey != APIKeyKeepSentinel {
+		s.config.Keys.CurseforgeApiKey = strings.TrimSpace(req.CurseforgeApiKey)
+	}
+	if req.ModrinthApiKey != APIKeyKeepSentinel {
+		s.config.Keys.ModrinthApiKey = strings.TrimSpace(req.ModrinthApiKey)
+	}
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save api keys failed", "error", err)
+	}
+	s.applyRuntimeConfig(s.downloadEvents())
+	return s.GetSettings()
+}

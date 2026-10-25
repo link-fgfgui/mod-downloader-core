@@ -6,8 +6,9 @@ type JijModInfo struct {
 }
 
 type LocalModDependency struct {
-	ModID string `json:"modId"`
-	Type  string `json:"type,omitempty"`
+	ModID   string `json:"modId"`
+	Type    string `json:"type,omitempty"`
+	Version string `json:"version,omitempty"`
 }
 
 type ModInfo struct {

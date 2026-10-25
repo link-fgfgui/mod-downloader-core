@@ -72,16 +72,16 @@ func (fabricModParser) Parse(r *zip.Reader) (parsedModMetadata, error) {
 	}
 
 	var meta struct {
-		ID          string         `json:"id"`
-		Name        string         `json:"name"`
-		Version     string         `json:"version"`
-		Description string         `json:"description"`
-		Depends     map[string]any `json:"depends"`
+		ID          string                     `json:"id"`
+		Name        string                     `json:"name"`
+		Version     string                     `json:"version"`
+		Description string                     `json:"description"`
+		Depends     map[string]json.RawMessage `json:"depends"`
 		Jars        []struct {
 			File string `json:"file"`
 		} `json:"jars"`
 	}
-	if err := json.Unmarshal(data, &meta); err != nil {
+	if err := unmarshalModMetadataJSON(data, &meta); err != nil {
 		return parsedModMetadata{}, fmt.Errorf("parse fabric.mod.json: %w", err)
 	}
 
@@ -184,7 +184,7 @@ func parseModsToml(r *zip.Reader, path string) ([]structs.ModInfo, error) {
 	return infos, nil
 }
 
-func requiredFabricDependencyIDs(depends map[string]any) []string {
+func requiredFabricDependencyIDs(depends map[string]json.RawMessage) []string {
 	if len(depends) == 0 {
 		return nil
 	}
@@ -778,7 +778,7 @@ func parseJarJarNestedPaths(r *zip.Reader) ([]string, error) {
 			Path string `json:"path"`
 		} `json:"jars"`
 	}
-	if err := json.Unmarshal(data, &meta); err != nil {
+	if err := unmarshalModMetadataJSON(data, &meta); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", jarJarMetadataPath, err)
 	}
 
@@ -914,6 +914,133 @@ func PrimaryModIDs(mods []structs.ModInfo) []string {
 		out = append(out, id)
 	}
 	return out
+}
+
+// --- Gson-compatible JSON ---
+
+var errModMetadataRoot = errors.New("mod metadata root must be a JSON object")
+
+// unmarshalModMetadataJSON decodes mod metadata JSON with the same acceptance
+// boundaries as the Gson JsonReader vendored by fabric-loader. encoding/json
+// enforces RFC 8259, while that reader (always non-lenient in the loader)
+// differs on a few points that show up in published mods:
+//
+//   - the root must be an object, checked before decoding;
+//   - one leading UTF-8 BOM is skipped by JsonReader.fillBuffer;
+//   - unescaped C0 control characters are allowed inside string literals;
+//   - \' and backslash-LF escapes are accepted, returning ' and LF;
+//   - reading stops after the root object, so trailing bytes are ignored; this
+//     is achieved by decoding a single value with json.Decoder.
+//
+// Strict decoding runs first; normalization only happens on failure and only
+// rewrites the constructs above, so genuine syntax errors still fail.
+func unmarshalModMetadataJSON[T any](data []byte, v *T) error {
+	if !hasJSONObjectRoot(data) {
+		return errModMetadataRoot
+	}
+
+	var decoded T
+	strictErr := json.Unmarshal(data, &decoded)
+	if strictErr == nil {
+		*v = decoded
+		return nil
+	}
+
+	var retried T
+	decoder := json.NewDecoder(bytes.NewReader(normalizeModMetadataJSON(data)))
+	if err := decoder.Decode(&retried); err != nil {
+		return fmt.Errorf("%w (after Gson-compatible normalization: %v)", strictErr, err)
+	}
+	*v = retried
+	return nil
+}
+
+// hasJSONObjectRoot mirrors ModMetadataParser's root check after skipping the
+// BOM and JSON whitespace that the Gson reader would skip.
+func hasJSONObjectRoot(data []byte) bool {
+	i := 0
+	if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+		i = 3
+	}
+	for i < len(data) {
+		switch data[i] {
+		case ' ', '\t', '\r', '\n':
+			i++
+		default:
+			return data[i] == '{'
+		}
+	}
+	return false
+}
+
+// normalizeModMetadataJSON rewrites only the Gson-specific string and BOM
+// deviations listed on unmarshalModMetadataJSON. When the input needs no
+// rewrite the returned bytes are identical to data.
+func normalizeModMetadataJSON(data []byte) []byte {
+	start := 0
+	if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+		start = 3
+	}
+
+	out := make([]byte, 0, len(data))
+	inString := false
+	escaped := false
+	for i := start; i < len(data); i++ {
+		c := data[i]
+		if !inString {
+			out = append(out, c)
+			if c == '"' {
+				inString = true
+			}
+			continue
+		}
+		if escaped {
+			escaped = false
+			switch c {
+			case '\n':
+				out = append(out, '\\', 'n')
+			case '\'':
+				out = append(out, '\'')
+			default:
+				out = append(out, '\\', c)
+			}
+			continue
+		}
+		switch {
+		case c == '\\':
+			escaped = true
+		case c == '"':
+			out = append(out, c)
+			inString = false
+		case c < 0x20:
+			out = appendControlCharEscape(out, c)
+		default:
+			out = append(out, c)
+		}
+	}
+	if escaped {
+		out = append(out, '\\')
+	}
+	return out
+}
+
+const jsonHexDigits = "0123456789abcdef"
+
+func appendControlCharEscape(out []byte, c byte) []byte {
+	switch c {
+	case '\n':
+		return append(out, '\\', 'n')
+	case '\r':
+		return append(out, '\\', 'r')
+	case '\t':
+		return append(out, '\\', 't')
+	case '\b':
+		return append(out, '\\', 'b')
+	case '\f':
+		return append(out, '\\', 'f')
+	default:
+		return append(out, '\\', 'u', '0', '0', jsonHexDigits[c>>4], jsonHexDigits[c&0x0f])
+	}
 }
 
 // --- zip helpers ---

@@ -427,3 +427,40 @@ func writeFabricJar(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+func TestLocalModsInDirRejectsMissingDir(t *testing.T) {
+	svc := New(Options{})
+	_, err := svc.LocalModsInDir(filepath.Join(t.TempDir(), "missing"), "", "")
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("LocalModsInDir error = %v, want explicit missing-directory error", err)
+	}
+}
+
+func TestEnsureSelectedVersionSelectsFirstOnlyWhenUnset(t *testing.T) {
+	previous := global.GetSelectedVersion()
+	previousDir := global.GetMinecraftDir()
+	t.Cleanup(func() {
+		global.SetSelectedVersion(previous)
+		global.SetMinecraftDir(previousDir)
+		global.InvalidateVersions()
+	})
+	dir := t.TempDir()
+	versions := []structs.VersionInfo{
+		{ID: "first", Name: "First", MinecraftVersion: "1.21.1", ModLoader: "fabric"},
+		{ID: "second", Name: "Second", MinecraftVersion: "1.20.1", ModLoader: "forge"},
+	}
+	global.SetMinecraftDir(dir)
+	global.SetVersionsForDir(dir, versions)
+
+	global.SetSelectedVersion(structs.VersionInfo{})
+	ensureSelectedVersion(versions)
+	if selected := global.GetSelectedVersion(); selected.ID != "first" {
+		t.Fatalf("selected = %q, want first", selected.ID)
+	}
+
+	global.SetSelectedVersion(versions[1])
+	ensureSelectedVersion(versions)
+	if selected := global.GetSelectedVersion(); selected.ID != "second" {
+		t.Fatalf("existing selection overwritten: %q", selected.ID)
+	}
+}

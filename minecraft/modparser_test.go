@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -180,6 +181,168 @@ func TestParseFabricRequiredDependencies(t *testing.T) {
 	sort.Strings(want)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("dependencies = %#v, want %#v", got, want)
+	}
+}
+
+func TestParseFabricAcceptsRawControlCharsInStrings(t *testing.T) {
+	// Fabric Loader accepts fabric.mod.json files whose strings contain literal
+	// newlines/tabs (Gson does not validate control characters). ETF 7.2.6 ships
+	// such a "description", so a strict encoding/json parse drops the whole mod.
+	fabricModJSON := "{\n" +
+		"  \"schemaVersion\": 1,\n" +
+		"  \"id\": \"entity_texture_features\",\n" +
+		"  \"version\": \"7.2.6\",\n" +
+		"  \"name\": \"Entity Texture Features\",\n" +
+		"  \"description\": \"Line one\nLine two\tindented \\\"quoted\\\" C:\\\\temp\",\n" +
+		"  \"depends\": {\"fabricloader\": \"*\", \"minecraft\": \"*\", \"architectury\": \">=1.0\"}\n" +
+		"}"
+	jar := testJar(t, map[string][]byte{
+		"fabric.mod.json": []byte(fabricModJSON),
+	})
+
+	mods := ParseModZipReader(testZipReader(t, jar), "raw-control.jar", "fabric")
+	if len(mods) != 1 {
+		t.Fatalf("ParseModZipReader() returned %d mods, want 1", len(mods))
+	}
+	mod := mods[0]
+	if mod.ID != "entity_texture_features" || mod.Name != "Entity Texture Features" || mod.Version != "7.2.6" {
+		t.Fatalf("mod = %#v, want parsed fabric metadata", mod)
+	}
+	wantDescription := "Line one\nLine two\tindented \"quoted\" C:\\temp"
+	if mod.Description != wantDescription {
+		t.Fatalf("description = %q, want %q", mod.Description, wantDescription)
+	}
+	if len(mod.Dependencies) != 1 || mod.Dependencies[0].ModID != "architectury" {
+		t.Fatalf("dependencies = %#v, want architectury only", mod.Dependencies)
+	}
+}
+
+func TestUnmarshalModMetadataJSONKeepsEscapedSequences(t *testing.T) {
+	var meta struct {
+		Description string `json:"description"`
+		ID          string `json:"id"`
+	}
+	// Raw 0x01 must be escaped by the retry path, while the existing \n and \"
+	// escapes must survive untouched.
+	data := []byte("{\"id\":\"example\",\"description\":\"a\x01b\\n\\\"c\\\"\"}")
+	if err := unmarshalModMetadataJSON(data, &meta); err != nil {
+		t.Fatalf("unmarshalModMetadataJSON() error = %v, want nil", err)
+	}
+	if meta.ID != "example" || meta.Description != "a\x01b\n\"c\"" {
+		t.Fatalf("meta = %#v, want original escapes preserved", meta)
+	}
+
+	if err := unmarshalModMetadataJSON([]byte(`{"id":}`), &meta); err == nil {
+		t.Fatal("unmarshalModMetadataJSON() error = nil, want syntax error")
+	}
+}
+
+func TestNormalizeModMetadataJSONPreservesStandardEscapes(t *testing.T) {
+	data := []byte(`{"id":"x","d":"a\n\t\u0000\\\"\/b"}`)
+	if got := normalizeModMetadataJSON(data); !bytes.Equal(got, data) {
+		t.Fatalf("normalizeModMetadataJSON() = %q, want input unchanged", got)
+	}
+}
+
+func TestUnmarshalModMetadataJSONGsonBoundaryParity(t *testing.T) {
+	// Expected outcomes below were verified against the Gson JsonReader vendored
+	// by fabric-loader 0.20.1 (non-lenient), google/gson 2.8.9, and 2.15.0.
+	// Untagged fields match the JSON keys case-insensitively, like the parser.
+	type meta struct {
+		ID          string
+		Description string
+		Depends     map[string]json.RawMessage
+	}
+	bom := []byte{0xEF, 0xBB, 0xBF}
+	withBOM := func(data []byte) []byte {
+		out := make([]byte, 0, len(bom)+len(data))
+		out = append(out, bom...)
+		return append(out, data...)
+	}
+	rawControl := func(c byte) []byte {
+		return []byte("{\"id\":\"x\",\"description\":\"a" + string(c) + "b\"}")
+	}
+
+	cases := []struct {
+		name string
+		data []byte
+		ok   bool
+		id   string
+		desc string
+	}{
+		{name: "valid", data: []byte("{\"id\":\"x\"}"), ok: true, id: "x"},
+		{name: "raw lf", data: rawControl('\n'), ok: true, id: "x", desc: "a\nb"},
+		{name: "raw cr", data: rawControl('\r'), ok: true, id: "x", desc: "a\rb"},
+		{name: "raw tab", data: rawControl('\t'), ok: true, id: "x", desc: "a\tb"},
+		{name: "raw nul", data: rawControl(0x00), ok: true, id: "x", desc: "a\x00b"},
+		{name: "raw 0x01", data: rawControl(0x01), ok: true, id: "x", desc: "a\x01b"},
+		{name: "raw 0x1f", data: rawControl(0x1f), ok: true, id: "x", desc: "a\x1fb"},
+		{name: "raw del", data: rawControl(0x7f), ok: true, id: "x", desc: "a\x7fb"},
+		{name: "raw lf in key", data: []byte("{\"i\nd\":\"x\"}"), ok: true},
+		{name: "invalid utf8", data: []byte("{\"id\":\"x\",\"description\":\"a\x80b\"}"), ok: true, id: "x", desc: "a\ufffdb"},
+		{name: "leading bom", data: withBOM([]byte("{\"id\":\"x\"}")), ok: true, id: "x"},
+		{name: "leading bom and raw lf", data: withBOM(rawControl('\n')), ok: true, id: "x", desc: "a\nb"},
+		{name: "escaped single quote", data: []byte("{\"id\":\"x\",\"description\":\"a\\'b\"}"), ok: true, id: "x", desc: "a'b"},
+		{name: "backslash lf", data: []byte("{\"id\":\"x\",\"description\":\"a\\\nb\"}"), ok: true, id: "x", desc: "a\nb"},
+		{name: "backslash lf in key", data: []byte("{\"i\\\nd\":\"x\"}"), ok: true},
+		{name: "escaped slash", data: []byte("{\"id\":\"x\",\"description\":\"a\\/b\"}"), ok: true, id: "x", desc: "a/b"},
+		{name: "escaped unicode", data: []byte("{\"id\":\"x\",\"description\":\"a\\u0000b\"}"), ok: true, id: "x", desc: "a\x00b"},
+		{name: "lone surrogate", data: []byte("{\"id\":\"x\",\"description\":\"a\\ud800b\"}"), ok: true, id: "x", desc: "a\ufffdb"},
+		{name: "duplicate keys", data: []byte("{\"id\":\"x\",\"id\":\"y\"}"), ok: true, id: "y"},
+		{name: "huge number in depends", data: []byte("{\"id\":\"x\",\"depends\":{\"a\":1e400}}"), ok: true, id: "x"},
+		{name: "trailing document", data: []byte("{\"id\":\"x\"}{\"id\":\"y\"}"), ok: true, id: "x"},
+		{name: "trailing garbage", data: []byte("{\"id\":\"x\"}x"), ok: true, id: "x"},
+		{name: "trailing nul", data: append([]byte("{\"id\":\"x\"}"), 0x00), ok: true, id: "x"},
+
+		{name: "trailing comma object", data: []byte("{\"id\":\"x\",}")},
+		{name: "trailing comma array", data: []byte("{\"id\":\"x\",\"a\":[1,]}")},
+		{name: "line comment", data: []byte("{\"id\":\"x\" // c\n}")},
+		{name: "block comment", data: []byte("{\"id\":\"x\" /* c */}")},
+		{name: "single quotes", data: []byte("{'id':'x'}")},
+		{name: "unquoted key", data: []byte("{id:\"x\"}")},
+		{name: "unquoted value", data: []byte("{\"id\":x}")},
+		{name: "equals separator", data: []byte("{\"id\"=\"x\"}")},
+		{name: "semicolon separator", data: []byte("{\"id\":\"x\";\"a\":1}")},
+		{name: "nan", data: []byte("{\"id\":\"x\",\"a\":NaN}")},
+		{name: "leading zero", data: []byte("{\"id\":\"x\",\"a\":01}")},
+		{name: "plus number", data: []byte("{\"id\":\"x\",\"a\":+1}")},
+		{name: "leading dot", data: []byte("{\"id\":\"x\",\"a\":.5}")},
+		{name: "trailing dot", data: []byte("{\"id\":\"x\",\"a\":5.}")},
+		{name: "bad escape", data: []byte("{\"id\":\"x\",\"d\":\"a\\qb\"}")},
+		{name: "hex escape", data: []byte("{\"id\":\"x\",\"d\":\"a\\x41b\"}")},
+		{name: "backslash cr", data: []byte("{\"id\":\"x\",\"d\":\"a\\\rb\"}")},
+		{name: "vertical tab escape", data: []byte("{\"id\":\"x\",\"d\":\"a\\vb\"}")},
+		{name: "zero escape", data: []byte("{\"id\":\"x\",\"d\":\"a\\0b\"}")},
+		{name: "unterminated", data: []byte("{\"id\":\"x\",\"d\":\"abc")},
+		{name: "short unicode", data: []byte("{\"id\":\"x\",\"d\":\"\\u12\"}")},
+		{name: "bom after whitespace", data: append([]byte(" "), withBOM([]byte("{\"id\":\"x\"}"))...)},
+		{name: "bad literal", data: []byte("{\"id\":\"x\",\"a\":tru}")},
+		{name: "empty", data: []byte{}},
+		{name: "top level array", data: []byte("[1]")},
+		{name: "null root", data: []byte("null")},
+		{name: "leading garbage", data: []byte("x{\"id\":\"x\"}")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var m meta
+			err := unmarshalModMetadataJSON(tc.data, &m)
+			if !tc.ok {
+				if err == nil {
+					t.Fatalf("unmarshalModMetadataJSON() accepted %q, want rejection like Gson", tc.data)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unmarshalModMetadataJSON() error = %v, want acceptance like Gson", err)
+			}
+			if m.ID != tc.id {
+				t.Fatalf("id = %q, want %q", m.ID, tc.id)
+			}
+			if m.Description != tc.desc {
+				t.Fatalf("description = %q, want %q", m.Description, tc.desc)
+			}
+		})
 	}
 }
 

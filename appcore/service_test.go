@@ -19,6 +19,7 @@ import (
 	"github.com/link-fgfgui/mod-downloader-core/models"
 	"github.com/link-fgfgui/mod-downloader-core/providers"
 	"github.com/link-fgfgui/mod-downloader-core/storage"
+	appstructs "github.com/link-fgfgui/mod-downloader-core/structs"
 )
 
 func TestLoadMinecraftReleaseVersionsUsesFreshCache(t *testing.T) {
@@ -806,7 +807,7 @@ func TestSaveUnusedDependencyCleanupSettingsPersists(t *testing.T) {
 	if svc.GetSettings().AutoScanUnusedDependencies {
 		t.Fatal("default auto scan unused dependencies = true, want false")
 	}
-	view := svc.SaveUnusedDependencyCleanupSettings(SaveUnusedDependencyCleanupSettingsRequest{
+	view := svc.SaveUnusedDependencyCleanupSettings(appstructs.SaveUnusedDependencyCleanupSettingsRequest{
 		AutoScanUnusedDependencies: true,
 	})
 	if !view.AutoScanUnusedDependencies {
@@ -845,7 +846,7 @@ func TestSaveSimpleModeSettingsPersistsAndAppliesImmediately(t *testing.T) {
 	if svc.GetSettings().SimpleMode {
 		t.Fatal("default simple mode = true, want false")
 	}
-	view := svc.SaveSimpleModeSettings(SaveSimpleModeSettingsRequest{SimpleMode: true})
+	view := svc.SaveSimpleModeSettings(appstructs.SaveSimpleModeSettingsRequest{SimpleMode: true})
 	if !view.SimpleMode || !svc.Config().Prefers.SimpleMode || !modbridge.SimpleModeEnabled() {
 		t.Fatalf("enabled simple mode was not applied: view=%#v config=%#v runtime=%v", view, svc.Config().Prefers, modbridge.SimpleModeEnabled())
 	}
@@ -858,7 +859,7 @@ func TestSaveSimpleModeSettingsPersistsAndAppliesImmediately(t *testing.T) {
 		t.Fatal("persisted simple mode = false, want true")
 	}
 
-	view = svc.SaveSimpleModeSettings(SaveSimpleModeSettingsRequest{SimpleMode: false})
+	view = svc.SaveSimpleModeSettings(appstructs.SaveSimpleModeSettingsRequest{SimpleMode: false})
 	if view.SimpleMode || modbridge.SimpleModeEnabled() {
 		t.Fatalf("disabled simple mode remained active: view=%#v runtime=%v", view, modbridge.SimpleModeEnabled())
 	}
@@ -923,7 +924,7 @@ func TestSaveMCIMSettingsPersistsAndReconfiguresProviders(t *testing.T) {
 	if svc.GetSettings().MCIMEnabled {
 		t.Fatal("default MCIM enabled = true, want false")
 	}
-	view := svc.SaveMCIMSettings(SaveMCIMSettingsRequest{MCIMEnabled: true})
+	view := svc.SaveMCIMSettings(appstructs.SaveMCIMSettingsRequest{MCIMEnabled: true})
 	if !view.MCIMEnabled || global.GetCurseForgeClient() == nil {
 		t.Fatalf("MCIM settings view = %#v", view)
 	}
@@ -940,7 +941,7 @@ func TestSaveMCIMSettingsPersistsAndReconfiguresProviders(t *testing.T) {
 		t.Fatal("persisted MCIM enabled = false, want true")
 	}
 
-	view = svc.SaveMCIMSettings(SaveMCIMSettingsRequest{MCIMEnabled: false})
+	view = svc.SaveMCIMSettings(appstructs.SaveMCIMSettingsRequest{MCIMEnabled: false})
 	if view.MCIMEnabled || global.GetCurseForgeClient() != nil {
 		t.Fatalf("disabled MCIM settings view = %#v", view)
 	}
@@ -999,7 +1000,7 @@ func TestDefaultCurseforgeAPIKeyFallback(t *testing.T) {
 	}
 
 	// Clear stores empty config and falls back to default again; default is not persisted.
-	sv = svc.SaveApiKeys(SaveApiKeysRequest{CurseforgeApiKey: ""})
+	sv = svc.SaveApiKeys(appstructs.SaveApiKeysRequest{CurseforgeApiKey: ""})
 	if svc.Config().Keys.CurseforgeApiKey != "" {
 		t.Fatalf("configured key after clear = %q, want empty", svc.Config().Keys.CurseforgeApiKey)
 	}
@@ -1043,7 +1044,7 @@ func TestSaveNetworkSettingsClampsAndPersists(t *testing.T) {
 	})
 
 	svc := New(Options{Config: &configs.Config{}})
-	view := svc.SaveNetworkSettings(SaveNetworkSettingsRequest{
+	view := svc.SaveNetworkSettings(appstructs.SaveNetworkSettingsRequest{
 		FileConcurrency:         100,
 		ConcurrentDownloads:     -1,
 		AdaptiveFileConcurrency: true,
@@ -1081,7 +1082,7 @@ func TestSaveNetworkSettingsClampsAndPersists(t *testing.T) {
 		t.Fatal("remote mod ID concurrency was not configured after saving network settings")
 	}
 
-	view = svc.SaveNetworkSettings(SaveNetworkSettingsRequest{
+	view = svc.SaveNetworkSettings(appstructs.SaveNetworkSettingsRequest{
 		FileConcurrency:         configs.DefaultFileConcurrency,
 		ConcurrentDownloads:     configs.DefaultConcurrentDownloads,
 		AdaptiveFileConcurrency: true,
