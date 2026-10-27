@@ -18,6 +18,10 @@ type loggingOnlyConfig struct {
 	Logging LoggingConfig `toml:"logging" env-prefix:"LOGGING_"`
 }
 
+type hardwareAccelerationConfig struct {
+	Prefers Preferences `toml:"preferences"`
+}
+
 // AppConfigPath returns the path to the config file in pwd.
 func AppConfigPath() (string, error) {
 	dir, err := os.Getwd()
@@ -52,6 +56,9 @@ func Load() (*Config, error) {
 		}
 		logging.Error("load config file failed", "path", path, "error", err)
 		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+	if err := readHardwareAccelerationEnv(&cfg.Prefers); err != nil {
+		return nil, fmt.Errorf("read hardware acceleration env: %w", err)
 	}
 	if err := readLoggingEnv(&cfg.Logging); err != nil {
 		return nil, fmt.Errorf("read logging env: %w", err)
@@ -89,11 +96,53 @@ func LoadLogging() (LoggingConfig, error) {
 	return cfg.Logging.Canonical(), nil
 }
 
+// LoadHardwareAcceleration reads only the GPU preference so the Wails window
+// can be created with the right webview policy before the core starts. It
+// emits no logs because logging is not configured at this point in startup.
+func LoadHardwareAcceleration() bool {
+	var cfg hardwareAccelerationConfig
+	path, err := AppConfigPath()
+	if err != nil {
+		return DefaultHardwareAcceleration
+	}
+	if err := cleanenv.ReadConfig(path, &cfg); err != nil {
+		if !os.IsNotExist(err) {
+			return DefaultHardwareAcceleration
+		}
+	}
+	if err := readHardwareAccelerationEnv(&cfg.Prefers); err != nil {
+		return DefaultHardwareAcceleration
+	}
+	if cfg.Prefers.HardwareAcceleration == nil {
+		return DefaultHardwareAcceleration
+	}
+	return *cfg.Prefers.HardwareAcceleration
+}
+
 func readEnv(cfg *Config) error {
 	if err := cleanenv.ReadEnv(cfg); err != nil {
 		return err
 	}
+	if err := readHardwareAccelerationEnv(&cfg.Prefers); err != nil {
+		return err
+	}
 	return readLoggingEnv(&cfg.Logging)
+}
+
+// readHardwareAccelerationEnv applies the environment override explicitly
+// because cleanenv cannot parse *bool fields from environment variables. The
+// pointer keeps "unset" distinct from an explicit false in the TOML file.
+func readHardwareAccelerationEnv(pref *Preferences) error {
+	raw, ok := os.LookupEnv("PREFERS_HARDWARE_ACCELERATION")
+	if !ok {
+		return nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fmt.Errorf("parse PREFERS_HARDWARE_ACCELERATION: %w", err)
+	}
+	pref.HardwareAcceleration = BoolPtr(value)
+	return nil
 }
 
 func readLoggingEnv(cfg *LoggingConfig) error {

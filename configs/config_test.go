@@ -25,9 +25,6 @@ func TestPreferencesThemeReadsPrefixedEnvironment(t *testing.T) {
 	if cfg.Prefers.Language != LanguageEnglish {
 		t.Fatalf("language = %q, want %q", cfg.Prefers.Language, LanguageEnglish)
 	}
-	if cfg.Prefers.AnimationModeValue() != DefaultAnimationMode {
-		t.Fatalf("animation mode = %q, want %q", cfg.Prefers.AnimationModeValue(), DefaultAnimationMode)
-	}
 	if cfg.Prefers.NormalizedAnimationDurationMultiplier() != 2.5 {
 		t.Fatalf("animation multiplier = %v, want 2.5", cfg.Prefers.NormalizedAnimationDurationMultiplier())
 	}
@@ -101,6 +98,67 @@ simple_mode = true
 	}
 }
 
+func TestPreferencesHardwareAccelerationDefaultsToEnabled(t *testing.T) {
+	if !(Preferences{}).HardwareAccelerationValue() {
+		t.Fatal("default hardware acceleration = false, want true")
+	}
+
+	var cfg Config
+	if _, err := toml.Decode(`
+[preferences]
+hardware_acceleration = false
+`, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Prefers.HardwareAccelerationValue() {
+		t.Fatal("TOML hardware acceleration = true, want false")
+	}
+
+	t.Setenv("PREFERS_HARDWARE_ACCELERATION", "false")
+	cfg = Config{}
+	if err := readEnv(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Prefers.HardwareAccelerationValue() {
+		t.Fatal("environment hardware acceleration = true, want false")
+	}
+}
+
+func TestLoadHardwareAccelerationReadsConfigFileBeforeCoreStartup(t *testing.T) {
+	dir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldwd); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	if got := LoadHardwareAcceleration(); !got {
+		t.Fatal("missing config file should default hardware acceleration to true")
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, configFileName), []byte(`
+[preferences]
+hardware_acceleration = true
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := LoadHardwareAcceleration(); !got {
+		t.Fatal("config file hardware acceleration = false, want true")
+	}
+
+	t.Setenv("PREFERS_HARDWARE_ACCELERATION", "false")
+	if got := LoadHardwareAcceleration(); got {
+		t.Fatal("environment override should disable hardware acceleration")
+	}
+}
+
 func TestLoadEnvDoesNotReadTOML(t *testing.T) {
 	dir := t.TempDir()
 	oldwd, err := os.Getwd()
@@ -159,37 +217,11 @@ func TestParseThemeSupportsLegacyNumericValues(t *testing.T) {
 	}
 }
 
-func TestParseAnimationModeSupportsModesAndLegacyValues(t *testing.T) {
-	tests := map[string]AnimationMode{
-		"":         AnimationModeVuetify,
-		"0":        AnimationModeOff,
-		"false":    AnimationModeOff,
-		"off":      AnimationModeOff,
-		"1":        AnimationModeVuetify,
-		"true":     AnimationModeVuetify,
-		"vuetify":  AnimationModeVuetify,
-		"2":        AnimationModeGSAP,
-		"gsap":     AnimationModeGSAP,
-		" GSAP  ":  AnimationModeGSAP,
-		"disabled": AnimationModeOff,
-		"enabled":  AnimationModeVuetify,
-	}
-	for value, want := range tests {
-		if got := ParseAnimationMode(value); got != want {
-			t.Fatalf("ParseAnimationMode(%q) = %q, want %q", value, got, want)
-		}
-	}
-	if got := ParseAnimationMode("invalid"); got != "" {
-		t.Fatalf("ParseAnimationMode(invalid) = %q, want empty", got)
-	}
-}
-
 func TestPreferencesThemeReadsStringTOML(t *testing.T) {
 	var cfg Config
 	if _, err := toml.Decode(`
 [preferences]
 theme = "system"
-animations_enabled = false
 animation_duration_multiplier = 1.75
 `, &cfg); err != nil {
 		t.Fatal(err)
@@ -197,31 +229,8 @@ animation_duration_multiplier = 1.75
 	if cfg.Prefers.Theme != ThemeSystem {
 		t.Fatalf("theme = %q, want %q", cfg.Prefers.Theme, ThemeSystem)
 	}
-	if cfg.Prefers.AnimationsEnabledValue() {
-		t.Fatal("animations enabled = true, want false")
-	}
-	if cfg.Prefers.AnimationModeValue() != AnimationModeOff {
-		t.Fatalf("animation mode = %q, want %q", cfg.Prefers.AnimationModeValue(), AnimationModeOff)
-	}
 	if cfg.Prefers.NormalizedAnimationDurationMultiplier() != 1.75 {
 		t.Fatalf("animation multiplier = %v, want 1.75", cfg.Prefers.NormalizedAnimationDurationMultiplier())
-	}
-}
-
-func TestPreferencesAnimationModeTOMLTakesPrecedenceOverLegacyEnabled(t *testing.T) {
-	var cfg Config
-	if _, err := toml.Decode(`
-[preferences]
-animation_mode = "gsap"
-animations_enabled = false
-`, &cfg); err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Prefers.AnimationModeValue() != AnimationModeGSAP {
-		t.Fatalf("animation mode = %q, want %q", cfg.Prefers.AnimationModeValue(), AnimationModeGSAP)
-	}
-	if !cfg.Prefers.AnimationsEnabledValue() {
-		t.Fatal("animations enabled = false, want true")
 	}
 }
 
@@ -238,14 +247,8 @@ theme = 2
 	}
 }
 
-func TestPreferencesAnimationDefaultsAndNormalization(t *testing.T) {
+func TestPreferencesAnimationDurationDefaultsAndNormalization(t *testing.T) {
 	defaults := Preferences{}
-	if defaults.AnimationModeValue() != DefaultAnimationMode {
-		t.Fatalf("default animation mode = %q, want %q", defaults.AnimationModeValue(), DefaultAnimationMode)
-	}
-	if !defaults.AnimationsEnabledValue() {
-		t.Fatal("default animations enabled = false, want true")
-	}
 	if defaults.NormalizedAnimationDurationMultiplier() != DefaultAnimationDurationMultiplier {
 		t.Fatalf("default animation multiplier = %v, want %v", defaults.NormalizedAnimationDurationMultiplier(), DefaultAnimationDurationMultiplier)
 	}

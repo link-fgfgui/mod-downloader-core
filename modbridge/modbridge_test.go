@@ -864,8 +864,14 @@ func TestPreferredVersionsUsesFallbackWhenPreferredTypeUnavailable(t *testing.T)
 		{ID: "beta", ReleaseType: "beta"},
 	}
 
-	ConfigurePreferredReleaseType("beta")
+	ConfigurePreferredReleaseType("latest")
 	got := preferredVersions(versions)
+	if len(got) != len(versions) {
+		t.Fatalf("preferred latest versions = %#v, want all versions", got)
+	}
+
+	ConfigurePreferredReleaseType("beta")
+	got = preferredVersions(versions)
 	if len(got) != 1 || got[0].ID != "beta" {
 		t.Fatalf("preferred beta versions = %#v, want beta only", got)
 	}
@@ -875,5 +881,11 @@ func TestPreferredVersionsUsesFallbackWhenPreferredTypeUnavailable(t *testing.T)
 	if len(got) != len(versions) {
 		t.Fatalf("missing preferred alpha fallback = %#v, want all versions", got)
 	}
+
 	ConfigurePreferredReleaseType("release")
+	got = preferredVersions(versions)
+	if len(got) != 1 || got[0].ID != "stable" {
+		t.Fatalf("preferred release versions = %#v, want stable only", got)
+	}
+	ConfigurePreferredReleaseType("latest")
 }

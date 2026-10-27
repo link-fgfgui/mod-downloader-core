@@ -56,10 +56,13 @@ var remoteModIDCache = struct {
 }{entries: make(map[string]*remoteModIDCacheEntry)}
 
 var simpleMode atomic.Bool
+
+// preferredReleaseType selects the release channel automatic installs prefer:
+// 0 = latest (no channel filter), 1 = release, 2 = beta, 3 = alpha.
 var preferredReleaseType atomic.Int32
 
 func init() {
-	preferredReleaseType.Store(1)
+	preferredReleaseType.Store(0)
 }
 
 func ConfigurePreferredReleaseType(value string) {
@@ -68,13 +71,18 @@ func ConfigurePreferredReleaseType(value string) {
 		preferredReleaseType.Store(3)
 	case "beta":
 		preferredReleaseType.Store(2)
-	default:
+	case "release":
 		preferredReleaseType.Store(1)
+	default:
+		preferredReleaseType.Store(0)
 	}
 }
 
 func preferredReleaseTypeMatches(version models.ModVersion) bool {
 	typeID := preferredReleaseType.Load()
+	if typeID == 0 {
+		return true
+	}
 	value := strings.ToLower(strings.TrimSpace(version.ReleaseType))
 	if value == "" {
 		return typeID == 1

@@ -101,98 +101,31 @@ func ParseLanguage(value string) Language {
 	}
 }
 
-type AnimationMode string
-
-const (
-	AnimationModeOff     AnimationMode = "off"
-	AnimationModeVuetify AnimationMode = "vuetify"
-	AnimationModeGSAP    AnimationMode = "gsap"
-)
-
-func (m *AnimationMode) UnmarshalText(text []byte) error {
-	mode := ParseAnimationMode(string(text))
-	if mode == "" {
-		return fmt.Errorf("invalid animation mode %q: expected off, vuetify, or gsap", strings.TrimSpace(string(text)))
-	}
-	*m = mode
-	return nil
-}
-
-func (m AnimationMode) MarshalText() ([]byte, error) {
-	return []byte(m.Normalized().String()), nil
-}
-
-func (m AnimationMode) String() string {
-	return string(m)
-}
-
-func (m AnimationMode) Normalized() AnimationMode {
-	if normalized := ParseAnimationMode(string(m)); normalized != "" {
-		return normalized
-	}
-	return DefaultAnimationMode
-}
-
-func ParseAnimationMode(value string) AnimationMode {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "true", "on", "enabled", "1", string(AnimationModeVuetify):
-		return AnimationModeVuetify
-	case "false", "disabled", "0", string(AnimationModeOff):
-		return AnimationModeOff
-	case "2", string(AnimationModeGSAP):
-		return AnimationModeGSAP
-	default:
-		return ""
-	}
-}
-
 type Preferences struct {
-	Theme                       Theme         `toml:"theme" json:"theme" env:"THEME" env-default:"dark"`
-	Language                    Language      `toml:"language" json:"language" env:"LANGUAGE" env-default:"system"`
-	MinecraftDir                string        `toml:"minecraft_dir" json:"minecraft_dir" env:"MINECRAFT_DIR"`
-	SimpleMode                  bool          `toml:"simple_mode" json:"simple_mode" env:"SIMPLE_MODE"`
-	AnimationMode               AnimationMode `toml:"animation_mode" json:"animation_mode" env:"ANIMATION_MODE"`
-	AnimationsEnabled           *bool         `toml:"animations_enabled" json:"animations_enabled"`
-	AnimationDurationMultiplier float64       `toml:"animation_duration_multiplier" json:"animation_duration_multiplier" env:"ANIMATION_DURATION_MULTIPLIER"`
-	AutoScanUnusedDependencies  *bool         `toml:"auto_scan_unused_dependencies" json:"auto_scan_unused_dependencies"`
-	MCIMEnabled                 bool          `toml:"mcim_enabled" json:"mcim_enabled" env:"MCIM_ENABLED"`
-	PreferredReleaseType        string        `toml:"preferred_release_type" json:"preferred_release_type" env:"PREFERRED_RELEASE_TYPE"`
-	EnableJijDetection          *bool         `toml:"enable_jij_detection" json:"enable_jij_detection"`
+	Theme                       Theme    `toml:"theme" json:"theme" env:"THEME" env-default:"dark"`
+	Language                    Language `toml:"language" json:"language" env:"LANGUAGE" env-default:"system"`
+	MinecraftDir                string   `toml:"minecraft_dir" json:"minecraft_dir" env:"MINECRAFT_DIR"`
+	SimpleMode                  bool     `toml:"simple_mode" json:"simple_mode" env:"SIMPLE_MODE"`
+	AnimationDurationMultiplier float64  `toml:"animation_duration_multiplier" json:"animation_duration_multiplier" env:"ANIMATION_DURATION_MULTIPLIER"`
+	AutoScanUnusedDependencies  *bool    `toml:"auto_scan_unused_dependencies" json:"auto_scan_unused_dependencies"`
+	MCIMEnabled                 bool     `toml:"mcim_enabled" json:"mcim_enabled" env:"MCIM_ENABLED"`
+	PreferredReleaseType        string   `toml:"preferred_release_type" json:"preferred_release_type" env:"PREFERRED_RELEASE_TYPE"`
+	EnableJijDetection          *bool    `toml:"enable_jij_detection" json:"enable_jij_detection"`
+	HardwareAcceleration        *bool    `toml:"hardware_acceleration" json:"hardware_acceleration"`
 }
 
 const (
-	DefaultAnimationMode               = AnimationModeVuetify
-	DefaultAnimationsEnabled           = true
 	DefaultAnimationDurationMultiplier = 1.0
 	MinAnimationDurationMultiplier     = 0.1
 	MaxAnimationDurationMultiplier     = 3.0
 	DefaultAutoScanUnusedDependencies  = false
-	DefaultPreferredReleaseType        = "release"
+	DefaultPreferredReleaseType        = "latest"
 	DefaultEnableJijDetection          = true
+	DefaultHardwareAcceleration        = true
 )
 
 func BoolPtr(value bool) *bool {
 	return &value
-}
-
-func (p Preferences) AnimationModeValue() AnimationMode {
-	if strings.TrimSpace(string(p.AnimationMode)) != "" {
-		if mode := ParseAnimationMode(string(p.AnimationMode)); mode != "" {
-			return mode
-		}
-		return DefaultAnimationMode
-	}
-	if p.AnimationsEnabled == nil {
-		return DefaultAnimationMode
-	}
-	if *p.AnimationsEnabled {
-		return AnimationModeVuetify
-	}
-	return AnimationModeOff
-}
-
-func (p Preferences) AnimationsEnabledValue() bool {
-	return p.AnimationModeValue() != AnimationModeOff
 }
 
 func (p Preferences) NormalizedAnimationDurationMultiplier() float64 {
@@ -212,7 +145,7 @@ func (p Preferences) MCIMEnabledValue() bool {
 
 func (p Preferences) PreferredReleaseTypeValue() string {
 	switch strings.ToLower(strings.TrimSpace(p.PreferredReleaseType)) {
-	case "alpha", "beta", "release":
+	case "latest", "alpha", "beta", "release":
 		return strings.ToLower(strings.TrimSpace(p.PreferredReleaseType))
 	default:
 		return DefaultPreferredReleaseType
@@ -224,6 +157,16 @@ func (p Preferences) EnableJijDetectionValue() bool {
 		return DefaultEnableJijDetection
 	}
 	return *p.EnableJijDetection
+}
+
+// HardwareAccelerationValue reports whether the webview should force GPU
+// rendering. It is read before the Wails window exists, so changing it only
+// takes effect on the next launch.
+func (p Preferences) HardwareAccelerationValue() bool {
+	if p.HardwareAcceleration == nil {
+		return DefaultHardwareAcceleration
+	}
+	return *p.HardwareAcceleration
 }
 
 func NormalizeAnimationDurationMultiplier(value float64) float64 {

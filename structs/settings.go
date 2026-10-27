@@ -4,8 +4,6 @@ package structs
 type AppPreferences struct {
 	Theme                       string  `json:"theme"`
 	Language                    string  `json:"language"`
-	AnimationMode               string  `json:"animationMode"`
-	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
 }
 
@@ -15,12 +13,11 @@ type SettingsView struct {
 	Theme                       string  `json:"theme"`
 	Language                    string  `json:"language"`
 	SimpleMode                  bool    `json:"simpleMode"`
-	AnimationMode               string  `json:"animationMode"`
-	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
 	AutoScanUnusedDependencies  bool    `json:"autoScanUnusedDependencies"`
 	MCIMEnabled                 bool    `json:"mcimEnabled"`
 	EnableJijDetection          bool    `json:"enableJijDetection"`
+	HardwareAcceleration        bool    `json:"hardwareAcceleration"`
 	PreferredReleaseType        string  `json:"preferredReleaseType"`
 	MinecraftDir                string  `json:"minecraftDir"`
 	CacheDir                    string  `json:"cacheDir"`
@@ -43,8 +40,6 @@ type SaveApiKeysRequest struct {
 }
 
 type SaveAnimationSettingsRequest struct {
-	AnimationMode               string  `json:"animationMode"`
-	AnimationEnabled            bool    `json:"animationEnabled"`
 	AnimationDurationMultiplier float64 `json:"animationDurationMultiplier"`
 }
 
@@ -66,6 +61,10 @@ type SaveJijDetectionSettingsRequest struct {
 
 type SavePreferredReleaseTypeSettingsRequest struct {
 	PreferredReleaseType string `json:"preferredReleaseType"`
+}
+
+type SaveHardwareAccelerationSettingsRequest struct {
+	HardwareAcceleration bool `json:"hardwareAcceleration"`
 }
 
 type SaveNetworkSettingsRequest struct {

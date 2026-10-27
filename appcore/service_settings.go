@@ -16,17 +16,12 @@ func (s *Service) GetPreferences() appstructs.AppPreferences {
 		return appstructs.AppPreferences{
 			Theme:                       configs.ThemeDark.String(),
 			Language:                    configs.LanguageSystem.String(),
-			AnimationMode:               configs.DefaultAnimationMode.String(),
-			AnimationEnabled:            configs.DefaultAnimationsEnabled,
 			AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
 		}
 	}
-	animationMode := s.config.Prefers.AnimationModeValue()
 	return appstructs.AppPreferences{
 		Theme:                       s.config.Prefers.Theme.Normalized().String(),
 		Language:                    s.config.Prefers.Language.Normalized().String(),
-		AnimationMode:               animationMode.String(),
-		AnimationEnabled:            animationMode != configs.AnimationModeOff,
 		AnimationDurationMultiplier: s.config.Prefers.NormalizedAnimationDurationMultiplier(),
 	}
 }
@@ -36,27 +31,24 @@ func (s *Service) GetSettings() appstructs.SettingsView {
 		Theme:                       configs.ThemeDark.String(),
 		Language:                    configs.LanguageSystem.String(),
 		SimpleMode:                  false,
-		AnimationMode:               configs.DefaultAnimationMode.String(),
-		AnimationEnabled:            configs.DefaultAnimationsEnabled,
 		AnimationDurationMultiplier: configs.DefaultAnimationDurationMultiplier,
 		AutoScanUnusedDependencies:  configs.DefaultAutoScanUnusedDependencies,
 		EnableJijDetection:          configs.DefaultEnableJijDetection,
+		HardwareAcceleration:        configs.DefaultHardwareAcceleration,
 		PreferredReleaseType:        configs.DefaultPreferredReleaseType,
 		FileConcurrency:             configs.DefaultFileConcurrency,
 		ConcurrentDownloads:         configs.DefaultConcurrentDownloads,
 		TargetDownloadRateMiB:       configs.DefaultTargetDownloadRateMiB,
 	}
 	if s.config != nil {
-		animationMode := s.config.Prefers.AnimationModeValue()
 		sv.Theme = s.config.Prefers.Theme.Normalized().String()
 		sv.Language = s.config.Prefers.Language.Normalized().String()
 		sv.SimpleMode = s.config.Prefers.SimpleMode
-		sv.AnimationMode = animationMode.String()
-		sv.AnimationEnabled = animationMode != configs.AnimationModeOff
 		sv.AnimationDurationMultiplier = s.config.Prefers.NormalizedAnimationDurationMultiplier()
 		sv.AutoScanUnusedDependencies = s.config.Prefers.AutoScanUnusedDependenciesValue()
 		sv.MCIMEnabled = s.config.Prefers.MCIMEnabledValue()
 		sv.EnableJijDetection = s.config.Prefers.EnableJijDetectionValue()
+		sv.HardwareAcceleration = s.config.Prefers.HardwareAccelerationValue()
 		sv.PreferredReleaseType = s.config.Prefers.PreferredReleaseTypeValue()
 		sv.FileConcurrency = s.config.Downloads.FileConcurrencyValue()
 		sv.ConcurrentDownloads = s.config.Downloads.ConcurrentDownloadsValue()
@@ -115,22 +107,9 @@ func (s *Service) SaveAnimationSettings(req appstructs.SaveAnimationSettingsRequ
 	if s.config == nil {
 		s.config = &configs.Config{}
 	}
-	var animationMode configs.AnimationMode
-	if strings.TrimSpace(req.AnimationMode) != "" {
-		animationMode = configs.ParseAnimationMode(req.AnimationMode)
-	}
-	if animationMode == "" {
-		if req.AnimationEnabled {
-			animationMode = configs.AnimationModeVuetify
-		} else {
-			animationMode = configs.AnimationModeOff
-		}
-	}
-	s.config.Prefers.AnimationMode = animationMode
-	s.config.Prefers.AnimationsEnabled = configs.BoolPtr(animationMode != configs.AnimationModeOff)
 	s.config.Prefers.AnimationDurationMultiplier = configs.NormalizeAnimationDurationMultiplier(req.AnimationDurationMultiplier)
 	if err := configs.Save(s.config); err != nil {
-		logging.Error("save animation settings failed", "animationMode", animationMode, "animationDurationMultiplier", req.AnimationDurationMultiplier, "error", err)
+		logging.Error("save animation settings failed", "animationDurationMultiplier", req.AnimationDurationMultiplier, "error", err)
 	}
 	return s.GetSettings()
 }
@@ -179,6 +158,20 @@ func (s *Service) SaveJijDetectionSettings(req appstructs.SaveJijDetectionSettin
 		logging.Error("save JIJ detection setting failed", "enableJijDetection", req.EnableJijDetection, "error", err)
 	}
 	s.applyRuntimeConfig(s.downloadEvents())
+	return s.GetSettings()
+}
+
+// SaveHardwareAccelerationSettings persists the webview GPU preference. The
+// value is consumed before wails.Run on the next launch; it cannot be applied
+// to the already-created webview at runtime.
+func (s *Service) SaveHardwareAccelerationSettings(req appstructs.SaveHardwareAccelerationSettingsRequest) appstructs.SettingsView {
+	if s.config == nil {
+		s.config = &configs.Config{}
+	}
+	s.config.Prefers.HardwareAcceleration = configs.BoolPtr(req.HardwareAcceleration)
+	if err := configs.Save(s.config); err != nil {
+		logging.Error("save hardware acceleration setting failed", "hardwareAcceleration", req.HardwareAcceleration, "error", err)
+	}
 	return s.GetSettings()
 }
 
